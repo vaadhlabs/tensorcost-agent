@@ -32,8 +32,8 @@ ENV VARIANT=${VARIANT}
 # Metadata
 LABEL org.opencontainers.image.title="Unified GPU Agent"
 LABEL org.opencontainers.image.description="GPU monitoring agent for AWS, GCP, Azure and Kubernetes"
-LABEL org.opencontainers.image.source="https://github.com/gocloudera/unified-gpu-agent"
-LABEL org.opencontainers.image.vendor="GoCloudera"
+LABEL org.opencontainers.image.source="https://github.com/vaadhlabs/tensorcost-agent"
+LABEL org.opencontainers.image.vendor="TensorCost"
 
 # System dependencies — only what's needed to compile grpcio
 RUN apt-get update && apt-get install -y --no-install-recommends \
