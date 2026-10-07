@@ -1,6 +1,6 @@
 {
   "name": "@tensorcost/sdk",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "One-line wrapper SDK for TensorCost — fire-and-forget LLM observability for OpenAI, Anthropic, AWS Bedrock, and Google Vertex AI clients.",
   "license": "Apache-2.0",
   "type": "module",
@@ -38,6 +38,11 @@
     "tensorcost"
   ],
   "author": "Vaadh Labs / TensorCost <engineering@tensorcost.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vaadhlabs/tensorcost-agent.git",
+    "directory": "sdks/node"
+  },
   "homepage": "https://tensorcost.com",
   "scripts": {
     "build": "tsc -b",
