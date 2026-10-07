@@ -63,6 +63,7 @@ message ServerAccepted { string session_id=1; int32 heartbeat_interval_seconds=2
 // the pre-cloud-id proto deserialise these as empty strings (proto3
 // default), which the server's identity branch correctly treats as
 // "no cloud-id pair", falling back to the UUID path.
+//
 // Live MIG partition geometry reported by the agent (read-only NVML).
 // Added 2026-08-04 for gpu.mig_partition UPSERT on sync. Older agents
 // omit these fields; the server treats absent mig_enabled as "no MIG
@@ -183,8 +184,8 @@ message MetricPoint {
   int32  memory_clock_mhz = 15;
   // Host-level NVLink degradation count (degraded links on this node). Stamped
   // on gpu_index=0 samples by the agent when GPUClusterMonitor is enabled.
-  // 0 is a valid value (no degraded links). Must be optional so wire absence
-  // (pre-035 agent, no NVLink telemetry) is not decoded as 0.
+  // 0 is a valid value (no degraded links). NULL when absent (pre-035 agent or
+  // host without NVLink telemetry).
   optional int32 nvlink_links_degraded = 16;
 }
 message InstanceCommand {

@@ -7,6 +7,10 @@ __pycache__/
 logs/
 .regen-venv/
 node_modules/
+sdks/node/node_modules/
+sdks/node/dist/
+sdks/node/.turbo/
+sdks/node/coverage/
 dist/
 *.egg-info/
 .DS_Store
