@@ -30,6 +30,34 @@ os.environ['DB_TYPE'] = 'sqlite'
 os.environ['LOG_LEVEL'] = 'ERROR'
 
 
+@pytest.fixture(autouse=True)
+def _stub_nvml_init():
+    """NVML init can block on GPU-less runners when cluster tests construct many monitors."""
+    patches = [
+        patch("pynvml.nvmlInit", return_value=None),
+        patch("pynvml.nvmlShutdown", return_value=None),
+    ]
+    try:
+        import monitors.gpu_cluster_monitor as gcm  # noqa: WPS433
+
+        if getattr(gcm, "PYNVML_AVAILABLE", False):
+            patches.append(
+                patch.object(gcm.pynvml, "nvmlInit", return_value=None),
+            )
+            patches.append(
+                patch.object(gcm.pynvml, "nvmlShutdown", return_value=None),
+            )
+    except ImportError:
+        pass
+
+    for p in patches:
+        p.start()
+    try:
+        yield
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
 
 @pytest.fixture
 def mock_aws_services():
