@@ -1,6 +1,16 @@
 # Releasing
 
-Publishing is **tag-driven**. Push an annotated semver tag on `main`:
+**Maintainers only.** External contributors cannot push `v*` tags or approve release deployments.
+
+## Repository protections (already configured)
+
+| Control | Effect |
+|---------|--------|
+| Branch protection on `main` | PR + 1 review + required CI before merge |
+| Ruleset **Release tags (maintainers only)** | Only **Admin** / **Maintain** can create, move, or delete `refs/tags/v*` |
+| **`release` environment** | Configure in GitHub → Settings → Environments → **release** → add required reviewers and limit to `v*` tags (recommended) |
+
+Publishing is **tag-driven**. A maintainer pushes an annotated semver tag on `main`:
 
 ```bash
 git tag v1.3.0

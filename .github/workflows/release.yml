@@ -1,5 +1,9 @@
 name: Release
 
+# Maintainer-only: v* tags are protected by a repository ruleset (Admin/Maintain
+# can create tags). This workflow also uses the `release` GitHub Environment
+# so publish jobs can require manual approval before npm/PyPI/GHCR go live.
+
 on:
   push:
     tags:
@@ -13,6 +17,8 @@ permissions:
 
 jobs:
   docker:
+    if: github.repository == 'vaadhlabs/tensorcost-agent' && github.event_name == 'push'
+    environment: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -44,6 +50,8 @@ jobs:
           sbom: true
 
   npm:
+    if: github.repository == 'vaadhlabs/tensorcost-agent' && github.event_name == 'push'
+    environment: release
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -60,6 +68,8 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   pypi:
+    if: github.repository == 'vaadhlabs/tensorcost-agent' && github.event_name == 'push'
+    environment: release
     runs-on: ubuntu-latest
     defaults:
       run:
