@@ -4,7 +4,7 @@ Apache-2.0 collection layer for **GPU telemetry** and **LLM usage metadata**. Ru
 
 | Component | Path | Package |
 |-----------|------|---------|
-| GPU agent | [`agent/`](./agent/) | Docker `ghcr.io/tensorcost/agent` |
+| GPU agent | [`agent/`](./agent/) | Docker `ghcr.io/vaadhlabs/tensorcost-agent` |
 | Node SDK | [`sdks/node/`](./sdks/node/) | npm `@tensorcost/sdk` |
 | Python SDK | [`sdks/python/`](./sdks/python/) | PyPI `tensorcost` |
 
@@ -22,7 +22,7 @@ docker run --rm -d --name tc-agent \
   -e HOST_GPU_TELEMETRY_ENABLED=true \
   -e BACKEND_API_URL= \
   -p 9090:9090 \
-  ghcr.io/tensorcost/agent:latest
+  ghcr.io/vaadhlabs/tensorcost-agent:latest
 curl -s localhost:9090/metrics | head
 ```
 
