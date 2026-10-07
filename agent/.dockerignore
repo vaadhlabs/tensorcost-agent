@@ -1,0 +1,67 @@
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Test artifacts (never ship test code in images)
+tests/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.coveragerc
+
+# Dev tooling
+.mypy_cache/
+.ruff_cache/
+.flake8
+.pylintrc
+Makefile
+
+# Local config and secrets
+.env
+*.env
+config.yaml
+config.*.yaml
+
+# Runtime data (mounted as volumes)
+data/
+logs/
+
+# Docs
+*.md
+docs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CI artifacts
+.github/
+
+# Dev requirements (production images use variant-specific files)
+requirements.txt
+requirements-dev.txt

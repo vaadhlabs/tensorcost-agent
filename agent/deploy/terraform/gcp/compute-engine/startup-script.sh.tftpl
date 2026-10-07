@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# ─── unified-gpu-agent startup-script (GCE) ──────────────────────────────
+#
+# Runs on every VM boot. Idempotent — safe to re-run after manual reboots
+# or `gcloud compute instances reset`. Authenticates to all GCP APIs
+# (Secret Manager, Artifact Registry, Cloud Monitoring) via the VM's
+# attached service account through the metadata server. No JSON key file
+# is ever materialised on disk.
+
+set -euo pipefail
+
+LOG=/var/log/tensorcost-agent-install.log
+exec > >(tee -a "$LOG") 2>&1
+
+echo "[$(date -Iseconds)] unified-gpu-agent install starting (GCE)"
+echo "[$(date -Iseconds)] agent image: ${agent_image}"
+
+%{ if !agent_image_digest_pinned ~}
+# ─── Supply-chain warning ────────────────────────────────────────────────
+# No `agent_image_digest` was set, so the image reference above is a
+# mutable tag. Bump the digest variable in the module call to pin a
+# specific cosign-verified manifest digest:
+#
+#   cosign verify ${agent_image} \
+#     --certificate-identity-regexp '^https://github\.com/.+/gpu-agents/' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#
+# See parallel commit ead77a7 (cosign image signing + SLSA provenance).
+echo "[$(date -Iseconds)] WARNING: agent_image is a mutable tag; set agent_image_digest for production." >&2
+%{ endif ~}
+
+# ─── 0. Wait for apt/dpkg lock ────────────────────────────────────────────
+
+export DEBIAN_FRONTEND=noninteractive
+
+for i in $(seq 1 60); do
+  if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
+     ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then break; fi
+  echo "waiting for apt/dpkg lock ($i/60)..."; sleep 5
+done
+
+apt-get update -qq
+apt-get install -y -qq \
+  curl wget jq ca-certificates gnupg lsb-release apt-transport-https
+
+# ─── 1. gcloud CLI (always — needed to fetch Secret Manager secrets) ────
+# Cloud SDK is preinstalled on Google's official Ubuntu/Deep Learning
+# images, but not on stock ubuntu-2204-lts. Install if missing.
+
+if ! command -v gcloud >/dev/null 2>&1; then
+  echo "installing Google Cloud SDK"
+  echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+    > /etc/apt/sources.list.d/google-cloud-sdk.list
+  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+    gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+  apt-get update -qq
+  apt-get install -y -qq google-cloud-cli
+fi
+
+# ─── 2. Fetch secrets from Secret Manager (via Workload Identity) ───────
+# `gcloud secrets versions access` uses Application Default Credentials,
+# which on a GCE VM resolve through the metadata server using the
+# attached service account. No JSON key file involved.
+
+AGENT_API_KEY=$(gcloud secrets versions access latest \
+  --secret='${secret_agent_api_key}' \
+  --project='${project_id}')
+
+TENANT_ID=$(gcloud secrets versions access latest \
+  --secret='${secret_tenant_id}' \
+  --project='${project_id}')
+
+%{ if grpc_enabled ~}
+AGENT_KEY_ID=$(gcloud secrets versions access latest \
+  --secret='${secret_agent_key_id}' \
+  --project='${project_id}')
+
+AGENT_HMAC_PEPPER=$(gcloud secrets versions access latest \
+  --secret='${secret_agent_hmac_pepper}' \
+  --project='${project_id}')
+%{ endif ~}
+
+if [ -z "$AGENT_API_KEY" ] || [ -z "$TENANT_ID" ]; then
+  echo "ERROR: failed to fetch secrets from Secret Manager — check VM service account binding"
+  exit 1
+fi
+
+%{ if grpc_enabled ~}
+if [ -z "$AGENT_KEY_ID" ] || [ -z "$AGENT_HMAC_PEPPER" ]; then
+  echo "ERROR: agent_key_id or agent_hmac_pepper missing from Secret Manager — required for COMM_MODE=both"
+  exit 1
+fi
+%{ endif ~}
+
+# ─── 3. Docker (if not already present) ──────────────────────────────────
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "installing Docker CE"
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+    gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  apt-get install -y -qq \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+else
+  echo "Docker already installed, skipping"
+fi
+
+# ─── 4. NVIDIA driver + container toolkit (if GPU) ───────────────────────
+# GCP's Deep Learning VM images ship the driver pre-installed; on stock
+# Ubuntu we install it ourselves. Skipped on CPU-only VMs.
+
+%{ if has_gpu ~}
+if lspci | grep -qi nvidia; then
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "installing NVIDIA driver + CUDA runtime"
+    apt-get install -y -qq linux-headers-generic build-essential
+    apt-get install -y -qq nvidia-driver-535 cuda-toolkit-12-1
+  fi
+
+  if ! dpkg -s nvidia-container-toolkit >/dev/null 2>&1; then
+    echo "installing nvidia-container-toolkit"
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+      gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    apt-get update -qq
+    apt-get install -y -qq nvidia-container-toolkit
+    nvidia-ctk runtime configure --runtime=docker
+    systemctl restart docker
+  fi
+
+  GPU_FLAG="--gpus all"
+  nvidia-smi || echo "WARNING: nvidia-smi failed — driver may need a reboot"
+else
+  echo "GPU configured but no NVIDIA card detected — running cost-only"
+  GPU_FLAG=""
+fi
+%{ else ~}
+echo "no GPU configured; running agent in cost-only mode (no NVML sampling)"
+GPU_FLAG=""
+%{ endif ~}
+
+# ─── 5. (Optional) Artifact Registry login via Workload Identity ─────────
+# `gcloud auth configure-docker` writes a credential helper that calls
+# back into gcloud — which uses the VM's attached SA. NO key file.
+
+%{ if use_private_artifact_registry ~}
+gcloud auth configure-docker '${artifact_registry_host}' --quiet
+%{ endif ~}
+
+# ─── 6. Agent env file (sensitive — 0600) ────────────────────────────────
+
+NVML_FLAG="false"
+if lspci | grep -qi nvidia; then
+  NVML_FLAG="true"
+fi
+
+install -d -m 0755 /etc/default
+cat > /etc/default/unified-gpu-agent <<EOF
+# Backend connection (TensorCost agent)
+BACKEND_API_URL=${backend_api_url}
+BACKEND_API_KEY=$AGENT_API_KEY
+AGENT_API_KEY=$AGENT_API_KEY
+TENANT_ID=$TENANT_ID
+AGENT_HOSTNAME=${agent_hostname}
+%{ if grpc_enabled ~}
+AGENT_KEY_ID=$AGENT_KEY_ID
+AGENT_HMAC_PEPPER=$AGENT_HMAC_PEPPER
+%{ endif ~}
+GRPC_TARGET=${grpc_host}:${grpc_port}
+GRPC_USE_TLS=true
+COMM_MODE=${grpc_host == "" ? "http" : "both"}
+NVML_ENABLED=$NVML_FLAG
+
+# Sampling
+MONITORING_INTERVAL=${metrics_push_interval}
+ACTIVE_MONITORS=gcp,nvml
+
+# GCP context — agent's GCP cost monitor uses these
+GCP_ENABLED=true
+GCP_PROJECT_ID=${project_id}
+EOF
+chmod 0600 /etc/default/unified-gpu-agent
+
+# ─── 7. systemd unit ──────────────────────────────────────────────────────
+
+cat > /etc/systemd/system/unified-gpu-agent.service <<EOF
+[Unit]
+Description=Unified GPU Agent (cost + metrics → TensorCost)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10s
+EnvironmentFile=/etc/default/unified-gpu-agent
+ExecStartPre=-/usr/bin/docker stop unified-gpu-agent
+ExecStartPre=-/usr/bin/docker rm unified-gpu-agent
+ExecStartPre=/usr/bin/docker pull ${agent_image}
+ExecStart=/usr/bin/docker run --rm \\
+  --name unified-gpu-agent \\
+  --network host \\
+  $GPU_FLAG \\
+  --env-file /etc/default/unified-gpu-agent \\
+  ${agent_image}
+ExecStop=/usr/bin/docker stop unified-gpu-agent
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ─── 8. Start / restart the agent ─────────────────────────────────────────
+
+systemctl daemon-reload
+systemctl enable unified-gpu-agent.service
+systemctl restart unified-gpu-agent.service
+
+echo "[$(date -Iseconds)] unified-gpu-agent install complete"
+echo "agent status: $(systemctl is-active unified-gpu-agent.service)"
+echo "agent logs:   journalctl -u unified-gpu-agent -f"

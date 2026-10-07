@@ -1,0 +1,26 @@
+# Local .terraform directories
+**/.terraform/*
+
+# Lock file — some teams check this in; flip here if your policy differs
+.terraform.lock.hcl
+
+# Terraform state
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Variable files with sensitive values
+*.tfvars
+*.tfvars.json
+!example.tfvars
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI config
+.terraformrc
+terraform.rc

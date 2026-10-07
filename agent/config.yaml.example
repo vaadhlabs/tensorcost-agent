@@ -1,0 +1,178 @@
+# Unified GPU Cost Optimization Agent Configuration
+
+# Monitoring Configuration
+monitoring:
+  # List of enabled cloud providers
+  enabled_clouds:
+    - aws
+    - azure
+    - gcp
+    - kubernetes
+    - sagemaker
+  
+  # Monitoring interval in seconds
+  interval: 300  # 5 minutes
+  
+  # AWS Configuration
+  aws:
+    enabled: true
+    region: us-east-1
+    services:
+      - ec2
+      - sagemaker
+      - eks
+    # Optional: specific instance types to monitor
+    instance_types:
+      - p2.*
+      - p3.*
+      - p4.*
+      - g4.*
+      - g5.*
+  
+  # Azure Configuration
+  azure:
+    enabled: true
+    subscription_id: "your-subscription-id"
+    resource_group: "your-resource-group"  # Optional: monitor all if not specified
+    services:
+      - virtual_machines
+      - machine_learning
+    # Optional: specific VM sizes to monitor
+    vm_sizes:
+      - Standard_NC6s_v3
+      - Standard_NC12s_v3
+      - Standard_NC24s_v3
+      - Standard_ND6s
+      - Standard_ND12s
+      - Standard_ND24s
+      - Standard_NV6
+      - Standard_NV12
+      - Standard_NV24
+  
+  # Google Cloud Configuration
+  gcp:
+    enabled: true
+    project_id: "your-project-id"
+    region: us-central1
+    zone: us-central1-a
+    services:
+      - compute_engine
+      - vertex_ai
+    # Optional: specific machine types to monitor
+    machine_types:
+      - n1-standard-4
+      - n1-standard-8
+      - n1-standard-16
+      - n1-standard-32
+      - n1-standard-64
+      - n1-standard-96
+    # Optional: specific GPU types to monitor
+    gpu_types:
+      - nvidia-tesla-k80
+      - nvidia-tesla-p4
+      - nvidia-tesla-p100
+      - nvidia-tesla-v100
+      - nvidia-tesla-t4
+      - nvidia-tesla-a100
+  
+  # Kubernetes Configuration
+  kubernetes:
+    enabled: true
+    kubeconfig_path: "~/.kube/config"
+    context: "your-cluster-context"  # Optional
+    namespace: "default"  # or "all" for all namespaces
+    services:
+      - nodes
+      - pods
+    # Optional: specific namespaces to monitor
+    namespaces:
+      - default
+      - kube-system
+      - ml-training
+      - ml-inference
+  
+  # SageMaker Configuration
+  sagemaker:
+    enabled: true
+    region: us-east-1
+    services:
+      - training_jobs
+      - endpoints
+      - processing_jobs
+    # Optional: specific job prefixes to monitor
+    job_prefixes:
+      - training-job
+      - processing-job
+
+# Backend API Configuration
+backend:
+  # Backend API URL for data streaming (HTTP fallback)
+  api_url: "https://your-backend-api.com"
+  # API key for authentication
+  api_key: "your-api-key"
+  # Tenant ID for multi-tenancy
+  tenant_id: "default"
+
+# Communication Mode: "http" (default), "grpc", or "both" (grpc primary, http fallback)
+# Set to "both" for zero-downtime migration — gRPC handles commands + metrics when
+# connected, HTTP polling kicks in automatically if the stream drops.
+comm_mode: "both"
+
+# gRPC Configuration (bidirectional streaming for real-time commands + metrics)
+grpc:
+  target: "your-backend-grpc.com:50051"
+  use_tls: true
+  # Optional TLS certificate paths (uses system certs if not specified)
+  ca_cert: ""
+
+# Local NVML GPU Sampling (sub-minute idle detection)
+# Samples GPUs locally via pynvml — much faster than CloudWatch's 5-min aggregation.
+# Read-only driver queries, runs at OS nice(19), zero impact on client workloads.
+nvml:
+  enabled: true
+  sample_interval: 10        # seconds between local GPU samples
+  idle_gpu_threshold: 10     # GPU utilization % below which is "idle"
+  idle_memory_threshold: 10  # memory utilization % below which is "idle"
+  idle_duration: 120         # seconds of sustained idle before declaring instance idle
+
+
+# Alerting Configuration
+alerting:
+  # Slack webhook URL
+  slack_webhook: "https://hooks.slack.com/services/..."
+  # Email configuration
+  email:
+    to: "alerts@yourcompany.com"
+    from: "gpu-agent@yourcompany.com"
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    smtp_username: "your-email@gmail.com"
+    smtp_password: "your-app-password"
+  
+  # Alert thresholds
+  thresholds:
+    idle_gpu_minutes: 10
+    daily_cost_usd: 100
+    cost_alert_usd: 500
+
+# Logging Configuration
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR
+  file: "./logs/unified_agent.log"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# Performance Configuration
+performance:
+  max_concurrent_requests: 10
+  request_timeout: 30
+  retry_attempts: 3
+  retry_delay: 5
+
+# Performance Configuration
+performance:
+  # Maximum memory usage for data collection (MB)
+  max_memory_mb: 512
+  # Batch size for streaming data
+  batch_size: 100
+  # Connection timeout for cloud APIs
+  api_timeout: 30

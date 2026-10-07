@@ -1,0 +1,24 @@
+---
+description: Keep hand-written source files under 400 lines; do not grow closed oversized files.
+alwaysApply: true
+---
+
+# File size limit
+
+Hand-written TypeScript and Python source files should stay at or under **400 lines**. Prefer **300** when starting a new module.
+
+## Out of scope
+
+- Generated code (`*_pb2.py`, protobuf outputs)
+- SQL migrations
+- Lockfiles and JSON config blobs
+
+## Closed files
+
+If a file already exceeds 400 lines, treat it as **closed**. Do not append new behavior to it. Extract new logic into a sibling module under the cap and import it.
+
+Examples of closed files: `gpu_cluster_monitor.py`, `middleware.py`, `training_run_monitor.py`.
+
+## When editing a closed file
+
+Only make the smallest change required (bug fix, import wiring). New features belong in a new file.

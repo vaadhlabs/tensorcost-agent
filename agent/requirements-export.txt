@@ -1,0 +1,2 @@
+# Optional standalone exporters (remote_write snappy compression)
+python-snappy>=0.7.0

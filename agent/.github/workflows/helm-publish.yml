@@ -1,0 +1,114 @@
+name: Publish Helm Chart
+
+# Publishes deploy/helm/gpu-agent as an OCI-format chart to GHCR.
+#
+# Install:
+#   helm install gpu-agent oci://ghcr.io/<owner>/charts/gpu-agent \
+#     --version 1.0.0 \
+#     --set auth.inline.apiKey=... --set auth.inline.tenantId=...
+#
+# Release workflow:
+#   1. Bump `version:` in deploy/helm/gpu-agent/Chart.yaml.
+#   2. Bump `appVersion:` if the chart now requires a newer image.
+#   3. git tag helm-v<same-version> && git push --tags
+#   4. This workflow fires, packages the chart, and pushes it to GHCR.
+#
+# The tag version MUST match Chart.yaml `version:` — the workflow fails
+# fast if they drift. Keeps the published artifact honest about what
+# source tree it came from.
+
+on:
+  push:
+    tags:
+      - 'helm-v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Chart version (must match Chart.yaml). Leave empty to read from Chart.yaml.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0  # >= 3.8 for OCI support
+
+      - name: Resolve chart version
+        id: ver
+        run: |
+          CHART_VERSION=$(awk '/^version:/ {print $2; exit}' deploy/helm/gpu-agent/Chart.yaml)
+          if [ -z "$CHART_VERSION" ]; then
+            echo "::error::Could not read `version:` from deploy/helm/gpu-agent/Chart.yaml"
+            exit 1
+          fi
+
+          # Figure out which version the trigger asked for.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF#refs/tags/helm-v}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            TAG="${{ inputs.version }}"
+          else
+            TAG="$CHART_VERSION"
+          fi
+
+          if [ "$TAG" != "$CHART_VERSION" ]; then
+            echo "::error::Tag version ($TAG) does not match Chart.yaml version ($CHART_VERSION). Bump Chart.yaml first, then re-tag."
+            exit 1
+          fi
+          echo "chart_version=$CHART_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Lint chart
+        run: helm lint deploy/helm/gpu-agent
+
+      - name: Package chart
+        run: |
+          mkdir -p .helm-dist
+          helm package deploy/helm/gpu-agent \
+            --destination .helm-dist
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ghcr.io \
+              --username ${{ github.actor }} \
+              --password-stdin
+
+      - name: Resolve GHCR target
+        id: target
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          # One `charts` namespace per owner so we can publish other charts
+          # later without path collisions (e.g. gpu-agent, gpu-dashboard).
+          echo "repo=oci://ghcr.io/${OWNER_LC}/charts" >> $GITHUB_OUTPUT
+
+      - name: Push chart to GHCR
+        run: |
+          helm push \
+            .helm-dist/gpu-agent-${{ steps.ver.outputs.chart_version }}.tgz \
+            ${{ steps.target.outputs.repo }}
+
+      - name: Summary
+        run: |
+          echo "## Published Helm chart" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Version:  ${{ steps.ver.outputs.chart_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "Registry: ${{ steps.target.outputs.repo }}/gpu-agent" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Install" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "helm install gpu-agent ${{ steps.target.outputs.repo }}/gpu-agent --version ${{ steps.ver.outputs.chart_version }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

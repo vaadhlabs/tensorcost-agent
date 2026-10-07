@@ -1,0 +1,42 @@
+# Core dependencies — no cloud SDKs
+# Use this for the 'node' variant (NVML + gRPC only)
+requests==2.31.0
+python-dotenv==1.0.0
+schedule==1.2.0
+psutil==5.9.6
+pynvml==11.5.3
+pyyaml==6.0.1
+
+# gRPC runtime + protobuf. The version bounds are coupled:
+#
+#   grpcio>=1.62 — matches the regen toolchain (bin/regen-proto.sh
+#     pins grpcio-tools 1.62.x). Pre-1.66 toolchains emit stubs
+#     without the runtime version-validation call, so the floor here
+#     just needs to support proto3 features we use. 1.62 is the
+#     latest pre-validation line.
+#
+#   protobuf>=4.25.3,<5.0 — matches what sagemaker (aws variant) +
+#     google-cloud-* (gcp variant) accept. They pin protobuf<5.0
+#     hard. Without this upper bound pip would prefer protobuf 6.x
+#     (latest), the resolver fails on the cloud-SDK conflict, and
+#     aws / gcp / full Docker builds 404 with ResolutionImpossible.
+#     DO NOT bump above 5.x without first re-evaluating those pins.
+#
+# grpcio-tools is BUILD-time only — DO NOT add it here. The 1.66+
+# line of grpcio-tools requires protobuf>=6.31 which collides with
+# the cloud-SDK pins above; even the older 1.62.x line pulls
+# protobuf 4.x at install. Either way, build-tools have no business
+# in the runtime image. The regen-proto script handles it in a
+# throwaway venv. See bin/regen-proto.sh.
+grpcio>=1.62.0
+protobuf>=4.25.3,<5.0
+
+# TLS certificate pinning + SPKI hashing (§8.2 Blocker #6). Used by
+# src/transport/tls_pinning.py to compute RFC 7469 §2.4 SPKI pins
+# from the peer chain on both the HTTPS and gRPC planes. Pure-Python
+# wheels are published for linux/amd64 + linux/arm64 + manylinux,
+# which is what the python:3.11-slim runtime image needs. No upper
+# bound — the API surface we use (x509.load_der_x509_certificate,
+# public_key().public_bytes(SubjectPublicKeyInfo)) has been stable
+# since 35.x.
+cryptography>=42.0.0

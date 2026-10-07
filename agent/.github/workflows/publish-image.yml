@@ -1,0 +1,134 @@
+name: Publish TensorCost Agent Image
+
+# Publishes ghcr.io/tensorcost/agent to GHCR under the @tensorcost org.
+#
+# Two target variants per run:
+#   aws  → ghcr.io/tensorcost/agent:<semver>        (default tag — most common BYOC path)
+#   full → ghcr.io/tensorcost/agent:<semver>-full   (all cloud SDKs)
+#
+# gcp / azure / node variants are deferred — see RELEASING.md for how to extend.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or SHA to build from (default: current branch)'
+        required: false
+        default: ''
+
+# GITHUB_TOKEN needs package-write so we can push to GHCR.
+# Contents read is the default but listed explicitly for clarity.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    # Build both variants sequentially in one job to share the Buildx cache
+    # layer between them — the python:3.11-slim base + requirements-core.lock
+    # layer is identical across all variants, so the second build (full) is
+    # materially faster than a cold run.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Metadata for the aws variant (carries the plain semver tags) ─────────
+      - name: Docker metadata — aws variant
+        id: meta-aws
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/tensorcost/agent
+          flavor: |
+            latest=false
+          tags: |
+            # Semver tags on a `v*` push: 0.4.0, 0.4, 0, latest
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            # workflow_dispatch: dev-<short_sha> so operators can pull a test image
+            type=raw,value=dev-${{ github.sha }},enable=${{ github.event_name == 'workflow_dispatch' }},suffix=,prefix=
+
+      # ── Metadata for the full variant (appends -full suffix to every tag) ────
+      - name: Docker metadata — full variant
+        id: meta-full
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/tensorcost/agent
+          flavor: |
+            latest=false
+            suffix=-full
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=raw,value=dev-${{ github.sha }},enable=${{ github.event_name == 'workflow_dispatch' }},suffix=,prefix=
+
+      # ── Build & push aws ──────────────────────────────────────────────────────
+      - name: Build and push — aws variant
+        id: build-aws
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-aws.outputs.tags }}
+          labels: ${{ steps.meta-aws.outputs.labels }}
+          build-args: VARIANT=aws
+          cache-from: type=gha,scope=tensorcost-aws
+          cache-to: type=gha,mode=max,scope=tensorcost-aws
+
+      # ── Build & push full ─────────────────────────────────────────────────────
+      - name: Build and push — full variant
+        id: build-full
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-full.outputs.tags }}
+          labels: ${{ steps.meta-full.outputs.labels }}
+          build-args: VARIANT=full
+          cache-from: type=gha,scope=tensorcost-full
+          cache-to: type=gha,mode=max,scope=tensorcost-full
+
+      # ── Workflow summary ──────────────────────────────────────────────────────
+      - name: Print published image URIs
+        run: |
+          echo "## Published images" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### aws variant" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta-aws.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Digest: \`${{ steps.build-aws.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### full variant" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta-full.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Digest: \`${{ steps.build-full.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY

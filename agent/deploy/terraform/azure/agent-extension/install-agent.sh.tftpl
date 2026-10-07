@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# ─── unified-gpu-agent install script (runs via Azure VM Extension) ─────
+#
+# Rendered by Terraform's `templatefile()`. Variables below with $${} are
+# interpolated at apply time (secrets come through protected_settings on
+# the VM Extension, so the whole script body is encrypted by Azure).
+#
+# This script is idempotent — safe to re-run. Existing Docker / NVIDIA /
+# toolkit installs are detected and skipped. The systemd unit is always
+# rewritten (env file may have changed) and the agent container is
+# stopped + restarted to pick up new config.
+
+set -euo pipefail
+
+LOG=/var/log/tensorcost-agent-install.log
+exec > >(tee -a "$LOG") 2>&1
+
+echo "[$(date -Iseconds)] unified-gpu-agent install starting"
+
+# ─── 1. Packages (apt) ────────────────────────────────────────────────────
+
+export DEBIAN_FRONTEND=noninteractive
+
+# Wait out any running unattended-upgrades lock; pip/apt conflicts on fresh
+# VMs are a common cause of VM Extension failures.
+for i in $(seq 1 60); do
+  if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then break; fi
+  echo "waiting for dpkg lock ($i/60)..."; sleep 5
+done
+
+apt-get update -qq
+apt-get install -y -qq \
+  curl wget jq ca-certificates gnupg lsb-release apt-transport-https
+
+# ─── 2. Docker (if not already present) ──────────────────────────────────
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "installing Docker CE"
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+    gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  apt-get install -y -qq \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+else
+  echo "Docker already installed, skipping"
+fi
+
+# ─── 3. NVIDIA driver + container toolkit (if not already present) ───────
+# Skip on hosts without a GPU (some BYO-VM customers install the agent on
+# non-GPU bastions for AZURE_ENABLED=true cost-only mode).
+
+if lspci | grep -qi nvidia; then
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "installing NVIDIA driver + CUDA runtime"
+    apt-get install -y -qq nvidia-driver-535 cuda-toolkit-12-1
+  fi
+
+  if ! dpkg -s nvidia-container-toolkit >/dev/null 2>&1; then
+    echo "installing nvidia-container-toolkit"
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+      gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    apt-get update -qq
+    apt-get install -y -qq nvidia-container-toolkit
+    nvidia-ctk runtime configure --runtime=docker
+    systemctl restart docker
+  fi
+
+  GPU_FLAG="--gpus all"
+  nvidia-smi || echo "WARNING: nvidia-smi failed — driver may need a reboot"
+else
+  echo "no NVIDIA GPU on this host; running agent in cost-only mode (no NVML sampling)"
+  GPU_FLAG=""
+fi
+
+# ─── 4. (Optional) Azure CLI for private ACR pulls ───────────────────────
+
+%{ if use_private_acr ~}
+if ! command -v az >/dev/null 2>&1; then
+  echo "installing Azure CLI for private ACR login"
+  curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+fi
+%{ endif ~}
+
+# ─── 5. Agent env file (sensitive — 0600) ────────────────────────────────
+
+install -d -m 0755 /etc/default
+cat > /etc/default/unified-gpu-agent <<EOF
+# Backend connection
+BACKEND_API_URL=${backend_api_url}
+BACKEND_API_KEY=${backend_api_key}
+TENANT_ID=${tenant_id}
+GRPC_TARGET=${grpc_host}:${grpc_port}
+GRPC_USE_TLS=true
+COMM_MODE=${grpc_host == "" ? "http" : "both"}
+
+# Sampling
+MONITORING_INTERVAL=${metrics_push_interval}
+ACTIVE_MONITORS=azure,nvml
+
+# Azure context — agent's Azure cost monitor uses these
+AZURE_ENABLED=true
+AZURE_SUBSCRIPTION_ID=${azure_subscription_id}
+EOF
+chmod 0600 /etc/default/unified-gpu-agent
+
+# ─── 6. systemd unit ──────────────────────────────────────────────────────
+
+cat > /etc/systemd/system/unified-gpu-agent.service <<EOF
+[Unit]
+Description=Unified GPU Agent (cost + metrics → tensorcost)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10s
+EnvironmentFile=/etc/default/unified-gpu-agent
+ExecStartPre=-/usr/bin/docker stop unified-gpu-agent
+ExecStartPre=-/usr/bin/docker rm unified-gpu-agent
+%{ if use_private_acr ~}
+ExecStartPre=/usr/bin/az login --identity
+ExecStartPre=/usr/bin/az acr login --name ${acr_login_server}
+%{ endif ~}
+ExecStartPre=/usr/bin/docker pull ${agent_image}
+ExecStart=/usr/bin/docker run --rm \\
+  --name unified-gpu-agent \\
+  --network host \\
+  $GPU_FLAG \\
+  --env-file /etc/default/unified-gpu-agent \\
+  ${agent_image}
+ExecStop=/usr/bin/docker stop unified-gpu-agent
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ─── 7. Start/restart the agent ───────────────────────────────────────────
+
+systemctl daemon-reload
+systemctl enable unified-gpu-agent.service
+# `restart` (not `start`) so re-runs of this script with new env pick up
+# the change immediately.
+systemctl restart unified-gpu-agent.service
+
+echo "[$(date -Iseconds)] unified-gpu-agent install complete"
+echo "agent status: $(systemctl is-active unified-gpu-agent.service)"
+echo "agent logs:   journalctl -u unified-gpu-agent -f"

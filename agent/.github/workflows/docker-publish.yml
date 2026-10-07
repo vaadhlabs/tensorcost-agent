@@ -1,0 +1,172 @@
+name: Publish GPU Agent Docker Image
+
+# Dual-publishes to Docker Hub (tensorcost/gpu-agent) AND GHCR
+# (ghcr.io/<owner>/gpu-agent). GHCR mirror exists so customers who
+# prefer GitHub-native auth (no DOCKERHUB_TOKEN) can consume the image,
+# and so we have a zero-downtime migration path if Docker Hub's terms
+# change. Tags are identical across both registries.
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Variant to build: full | aws | gcp | azure | node'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - aws
+          - gcp
+          - azure
+          - node
+
+# `packages: write` is required to push to GHCR via GITHUB_TOKEN.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ── Determine which variants to build ─────────────────────────────────────
+  # On push/tag: always build all five
+  # On workflow_dispatch: build only the chosen variant
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.pick.outputs.variants }}
+    steps:
+      - name: Pick variants
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo 'variants=["${{ inputs.variant }}"]' >> $GITHUB_OUTPUT
+          else
+            echo 'variants=["full","aws","gcp","azure","node"]' >> $GITHUB_OUTPUT
+          fi
+
+  # ── Build & push ───────────────────────────────────────────────────────────
+  build-and-push:
+    needs: setup
+    runs-on: ubuntu-latest
+    name: Build ${{ matrix.variant }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.setup.outputs.variants) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve target images
+        id: image
+        run: |
+          # Docker Hub repository (legacy primary, still published).
+          DH="${{ vars.DOCKERHUB_IMAGE }}"
+          if [ -z "$DH" ]; then DH="tensorcost/gpu-agent"; fi
+          # GHCR mirror — uses the repo owner (gpu-usage/tensorcost/whichever).
+          # Lowercased because GHCR path segments must be lowercase.
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          GHCR="ghcr.io/${OWNER_LC}/gpu-agent"
+          echo "dockerhub=$DH"   >> $GITHUB_OUTPUT
+          echo "ghcr=$GHCR"      >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Passing BOTH images lets docker/metadata-action mirror every
+          # computed tag across both registries — e.g. a push to main with
+          # variant=azure yields `dockerhub/...:azure` AND `ghcr/...:azure`
+          # in a single `docker/build-push-action` step.
+          images: |
+            ${{ steps.image.outputs.dockerhub }}
+            ${{ steps.image.outputs.ghcr }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && matrix.variant == 'full' }}
+            type=semver,pattern={{version}},enable=${{ matrix.variant == 'full' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ matrix.variant == 'full' }}
+            type=semver,pattern={{major}},enable=${{ matrix.variant == 'full' }}
+            type=raw,value=${{ matrix.variant }},enable=${{ github.ref == 'refs/heads/main' && matrix.variant != 'full' }}
+            type=semver,pattern=${{ matrix.variant }}-{{version}},enable=${{ matrix.variant != 'full' }}
+            type=semver,pattern=${{ matrix.variant }}-{{major}}.{{minor}},enable=${{ matrix.variant != 'full' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VARIANT=${{ matrix.variant }}
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+
+      - name: Summary
+        run: |
+          echo "### Built \`${{ matrix.variant }}\`" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # ── Smoke test ─────────────────────────────────────────────────────────────
+  smoke-test:
+    needs: [setup, build-and-push]
+    runs-on: ubuntu-latest
+    name: Smoke ${{ matrix.variant }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.setup.outputs.variants) }}
+
+    steps:
+      - name: Resolve image and tag
+        id: ref
+        run: |
+          IMAGE="${{ vars.DOCKERHUB_IMAGE }}"
+          if [ -z "$IMAGE" ]; then IMAGE="tensorcost/gpu-agent"; fi
+          if [ "${{ matrix.variant }}" = "full" ]; then TAG="latest"; else TAG="${{ matrix.variant }}"; fi
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Pull image
+        run: docker pull ${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.tag }}
+
+      - name: Verify proto and main load
+        run: |
+          docker run --rm \
+            -e BACKEND_API_KEY=smoke-test \
+            -e TENANT_ID=smoke-test \
+            -e COMM_MODE=http \
+            -e BACKEND_API_URL=http://localhost:9999 \
+            ${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.tag }} \
+            python -c "import sys; sys.path.insert(0,'/app/src/proto'); import agent_pb2, agent_pb2_grpc; import main; print('OK')"

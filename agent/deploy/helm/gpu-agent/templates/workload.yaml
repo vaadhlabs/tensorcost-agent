@@ -1,0 +1,259 @@
+apiVersion: apps/v1
+kind: {{ .Values.workload.kind }}
+metadata:
+  name: {{ include "gpu-agent.fullname" . }}
+  labels:
+    {{- include "gpu-agent.labels" . | nindent 4 }}
+spec:
+  {{- if eq .Values.workload.kind "Deployment" }}
+  replicas: {{ .Values.workload.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gpu-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gpu-agent.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "gpu-agent.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if .Values.healthCheck.enabled }}
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f {{ .Values.healthCheck.heartbeatPath }} && test $(($(date +%s) - $(stat -c %Y {{ .Values.healthCheck.heartbeatPath }}))) -lt {{ .Values.healthCheck.maxAgeSeconds }}
+            initialDelaySeconds: {{ .Values.healthCheck.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthCheck.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthCheck.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthCheck.livenessProbe.failureThreshold }}
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f {{ .Values.healthCheck.heartbeatPath }} && test $(($(date +%s) - $(stat -c %Y {{ .Values.healthCheck.heartbeatPath }}))) -lt {{ .Values.healthCheck.maxAgeSeconds }}
+            initialDelaySeconds: {{ .Values.healthCheck.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthCheck.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthCheck.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthCheck.readinessProbe.failureThreshold }}
+          {{- end }}
+          env:
+            # ── Auth (sourced from Secret) ───────────────────────────
+            - name: BACKEND_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpu-agent.authSecretName" . }}
+                  key: {{ .Values.auth.secretKeys.apiKey }}
+            - name: TENANT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpu-agent.authSecretName" . }}
+                  key: {{ .Values.auth.secretKeys.tenantId }}
+            {{- if or (eq .Values.commMode "grpc") (eq .Values.commMode "both") }}
+            - name: AGENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpu-agent.authSecretName" . }}
+                  key: {{ .Values.auth.secretKeys.apiKey }}
+            - name: AGENT_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpu-agent.authSecretName" . }}
+                  key: {{ .Values.auth.secretKeys.keyId }}
+            - name: AGENT_HMAC_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpu-agent.authSecretName" . }}
+                  key: {{ .Values.auth.secretKeys.hmacPepper }}
+            - name: AGENT_HOSTNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpu-agent.authSecretName" . }}
+                  key: {{ .Values.auth.secretKeys.hostname }}
+            {{- end }}
+
+            # ── Backend connectivity ─────────────────────────────────
+            - name: BACKEND_API_URL
+              value: {{ .Values.backend.apiUrl | quote }}
+            - name: GRPC_TARGET
+              value: {{ .Values.backend.grpcTarget | quote }}
+            - name: GRPC_USE_TLS
+              value: {{ .Values.backend.grpcUseTls | quote }}
+            - name: COMM_MODE
+              value: {{ .Values.commMode | quote }}
+
+            # ── Agent identity & monitoring ──────────────────────────
+            - name: AGENT_ID
+              value: "agent-$(TENANT_ID)-$(POD_NAME)"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MONITORING_INTERVAL
+              value: {{ .Values.monitoring.intervalSeconds | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.monitoring.logLevel | quote }}
+
+            # ── Cloud monitors ───────────────────────────────────────
+            - name: AWS_ENABLED
+              value: {{ .Values.monitors.aws.enabled | quote }}
+            {{- if .Values.monitors.aws.enabled }}
+            - name: AWS_REGION
+              value: {{ .Values.monitors.aws.region | quote }}
+            - name: AWS_SERVICES
+              value: {{ .Values.monitors.aws.services | quote }}
+            {{- end }}
+            - name: AZURE_ENABLED
+              value: {{ .Values.monitors.azure.enabled | quote }}
+            {{- if .Values.monitors.azure.enabled }}
+            - name: AZURE_SUBSCRIPTION_ID
+              value: {{ .Values.monitors.azure.subscriptionId | quote }}
+            - name: AZURE_RESOURCE_GROUP
+              value: {{ .Values.monitors.azure.resourceGroup | quote }}
+            - name: AZURE_SERVICES
+              value: {{ .Values.monitors.azure.services | quote }}
+            {{- end }}
+            - name: GCP_ENABLED
+              value: {{ .Values.monitors.gcp.enabled | quote }}
+            {{- if .Values.monitors.gcp.enabled }}
+            - name: GCP_PROJECT_ID
+              value: {{ .Values.monitors.gcp.projectId | quote }}
+            - name: GCP_SERVICES
+              value: {{ .Values.monitors.gcp.services | quote }}
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /etc/gcp/key.json
+            {{- end }}
+            - name: K8S_ENABLED
+              value: {{ .Values.monitors.kubernetes.enabled | quote }}
+            {{- if .Values.monitors.kubernetes.enabled }}
+            - name: K8S_NAMESPACES
+              value: {{ .Values.monitors.kubernetes.namespaces | quote }}
+            {{- if not .Values.monitors.kubernetes.inCluster }}
+            - name: KUBECONFIG_PATH
+              value: /etc/kube/config
+            {{- end }}
+            {{- end }}
+            - name: SAGEMAKER_ENABLED
+              value: {{ .Values.monitors.sagemaker.enabled | quote }}
+            {{- if .Values.monitors.sagemaker.enabled }}
+            - name: SAGEMAKER_SERVICES
+              value: {{ .Values.monitors.sagemaker.services | quote }}
+            {{- end }}
+
+            # ── Optional feature monitors ────────────────────────────
+            - name: NVML_ENABLED
+              value: {{ .Values.features.nvml.enabled | quote }}
+            {{- if .Values.features.nvml.enabled }}
+            - name: NVML_SAMPLE_INTERVAL
+              value: {{ .Values.features.nvml.sampleInterval | quote }}
+            - name: NVML_IDLE_GPU_THRESHOLD
+              value: {{ .Values.features.nvml.idleGpuThreshold | quote }}
+            - name: NVML_IDLE_MEMORY_THRESHOLD
+              value: {{ .Values.features.nvml.idleMemoryThreshold | quote }}
+            - name: NVML_IDLE_DURATION
+              value: {{ .Values.features.nvml.idleDuration | quote }}
+            {{- end }}
+            - name: AI_SPEND_ENABLED
+              value: {{ .Values.features.aiSpend.enabled | quote }}
+            - name: INFERENCE_SERVER_ENABLED
+              value: {{ .Values.features.inferenceServer.enabled | quote }}
+            - name: TRAINING_MONITOR_ENABLED
+              value: {{ .Values.features.trainingMonitor.enabled | quote }}
+            - name: LLM_GATEWAY_ENABLED
+              value: {{ .Values.features.llmGateway.enabled | quote }}
+            - name: CLUSTER_MONITOR_ENABLED
+              value: {{ .Values.features.clusterMonitor.enabled | quote }}
+            - name: SPOT_HANDLER_ENABLED
+              value: {{ .Values.features.spotHandler.enabled | quote }}
+            {{- if .Values.features.spotHandler.enabled }}
+            - name: SPOT_POLL_INTERVAL
+              value: {{ .Values.features.spotHandler.pollInterval | quote }}
+            {{- end }}
+
+            # ── Telemetry ────────────────────────────────────────────
+            - name: OTEL_ENABLED
+              value: {{ .Values.telemetry.otel.enabled | quote }}
+            {{- if .Values.telemetry.otel.enabled }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.telemetry.otel.exporterEndpoint | default "http://localhost:4317" | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: {{ include "gpu-agent.fullname" . | quote }}
+            {{- end }}
+
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+            - name: data
+              mountPath: /app/data
+            {{- if .Values.monitors.gcp.credentialsSecret }}
+            - name: gcp-creds
+              mountPath: /etc/gcp
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.monitors.kubernetes.enabled (not .Values.monitors.kubernetes.inCluster) }}
+            - name: kube-config
+              mountPath: /etc/kube
+              readOnly: true
+            {{- end }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          # ── Credentials injected from Secrets ───────────────────
+          envFrom:
+            {{- if and .Values.monitors.aws.enabled .Values.monitors.aws.credentialsSecret }}
+            - secretRef:
+                name: {{ .Values.monitors.aws.credentialsSecret }}
+            {{- end }}
+            {{- if and .Values.monitors.azure.enabled .Values.monitors.azure.credentialsSecret }}
+            - secretRef:
+                name: {{ .Values.monitors.azure.credentialsSecret }}
+            {{- end }}
+
+      volumes:
+        - name: logs
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+        {{- if .Values.monitors.gcp.credentialsSecret }}
+        - name: gcp-creds
+          secret:
+            secretName: {{ .Values.monitors.gcp.credentialsSecret }}
+        {{- end }}
+        {{- if and .Values.monitors.kubernetes.enabled (not .Values.monitors.kubernetes.inCluster) .Values.monitors.kubernetes.kubeconfigSecret }}
+        - name: kube-config
+          secret:
+            secretName: {{ .Values.monitors.kubernetes.kubeconfigSecret }}
+        {{- end }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

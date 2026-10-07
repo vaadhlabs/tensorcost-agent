@@ -1,0 +1,16 @@
+---
+description: Git commit message conventions for this repo — no Co-authored-by trailers
+alwaysApply: true
+---
+
+# Git commit conventions
+
+Do **not** add `Co-authored-by:` trailers to commit messages in this repository.
+
+Commit messages should contain only the subject line and body written for the human author. Never append:
+
+```
+Co-authored-by: Cursor <cursoragent@cursor.com>
+```
+
+or any similar co-author attribution for AI/agent assistance.

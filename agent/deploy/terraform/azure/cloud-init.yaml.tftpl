@@ -1,0 +1,147 @@
+#cloud-config
+# ─── unified-gpu-agent VM bootstrap ──────────────────────────────────────
+# 1. Install NVIDIA driver + CUDA + Docker + nvidia-container-toolkit
+# 2. (Optional) Log in to ACR via system-assigned managed identity
+# 3. Pull the agent image and start it as a systemd unit, with backend
+#    creds + Azure context passed in as env vars
+#
+# Variables interpolated by Terraform `templatefile()`:
+#   backend_api_url, backend_api_key, tenant_id, grpc_host, grpc_port,
+#   metrics_push_interval, azure_subscription_id, resource_group,
+#   agent_image, use_private_acr (bool), acr_login_server (only used
+#   when use_private_acr = true)
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - build-essential
+  - linux-headers-generic
+  - curl
+  - wget
+  - jq
+  - htop
+  - stress-ng
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - apt-transport-https
+
+write_files:
+  # ── /etc/default/unified-gpu-agent — env file consumed by systemd ──────
+  - path: /etc/default/unified-gpu-agent
+    permissions: '0600'
+    owner: root:root
+    content: |
+      # Backend connection (TensorCost agent — BACKEND_API_KEY kept for legacy compat)
+      BACKEND_API_URL=${backend_api_url}
+      BACKEND_API_KEY=${backend_api_key}
+      AGENT_API_KEY=${backend_api_key}
+      TENANT_ID=${tenant_id}
+      # Install identity from mint (AGENT_HOSTNAME) — not DNS; pins heartbeats to gpu.agent row
+      AGENT_HOSTNAME=${agent_hostname}
+      AGENT_KEY_ID=${agent_key_id}
+      AGENT_HMAC_PEPPER=${agent_hmac_pepper_hex}
+      GRPC_TARGET=${grpc_host}:${grpc_port}
+      GRPC_USE_TLS=true
+      COMM_MODE=${grpc_host == "" ? "http" : "both"}
+      NVML_ENABLED=true
+
+      # Sampling
+      MONITORING_INTERVAL=${metrics_push_interval}
+      ACTIVE_MONITORS=azure,nvml
+
+      # Azure context — agent's Azure cost monitor uses these
+      AZURE_ENABLED=true
+      AZURE_SUBSCRIPTION_ID=${azure_subscription_id}
+      AZURE_RESOURCE_GROUP=${resource_group}
+
+  # ── Docker daemon config: nvidia runtime as default ────────────────────
+  - path: /etc/docker/daemon.json
+    permissions: '0644'
+    content: |
+      {
+        "default-runtime": "nvidia",
+        "runtimes": {
+          "nvidia": {
+            "path": "nvidia-container-runtime",
+            "runtimeArgs": []
+          }
+        },
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "50m", "max-file": "3" }
+      }
+
+  # ── systemd unit for the agent ─────────────────────────────────────────
+  - path: /etc/systemd/system/unified-gpu-agent.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Unified GPU Agent (cost + metrics → GPU dashboard)
+      Requires=docker.service
+      After=docker.service network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      Restart=always
+      RestartSec=10s
+      EnvironmentFile=/etc/default/unified-gpu-agent
+      ExecStartPre=-/usr/bin/docker stop unified-gpu-agent
+      ExecStartPre=-/usr/bin/docker rm unified-gpu-agent
+%{ if use_private_acr ~}
+      # Private-registry pull path — managed identity authenticates us.
+      ExecStartPre=/usr/bin/az login --identity
+      ExecStartPre=/usr/bin/az acr login --name ${acr_login_server}
+%{ endif ~}
+      ExecStartPre=/usr/bin/docker pull ${agent_image}
+      ExecStart=/usr/bin/docker run --rm \
+        --name unified-gpu-agent \
+        --network host \
+        --gpus all \
+        --env-file /etc/default/unified-gpu-agent \
+        ${agent_image}
+      ExecStop=/usr/bin/docker stop unified-gpu-agent
+
+      [Install]
+      WantedBy=multi-user.target
+
+apt:
+  sources:
+    docker:
+      source: "deb [arch=amd64] https://download.docker.com/linux/ubuntu $RELEASE stable"
+      keyid: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+    nvidia-container:
+      source: "deb https://nvidia.github.io/libnvidia-container/stable/deb/$(ARCH) /"
+      keyid: C95B321B61E88C1809C4F759DDCAE044F796ECB0
+
+runcmd:
+  - apt-get update
+
+%{ if use_private_acr ~}
+  # Azure CLI (needed for managed-identity ACR login)
+  - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+%{ endif ~}
+
+  # NVIDIA driver + CUDA runtime
+  - apt-get install -y nvidia-driver-535 cuda-toolkit-12-1
+
+  # Docker
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - systemctl enable --now docker
+
+  # NVIDIA Container Toolkit (so `--gpus all` works)
+  - apt-get install -y nvidia-container-toolkit
+  - nvidia-ctk runtime configure --runtime=docker
+  - systemctl restart docker
+
+  # Verify GPU is visible
+  - nvidia-smi || echo "WARNING: nvidia-smi failed — driver install may need a reboot"
+
+  # Bring up the agent
+  - systemctl daemon-reload
+  - systemctl enable --now unified-gpu-agent.service
+
+  - echo "[$(date)] cloud-init complete" > /var/log/gpu-init-complete.log
+
+final_message: "VM ready — agent should be streaming to ${backend_api_url} within 60s of `systemctl status unified-gpu-agent` going active."

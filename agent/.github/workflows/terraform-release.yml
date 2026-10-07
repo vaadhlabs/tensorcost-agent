@@ -1,0 +1,135 @@
+name: Release Terraform Module
+
+# Cuts a GitHub Release for a specific cloud's Terraform module.
+#
+# Tag scheme: terraform-<cloud>-v<semver>
+#   terraform-aws-v1.0.0     → deploy/terraform/aws/
+#   terraform-azure-v1.0.0   → deploy/terraform/azure/
+#   terraform-gcp-v1.0.0     → deploy/terraform/gcp/
+#
+# Modules are consumed by customers via git-tagged refs:
+#
+#   module "gpu_agent" {
+#     source = "git::https://github.com/<owner>/<repo>.git//deploy/terraform/azure?ref=terraform-azure-v1.0.0"
+#   }
+#
+# The GitHub Release itself is mostly a human-readable landmark — the
+# tag is what Terraform pins against. We also attach a tarball of the
+# module subtree for out-of-band downloads (air-gapped customers, etc.)
+# and generate auto-release notes from the git log.
+
+on:
+  push:
+    tags:
+      - 'terraform-aws-v*.*.*'
+      - 'terraform-azure-v*.*.*'
+      - 'terraform-gcp-v*.*.*'
+
+permissions:
+  contents: write  # needed to create releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so `git log` in release notes is accurate.
+          fetch-depth: 0
+
+      - name: Parse tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Extract cloud + version from `terraform-<cloud>-v<ver>`.
+          CLOUD=$(echo "$TAG" | sed -E 's/^terraform-([^-]+)-v.*/\1/')
+          VERSION=$(echo "$TAG" | sed -E 's/^terraform-[^-]+-v//')
+          MODULE_PATH="deploy/terraform/$CLOUD"
+
+          if [ ! -d "$MODULE_PATH" ]; then
+            echo "::error::Tag $TAG points at $MODULE_PATH but that directory doesn't exist."
+            exit 1
+          fi
+
+          echo "tag=$TAG"              >> $GITHUB_OUTPUT
+          echo "cloud=$CLOUD"          >> $GITHUB_OUTPUT
+          echo "version=$VERSION"      >> $GITHUB_OUTPUT
+          echo "module_path=$MODULE_PATH" >> $GITHUB_OUTPUT
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+
+      - name: Validate module
+        working-directory: ${{ steps.tag.outputs.module_path }}
+        run: |
+          terraform init -backend=false
+          terraform validate
+          terraform fmt -check -recursive
+
+      - name: Build module tarball
+        run: |
+          TARBALL="${{ steps.tag.outputs.tag }}.tar.gz"
+          tar -czf "$TARBALL" -C deploy/terraform "${{ steps.tag.outputs.cloud }}"
+          echo "TARBALL=$TARBALL" >> $GITHUB_ENV
+
+      - name: Find previous release tag for this cloud
+        id: prev
+        run: |
+          CLOUD="${{ steps.tag.outputs.cloud }}"
+          # Prior tags that match this cloud's pattern, newest first.
+          PREV=$(git tag --list "terraform-${CLOUD}-v*" --sort=-creatordate \
+                 | grep -v "^${{ steps.tag.outputs.tag }}$" \
+                 | head -n 1 || true)
+          echo "prev=$PREV" >> $GITHUB_OUTPUT
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          NOTES_FILE=$(mktemp)
+          {
+            echo "## \`deploy/terraform/${{ steps.tag.outputs.cloud }}\` — v${{ steps.tag.outputs.version }}"
+            echo ""
+            echo "Consume via:"
+            echo ""
+            echo '```hcl'
+            echo 'module "gpu_agent" {'
+            echo "  source = \"git::https://github.com/${{ github.repository }}.git//${{ steps.tag.outputs.module_path }}?ref=${{ steps.tag.outputs.tag }}\""
+            echo '  # …required inputs — see the module README…'
+            echo '}'
+            echo '```'
+            echo ""
+
+            if [ -n "${{ steps.prev.outputs.prev }}" ]; then
+              echo "### Changes since ${{ steps.prev.outputs.prev }}"
+              echo ""
+              # Only commits that actually touched this module's path.
+              git log "${{ steps.prev.outputs.prev }}..HEAD" \
+                --pretty=format:'- %s (%h)' \
+                -- "${{ steps.tag.outputs.module_path }}"
+            else
+              echo "### Initial release"
+              echo ""
+              echo "First published version of the \`${{ steps.tag.outputs.cloud }}\` module."
+            fi
+          } > "$NOTES_FILE"
+          echo "notes_file=$NOTES_FILE" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Terraform ${{ steps.tag.outputs.cloud }} v${{ steps.tag.outputs.version }}"
+          body_path: ${{ steps.notes.outputs.notes_file }}
+          files: ${{ env.TARBALL }}
+
+      - name: Summary
+        run: |
+          echo "## Released" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${{ steps.tag.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Module:** \`${{ steps.tag.outputs.module_path }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tarball:** \`${{ env.TARBALL }}\`" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,11 @@
+# GCP variant — core + Google Cloud SDK
+-r requirements-core.txt
+
+google-cloud-compute==1.14.1
+google-cloud-monitoring==2.16.0
+google-cloud-billing==1.11.4
+google-cloud-resource-manager==1.10.4
+google-cloud-bigquery==3.14.1
+google-auth==2.23.4
+google-auth-oauthlib==1.1.0
+google-auth-httplib2==0.1.1

@@ -1,0 +1,81 @@
+
+> @tensorcost/sdk@0.6.0 test /Users/raj/workspace/usage-app/apps/tensorcost/packages/sdk-node
+> vitest run --coverage
+
+
+ RUN  v3.2.6 /Users/raj/workspace/usage-app/apps/tensorcost/packages/sdk-node
+      Coverage enabled with v8
+
+ ✓ src/__tests__/retry.test.ts (14 tests) 303ms
+ ✓ src/__tests__/transport.test.ts (5 tests) 232ms
+stderr | src/__tests__/providers/openai.test.ts > openai provider — applied mode via wrapMethod > routes through proxy and posts observation on proxy success
+tensorcost: observation POST failed status=404
+
+ ✓ src/__tests__/run-budget-terminal.spec.ts (11 tests) 188ms
+ ✓ src/__tests__/providers/openai.test.ts (9 tests) 457ms
+   ✓ openai provider wrapper > posts an observation with the right shape on success  305ms
+ ✓ src/__tests__/providers/anthropic.test.ts (7 tests) 456ms
+   ✓ anthropic provider wrapper > posts an observation with the right shape on success  309ms
+ ✓ src/__tests__/proxy-client.test.ts (18 tests) 649ms
+stderr | src/__tests__/hardening.test.ts > hardening D — telemetry hooks > onLifecycleEvent callback errors are swallowed (never propagate to caller)
+tensorcost: observation delivery failed: tensorcost: tenant_id required for token exchange (pass tenantId to wrap() or set TENSORCOST_TENANT_ID)
+
+stderr | src/__tests__/hardening.test.ts > hardening D — telemetry hooks > onLifecycleEvent fires on_fallback when proxy is unreachable
+tensorcost: observation delivery failed: tensorcost: tenant_id required for token exchange (pass tenantId to wrap() or set TENSORCOST_TENANT_ID)
+
+stderr | src/__tests__/hardening.test.ts > hardening D — telemetry hooks > events carry no prompt content
+tensorcost: observation delivery failed: tensorcost: tenant_id required for token exchange (pass tenantId to wrap() or set TENSORCOST_TENANT_ID)
+
+stderr | src/__tests__/hardening.test.ts > hardening E — fail-open circuit breaker > fails open to direct provider when proxy is unreachable and failOpenEnabled=true
+tensorcost: observation delivery failed: tensorcost: tenant_id required for token exchange (pass tenantId to wrap() or set TENSORCOST_TENANT_ID)
+
+stderr | src/__tests__/hardening.test.ts > hardening E — fail-open circuit breaker > throws TensorCostProxyError when failOpenEnabled=false and proxy is unreachable
+tensorcost: observation delivery failed: tensorcost: tenant_id required for token exchange (pass tenantId to wrap() or set TENSORCOST_TENANT_ID)
+
+stderr | src/__tests__/hardening.test.ts > hardening E — fail-open circuit breaker > observe-only mode (appliedMode=false) is unaffected
+tensorcost: observation delivery failed: tensorcost: tenant_id required for token exchange (pass tenantId to wrap() or set TENSORCOST_TENANT_ID)
+
+stderr | src/__tests__/applied.test.ts > response body passthrough > returns the provider response unchanged regardless of applied mode
+tensorcost: observation delivery failed: tensorcost: tenant_id required for token exchange (pass tenantId to wrap() or set TENSORCOST_TENANT_ID)
+
+ ✓ src/__tests__/hardening.test.ts (12 tests) 32ms
+ ✓ src/__tests__/bedrock.test.ts (13 tests) 327ms
+ ✓ src/__tests__/vertex.test.ts (6 tests) 306ms
+ ✓ src/__tests__/applied.test.ts (31 tests) 337ms
+ ✓ src/__tests__/telemetry.test.ts (6 tests) 8ms
+ ✓ src/__tests__/wrap.test.ts (7 tests) 6ms
+ ✓ src/__tests__/agent-run.test.ts (12 tests) 18ms
+ ✓ src/__tests__/errors.test.ts (6 tests) 213ms
+ ✓ src/__tests__/metadata.test.ts (8 tests) 21ms
+ ✓ src/__tests__/config.test.ts (5 tests) 5ms
+ ✓ src/__tests__/circuit.test.ts (7 tests) 4ms
+ ✓ src/__tests__/providers/detect.test.ts (11 tests) 5ms
+
+ Test Files  18 passed (18)
+      Tests  188 passed (188)
+   Start at  22:08:26
+   Duration  6.70s (transform 3.76s, setup 0ms, collect 11.34s, tests 3.57s, environment 32ms, prepare 13.43s)
+
+ % Coverage report from v8
+------------------|---------|----------|---------|---------|--------------------
+File              | % Stmts | % Branch | % Funcs | % Lines | Uncovered Line #s  
+------------------|---------|----------|---------|---------|--------------------
+All files         |   89.52 |    73.56 |   97.29 |   89.52 |                    
+ src              |   89.78 |    89.21 |     100 |   89.78 |                    
+  applied.ts      |   93.58 |    89.65 |     100 |   93.58 | 130-135,184        
+  circuit.ts      |     100 |      100 |     100 |     100 |                    
+  config.ts       |   85.18 |    87.23 |     100 |   85.18 | 54-61,69-76        
+  errors.ts       |     100 |      100 |     100 |     100 |                    
+  proxy-client.ts |   81.42 |    84.74 |     100 |   81.42 | ...390-412,415-433 
+  retry.ts        |   90.47 |    94.11 |     100 |   90.47 | 75-78              
+  telemetry.ts    |     100 |      100 |     100 |     100 |                    
+  transport.ts    |   92.24 |       80 |     100 |   92.24 | ...173,181-182,186 
+  wrap.ts         |     100 |      100 |     100 |     100 |                    
+ src/providers    |   89.32 |    63.31 |   93.93 |   89.32 |                    
+  anthropic.ts    |   89.08 |     55.2 |     100 |   89.08 | ...404-405,427,434 
+  bedrock.ts      |   91.34 |    68.57 |     100 |   91.34 | ...176-183,196-197 
+  detect.ts       |   96.36 |    94.28 |     100 |   96.36 | 51-52              
+  index.ts        |       0 |        0 |       0 |       0 | 1-5                
+  openai.ts       |   87.01 |    65.38 |      90 |   87.01 | ...530-545,552,554 
+  vertex.ts       |   93.67 |    38.88 |     100 |   93.67 | ...-42,123,141,157 
+------------------|---------|----------|---------|---------|--------------------

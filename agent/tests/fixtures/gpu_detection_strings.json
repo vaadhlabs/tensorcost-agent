@@ -1,0 +1,93 @@
+{
+  "nvml_names": [
+    {
+      "input": "NVIDIA H200 141GB HBM3e",
+      "family": "H200",
+      "normalized": "H200",
+      "model_key": "h200-sxm",
+      "mig_capable": true
+    },
+    {
+      "input": "NVIDIA H200-SXM5-141GB",
+      "family": "H200",
+      "normalized": "H200",
+      "model_key": "h200-sxm",
+      "mig_capable": true
+    },
+    {
+      "input": "NVIDIA H100 80GB HBM3",
+      "family": "H100",
+      "normalized": "H100",
+      "model_key": "h100-sxm",
+      "mig_capable": true
+    },
+    {
+      "input": "NVIDIA H100 PCIe",
+      "family": "H100",
+      "normalized": "H100",
+      "model_key": "h100-pcie",
+      "mig_capable": true
+    },
+    {
+      "input": "NVIDIA B200",
+      "family": "B200",
+      "normalized": "B200",
+      "model_key": "b200-sxm",
+      "mig_capable": true
+    },
+    {
+      "input": "NVIDIA B200 180GB",
+      "family": "B200",
+      "normalized": "B200",
+      "model_key": "b200-sxm",
+      "mig_capable": true
+    },
+    {
+      "input": "NVIDIA GB200",
+      "family": "GB200",
+      "normalized": "GB200",
+      "model_key": "gb200",
+      "mig_capable": true
+    },
+    {
+      "input": "NVIDIA GB200 NVL72",
+      "family": "GB200",
+      "normalized": "GB200",
+      "model_key": "gb200",
+      "mig_capable": true
+    },
+    {
+      "input": "NVIDIA RTX PRO 6000 Blackwell",
+      "family": null,
+      "normalized": "NVIDIA RTX PRO 6000 Blackwell",
+      "model_key": null,
+      "miss": "unknown_gpu_type",
+      "mig_capable": false
+    }
+  ],
+  "aws_instance_types": [
+    {"input": "p5.48xlarge", "gpu_type": "H100", "gpu_count": 8},
+    {"input": "p5e.48xlarge", "gpu_type": "H200", "gpu_count": 8},
+    {"input": "p5en.48xlarge", "gpu_type": "H200", "gpu_count": 8},
+    {"input": "p6-b200.48xlarge", "gpu_type": "B200", "gpu_count": 8},
+    {"input": "u-p6e-gb200x36", "gpu_type": "GB200", "gpu_count": 36},
+    {"input": "u-p6e-gb200x72", "gpu_type": "GB200", "gpu_count": 72}
+  ],
+  "mig_memory_profiles": [
+    {"memory_mb": 5120, "gpu_family": "A100", "profile": "1g.5gb", "compute_slice": 14},
+    {"memory_mb": 10240, "gpu_family": "H100", "profile": "1g.10gb", "compute_slice": 14},
+    {"memory_mb": 19968, "gpu_family": "H100", "profile": "1g.20gb", "compute_slice": 14},
+    {"memory_mb": 18432, "gpu_family": "H200", "profile": "1g.18gb", "compute_slice": 14},
+    {"memory_mb": 35840, "gpu_family": "H200", "profile": "1g.35gb", "compute_slice": 14},
+    {"memory_mb": 23552, "gpu_family": "B200", "profile": "1g.23gb", "compute_slice": 14},
+    {"memory_mb": 46080, "gpu_family": "B200", "profile": "1g.45gb", "compute_slice": 14, "gi_slice": 1},
+    {"memory_mb": 46080, "gpu_family": "B200", "profile": "2g.45gb", "compute_slice": 28, "gi_slice": 2},
+    {"memory_mb": 92160, "gpu_family": "B200", "profile": "3g.90gb", "compute_slice": 42, "gi_slice": 3},
+    {"memory_mb": 92160, "gpu_family": "B200", "profile": "4g.90gb", "compute_slice": 57, "gi_slice": 4},
+    {"memory_mb": 184320, "gpu_family": "B200", "profile": "7g.180gb", "compute_slice": 100},
+    {"memory_mb": 23552, "gpu_family": "GB200", "profile": "1g.23gb", "compute_slice": 14},
+    {"memory_mb": 48128, "gpu_family": "GB200", "profile": "2g.47gb", "compute_slice": 28, "gi_slice": 2},
+    {"memory_mb": 95232, "gpu_family": "GB200", "profile": "3g.93gb", "compute_slice": 42, "gi_slice": 3},
+    {"memory_mb": 190464, "gpu_family": "GB200", "profile": "7g.186gb", "compute_slice": 100}
+  ]
+}

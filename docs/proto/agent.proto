@@ -1,0 +1,203 @@
+syntax = "proto3";
+package tensorcost.agent.v1;
+
+service AgentService {
+  // Bidirectional stream: agents push metrics/instances; server pushes commands.
+  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+  rpc Heartbeat(AgentHeartbeat) returns (AgentHeartbeatAck);
+}
+
+message AgentMessage {
+  oneof payload {
+    AgentHello hello = 1;
+    InstanceUpdate instance_update = 2;
+    MetricBatch metric_batch = 3;
+    CommandResult command_result = 4;
+  }
+}
+
+message ServerMessage {
+  oneof payload {
+    ServerAccepted accepted = 1;
+    InstanceCommand command = 2;
+    ServerPing ping = 3;
+  }
+}
+
+// HMAC-signed hello. Replaces a prior plaintext `api_key` field at tag 4;
+// since there are no deployed external clients, we deliberately REUSE tag 4
+// (as `key_id`) rather than reserving it and burning new tags. Document
+// this choice in docs/grpc-agent-protocol.md so future readers understand
+// why tag 4 flipped type meaning.
+//
+// Canonical signed-over bytes (server-side and agent-side must agree
+// verbatim, as Buffer.concat):
+//   tenantId  || "\n" || agentId || "\n" || nonce || "\n" || be8(timestampUnix)
+// hmac = HMAC-SHA256(pepper, canonical).
+message AgentHello {
+  string tenant_id       = 1;
+  string agent_id        = 2;  // hostname convention — unchanged
+  string version         = 3;
+  string key_id          = 4;  // was api_key — RENAMED and REPURPOSED
+  bytes  nonce           = 5;  // 16 random bytes
+  int64  timestamp_unix  = 6;  // seconds since epoch
+  bytes  hmac            = 7;  // HMAC-SHA256 output, 32 bytes
+}
+message ServerAccepted { string session_id=1; int32 heartbeat_interval_seconds=2; }
+
+// InstanceUpdate / MetricPoint identity model:
+//   - `instance_id` is OUR local UUID — used by HTTP-sync / API callers
+//     who already know the gpu.instance.id from a prior list().
+//   - `cloud_id` + `cloud_provider` is the cloud-native pair (e.g.
+//     i-0abc… + "aws"). Agents discovering instances from cloud APIs
+//     don't know our UUID, so they ship the pair; the server resolves
+//     to a UUID via the unique (tenant_id, instance_id) index, or
+//     UPSERTs a new gpu.instance row on first sight.
+//
+// Both messages: send EITHER `instance_id` OR (`cloud_id` + `cloud_provider`).
+// Sending both is allowed; UUID wins. Sending neither is a server-side
+// drop with a warn log. cloud_provider values: "aws" | "azure" | "gcp" |
+// "onprem" | "other".
+//
+// New fields added 2026-04-28 — older agents still building against
+// the pre-cloud-id proto deserialise these as empty strings (proto3
+// default), which the server's identity branch correctly treats as
+// "no cloud-id pair", falling back to the UUID path.
+// Live MIG partition geometry reported by the agent (read-only NVML).
+// Added 2026-08-04 for gpu.mig_partition UPSERT on sync. Older agents
+// omit these fields; the server treats absent mig_enabled as "no MIG
+// snapshot in this message" and skips partition upsert.
+message MigPartitionSnapshot {
+  string partition_id  = 1;  // NVML MIG device UUID when available
+  string profile       = 2;  // e.g. "1g.5gb" — agent-inferred when NVML lacks profile name
+  int32  memory_mb     = 3;
+  int32  compute_slice = 4;  // slice weight used for cost attribution (matches seed convention)
+  int32  gpu_index     = 5;  // parent GPU index (0-based)
+}
+
+message InstanceUpdate {
+  string instance_id        = 1;
+  string status             = 2;
+  map<string,string> tags   = 3;
+  string cloud_id           = 4;
+  string cloud_provider     = 5;
+  // MIG inventory snapshot (optional). When present, gpu-service sync
+  // UPSERTs gpu.mig_partition rows without clobbering operator soft-state
+  // (allocated + assigned_workload_id are preserved).
+  bool mig_enabled = 6;
+  repeated MigPartitionSnapshot mig_partitions = 7;
+  // Cloud region (e.g. us-east-1). Agents discovering instances from cloud
+  // APIs stamp this on first sight; the server UPSERTs gpu.instance.region.
+  string region = 8;
+}
+message MetricBatch { repeated MetricPoint points=1; }
+message MetricPoint {
+  string instance_id    = 1;
+  int64  ts_unix_ms     = 2;
+  double util_pct       = 3;
+  double mem_pct        = 4;
+  double temp_c         = 5;
+  string cloud_id       = 6;
+  string cloud_provider = 7;
+  // Per-device GPU index (0-based). Added 2026-05-15 so the heatmap and
+  // future per-device widgets (power sparklines, MIG slices, memory
+  // bandwidth) receive distinct series instead of a single instance
+  // aggregate. Older agents omit this field; proto3 zero-default means
+  // the server sees gpu_index=0, which matches the DEFAULT 0 on the
+  // new migration-021 column — historical and single-GPU-instance rows
+  // are queryable unchanged.
+  int32  gpu_index      = 8;
+  // Per-device power draw in watts. Populated via nvmlDeviceGetPowerUsage()
+  // (milliwatts) / 1000.0. Added 2026-05-15 alongside the power sparkline
+  // widget (migration 022). Older agents omit this field; proto3
+  // zero-default (0.0) maps to the server's DEFAULT NULL via the sync
+  // service sentinel check — a 0.0 from a new agent is treated as "not
+  // supported" the same way a missing field is, so no data is written.
+  // GPUs that genuinely don't expose power (older Tesla models, some MIG
+  // slices) also emit 0.0; the frontend's "not supported" tile covers both.
+  double power_w        = 9;
+  // Memory bus utilization as a percentage (0–100). Populated via
+  // nvmlDeviceGetUtilizationRates(handle).memory — the same integer the
+  // nvidia-smi "Memory" column shows. Added 2026-05-15 alongside the
+  // memory-bandwidth chart widget (migration 023). Older agents omit this
+  // field; proto3 zero-default (0.0) is treated as "not reported" by the
+  // sync service (stored as NULL). A true 0% reading is indistinguishable
+  // from "not reported" at the wire layer — the sync service documents
+  // this conflation in the migration comment. GPUs or driver versions that
+  // don't support utilization queries emit 0.0 and the frontend tile
+  // shows "not supported" for all-NULL device series.
+  double mem_bw_pct     = 10;
+  // Cumulative uncorrected ECC error count since device boot. Populated via
+  // pynvml.nvmlDeviceGetTotalEccErrors(handle, NVML_MEMORY_ERROR_TYPE_UNCORRECTED,
+  // NVML_VOLATILE_ECC_ERRORS). Added 2026-05-15 alongside the ECC errors chart
+  // widget (migration 024).
+  //
+  // Shipped as cumulative count, not per-window delta:
+  //   1. Lossless: a delta computed at the agent loses precision on agent restart
+  //      (the counter resets to 0 at boot). Storing cumulative and computing deltas
+  //      in the query/render layer is robust to restarts.
+  //   2. Diagnostic: a 0-flat line is the healthy signal; operators need to see
+  //      when a previously-flat series stops being flat. Per-window deltas can
+  //      obscure gradual degradation if the bucket is too coarse.
+  //   3. Type fidelity: NVML's unsigned long long fits in int64 for any realistic
+  //      count across the device lifetime.
+  //
+  // Sentinel note: 0 IS a valid value (no errors observed), so unlike power_w
+  // or mem_bw_pct, 0 cannot be used as a "not reported" sentinel. The sync
+  // service stores 0 as 0; NULL means the field was absent (older agent or
+  // pre-Volta GPU that doesn't support ECC). The frontend "not supported" tile
+  // fires only when all values for a device are NULL — a row with 0 is healthy.
+  //
+  // Older agents and pre-Volta GPUs: field absent → proto3 zero-default (0) on
+  // the wire. The server disambiguates absent-field vs genuine-zero by checking
+  // whether ANY point for the device is non-NULL: if all are 0 AND the agent
+  // predates migration 024, the column is NULL in the database (the sync service
+  // treats int64 zero-default as "not reported" when the agent hasn't populated
+  // the column). See migration 024 comment for the full disambiguation.
+  int64  ecc_errors_total = 11;
+  // Per-device memory used in megabytes. Populated via
+  // nvmlDeviceGetMemoryInfo(handle).used / 1024 / 1024. Added 2026-05-15
+  // alongside the memory occupancy chart widget (migration 025).
+  //
+  // Sentinel: 0.0 IS a valid value (a freshly-started GPU can report 0 MB
+  // used). Unlike power_w and mem_bw_pct, do NOT treat 0.0 as "not
+  // reported" — store it as-is. NULL means the field was absent (older
+  // agent or a device where NVML did not return memory info).
+  double memory_used_mb = 12;
+  // Per-device total memory capacity in megabytes. Populated via
+  // nvmlDeviceGetMemoryInfo(handle).total / 1024 / 1024. Added 2026-05-15
+  // alongside the memory occupancy chart widget (migration 025).
+  //
+  // Sentinel: 0.0 is NOT a valid value (any real GPU has positive total
+  // memory). The sync service treats 0.0 as "not reported" and stores NULL,
+  // matching the power_w pattern. This provides the calibration axis for the
+  // memory occupancy chart — operators see "65 GB / 80 GB" or "65 GB / 141 GB"
+  // depending on whether the device is an A100 or H200.
+  double memory_total_mb = 13;
+  // Phase 4 GPU dark signals — per-device SM clock and memory clock in MHz.
+  // Populated via nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS) and
+  // NVML_CLOCK_MEM. Added 2026-09-13 (migration 035). proto3 zero-default (0)
+  // maps to NULL in the DB — a running datacenter GPU always reports positive
+  // clocks when NVML is available.
+  int32  clock_mhz        = 14;
+  int32  memory_clock_mhz = 15;
+  // Host-level NVLink degradation count (degraded links on this node). Stamped
+  // on gpu_index=0 samples by the agent when GPUClusterMonitor is enabled.
+  // 0 is a valid value (no degraded links). Must be optional so wire absence
+  // (pre-035 agent, no NVLink telemetry) is not decoded as 0.
+  optional int32 nvlink_links_degraded = 16;
+}
+message InstanceCommand {
+  string command_id=1;
+  string instance_id=2;
+  string type=3;
+  map<string,string> params=4;
+  // First-class routing identity — server injects these alongside params
+  // so agents need not scrape params for cloud_provider/region.
+  string cloud_provider = 5;
+  string region = 6;
+}
+message CommandResult { string command_id=1; string status=2; string error=3; }
+message ServerPing { int64 ts_unix_ms=1; }
+message AgentHeartbeat { string tenant_id=1; string agent_id=2; int64 ts_unix_ms=3; }
+message AgentHeartbeatAck { int32 next_in_seconds=1; }

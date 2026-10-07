@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# ─── unified-gpu-agent install script (runs via SSM Association) ─────────
+#
+# Rendered by Terraform's `templatefile()` and invoked by
+# AWS-RunShellScript on the target EC2 instance. Secrets come through
+# SSM Parameter Store SecureStrings — script reads them at run time via
+# `aws ssm get-parameter --with-decryption`. Parameter NAMES are
+# interpolated here at Terraform apply time (non-secret); the VALUES
+# stay encrypted in SSM until the instance reads them.
+#
+# Idempotent — safe to re-run. The SSM Association default re-runs on
+# every schedule change, so we handle "already installed" gracefully.
+
+set -euo pipefail
+
+LOG=/var/log/tensorcost-agent-install.log
+exec > >(tee -a "$LOG") 2>&1
+
+echo "[$(date -Iseconds)] unified-gpu-agent install starting"
+echo "[$(date -Iseconds)] agent image: ${agent_image}"
+
+%{ if !agent_image_digest_pinned ~}
+# ─── Supply-chain warning ────────────────────────────────────────────────
+# No `agent_image_digest` was set, so the image reference above is a
+# mutable tag. SSM re-runs this install on a schedule and `docker pull`s
+# the same tag — a compromised upstream maintainer could land a
+# replacement image on this fleet within one re-run. For production,
+# verify the published image with cosign and pin the digest:
+#
+#   cosign verify ${agent_image} \
+#     --certificate-identity-regexp '^https://github\.com/.+/gpu-agents/' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#
+# Then set `agent_image_digest = "sha256:..."` in the module call.
+echo "[$(date -Iseconds)] WARNING: agent_image is a mutable tag; set agent_image_digest for production." >&2
+%{ endif ~}
+
+# ─── 0. Wait for apt/dpkg lock ────────────────────────────────────────────
+
+export DEBIAN_FRONTEND=noninteractive
+
+for i in $(seq 1 60); do
+  if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
+     ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then break; fi
+  echo "waiting for apt/dpkg lock ($i/60)..."; sleep 5
+done
+
+apt-get update -qq
+apt-get install -y -qq \
+  curl wget jq ca-certificates gnupg lsb-release apt-transport-https \
+  unzip
+
+# ─── 1. AWS CLI v2 (always — needed to fetch SSM SecureString params) ───
+
+if ! command -v aws >/dev/null 2>&1; then
+  echo "installing AWS CLI v2"
+  curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp/
+  /tmp/aws/install
+  rm -rf /tmp/awscliv2.zip /tmp/aws/
+fi
+
+# ─── 2. Fetch secrets from SSM Parameter Store ───────────────────────────
+# The instance role must have ssm:GetParameter on these param names
+# (Terraform attaches the policy in the caller module).
+
+REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+export AWS_DEFAULT_REGION="$REGION"
+
+BACKEND_API_KEY=$(aws ssm get-parameter \
+  --name '${ssm_param_backend_api_key}' \
+  --with-decryption --query 'Parameter.Value' --output text)
+
+TENANT_ID=$(aws ssm get-parameter \
+  --name '${ssm_param_tenant_id}' \
+  --with-decryption --query 'Parameter.Value' --output text)
+
+%{ if grpc_enabled ~}
+AGENT_KEY_ID=$(aws ssm get-parameter \
+  --name '${ssm_param_agent_key_id}' \
+  --with-decryption --query 'Parameter.Value' --output text)
+
+AGENT_HMAC_PEPPER=$(aws ssm get-parameter \
+  --name '${ssm_param_agent_hmac}' \
+  --with-decryption --query 'Parameter.Value' --output text)
+%{ endif ~}
+
+if [ -z "$BACKEND_API_KEY" ] || [ -z "$TENANT_ID" ]; then
+  echo "ERROR: failed to fetch secrets from SSM Parameter Store"
+  exit 1
+fi
+
+%{ if grpc_enabled ~}
+if [ -z "$AGENT_KEY_ID" ] || [ -z "$AGENT_HMAC_PEPPER" ]; then
+  echo "ERROR: agent_key_id or agent_hmac_pepper missing from SSM — required for COMM_MODE=both"
+  exit 1
+fi
+%{ endif ~}
+
+# ─── 3. Docker (if not already present) ──────────────────────────────────
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "installing Docker CE"
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+    gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  apt-get install -y -qq \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+else
+  echo "Docker already installed, skipping"
+fi
+
+# ─── 4. NVIDIA driver + container toolkit (if GPU + not already present) ─
+# Safe to skip on CPU-only instances — some customers install the agent on
+# a cost-only bastion for AWS_ENABLED=true (Cost Explorer polling) without
+# NVML sampling.
+
+if lspci | grep -qi nvidia; then
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "installing NVIDIA driver + CUDA runtime"
+    apt-get install -y -qq linux-headers-generic build-essential
+    apt-get install -y -qq nvidia-driver-535 cuda-toolkit-12-1
+  fi
+
+  if ! dpkg -s nvidia-container-toolkit >/dev/null 2>&1; then
+    echo "installing nvidia-container-toolkit"
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+      gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    apt-get update -qq
+    apt-get install -y -qq nvidia-container-toolkit
+    nvidia-ctk runtime configure --runtime=docker
+    systemctl restart docker
+  fi
+
+  GPU_FLAG="--gpus all"
+  nvidia-smi || echo "WARNING: nvidia-smi failed — driver may need a reboot"
+else
+  echo "no NVIDIA GPU on this host; running agent in cost-only mode (no NVML sampling)"
+  GPU_FLAG=""
+fi
+
+# ─── 5. (Optional) ECR login for private registry pulls ──────────────────
+
+%{ if use_private_ecr ~}
+if ! aws ecr get-login-password --region "$REGION" | docker login \
+    --username AWS --password-stdin ${ecr_registry}; then
+  echo "WARNING: ECR login failed — pulls will fail if image is in ${ecr_registry}"
+fi
+%{ endif ~}
+
+# ─── 6. Agent env file (sensitive — 0600) ────────────────────────────────
+
+install -d -m 0755 /etc/default
+NVML_FLAG="false"
+if lspci | grep -qi nvidia; then
+  NVML_FLAG="true"
+fi
+
+cat > /etc/default/unified-gpu-agent <<EOF
+# Backend connection (TensorCost agent — BACKEND_API_KEY kept for legacy compat)
+BACKEND_API_URL=${backend_api_url}
+BACKEND_API_KEY=$BACKEND_API_KEY
+AGENT_API_KEY=$BACKEND_API_KEY
+TENANT_ID=$TENANT_ID
+AGENT_HOSTNAME=${agent_hostname}
+%{ if grpc_enabled ~}
+AGENT_KEY_ID=$AGENT_KEY_ID
+AGENT_HMAC_PEPPER=$AGENT_HMAC_PEPPER
+%{ endif ~}
+GRPC_TARGET=${grpc_host}:${grpc_port}
+GRPC_USE_TLS=true
+COMM_MODE=${grpc_host == "" ? "http" : "both"}
+NVML_ENABLED=$NVML_FLAG
+
+# Sampling
+MONITORING_INTERVAL=${metrics_push_interval}
+ACTIVE_MONITORS=aws,nvml
+
+# AWS context — agent's AWS cost monitor uses these
+AWS_ENABLED=true
+AWS_REGION=$REGION
+EOF
+chmod 0600 /etc/default/unified-gpu-agent
+
+# ─── 7. systemd unit ──────────────────────────────────────────────────────
+
+cat > /etc/systemd/system/unified-gpu-agent.service <<EOF
+[Unit]
+Description=Unified GPU Agent (cost + metrics → tensorcost)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10s
+EnvironmentFile=/etc/default/unified-gpu-agent
+ExecStartPre=-/usr/bin/docker stop unified-gpu-agent
+ExecStartPre=-/usr/bin/docker rm unified-gpu-agent
+ExecStartPre=/usr/bin/docker pull ${agent_image}
+ExecStart=/usr/bin/docker run --rm \\
+  --name unified-gpu-agent \\
+  --network host \\
+  $GPU_FLAG \\
+  --env-file /etc/default/unified-gpu-agent \\
+  ${agent_image}
+ExecStop=/usr/bin/docker stop unified-gpu-agent
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ─── 8. Start / restart the agent ─────────────────────────────────────────
+
+systemctl daemon-reload
+systemctl enable unified-gpu-agent.service
+systemctl restart unified-gpu-agent.service
+
+echo "[$(date -Iseconds)] unified-gpu-agent install complete"
+echo "agent status: $(systemctl is-active unified-gpu-agent.service)"
+echo "agent logs:   journalctl -u unified-gpu-agent -f"

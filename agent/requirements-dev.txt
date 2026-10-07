@@ -1,0 +1,18 @@
+# Development / testing only — never included in Docker images
+-r requirements-full.txt
+
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+pytest-asyncio==0.21.1
+moto>=5.0.0,<6.0.0
+freezegun==1.2.2
+responses==0.24.1
+
+# grpcio-tools intentionally NOT pinned here. The 1.80+ line requires
+# protobuf>=6.31; sagemaker + google-cloud-* require protobuf<5. Any
+# version that satisfies both — there isn't one — would resolve, so
+# we keep it out of the lockfile entirely. bin/regen-proto.sh installs
+# it on demand into a throwaway venv; see that script for the version
+# pin. Devs who only need to run the test suite never need
+# grpcio-tools, so requirements-dev.txt stays clean.

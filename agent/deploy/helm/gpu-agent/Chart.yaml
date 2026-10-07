@@ -1,0 +1,18 @@
+apiVersion: v2
+name: gpu-agent
+description: tensorcost Unified GPU Cost Optimization Agent
+type: application
+version: 1.0.0
+appVersion: "2.0.0"
+kubeVersion: ">=1.24.0"
+keywords:
+  - gpu
+  - monitoring
+  - cost-optimization
+  - tensorcost
+home: https://tensorcost.com
+sources:
+  - https://github.com/gpu-usage/unified-gpu-agent
+maintainers:
+  - name: tensorcost Platform Team
+    email: platform@tensorcost.com

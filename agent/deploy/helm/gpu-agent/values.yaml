@@ -1,0 +1,198 @@
+# Default values for gpu-agent Helm chart.
+# This is a YAML-formatted file. See README.md for full documentation.
+
+# ── Image ─────────────────────────────────────────────────────────────
+image:
+  repository: ghcr.io/tensorcost/agent
+  # Variants: latest (full), aws, gcp, azure, node
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# ── Workload topology ─────────────────────────────────────────────────
+# Agents are stateless — deploy as Deployment (default) or DaemonSet
+# (for per-node GPU sampling via NVML).
+workload:
+  kind: Deployment
+  replicaCount: 1
+  # When kind=DaemonSet, the agent runs on every node; replicaCount is ignored.
+  # Use DaemonSet when NVML_ENABLED=true (each pod samples its node's GPUs).
+
+# ── Required credentials ──────────────────────────────────────────────
+# Agent authenticates to the backend via API key + tenant ID.
+# By default these come from an existing Secret (create it ahead of install).
+# For dev you can inline values — NEVER do that in prod.
+auth:
+  # Name of a Kubernetes Secret containing `api-key` and `tenant-id` keys.
+  # Leave empty to have the chart create one from `auth.inline.*` below.
+  existingSecret: ""
+  secretKeys:
+    apiKey: api-key
+    tenantId: tenant-id
+    keyId: key-id
+    hmacPepper: hmac-pepper
+    hostname: hostname
+
+  inline:
+    apiKey: ""
+    tenantId: ""
+    keyId: ""
+    hmacPepper: ""
+    hostname: ""
+
+# ── Backend connectivity ──────────────────────────────────────────────
+backend:
+  # HTTP API base URL (used for sync fallback and initial handshake)
+  apiUrl: ""
+  # gRPC endpoint for bidirectional streaming (preferred)
+  grpcTarget: ""
+  grpcUseTls: true
+
+# ── Communication mode ───────────────────────────────────────────────
+# "grpc" | "http" | "both"  — "both" uses HTTP as fallback when gRPC is down
+commMode: grpc
+
+# ── Monitoring configuration ─────────────────────────────────────────
+monitoring:
+  # Collection interval in seconds (default 300 = 5 min)
+  intervalSeconds: 300
+  # Log level: DEBUG | INFO | WARNING | ERROR
+  logLevel: INFO
+
+# ── Cloud provider monitors ──────────────────────────────────────────
+# Each monitor is opt-in. Set enabled=true and supply the required config.
+monitors:
+  aws:
+    enabled: false
+    region: us-east-1
+    services: "ec2,sagemaker"
+    # IAM: prefer IRSA (eks) or pod identity over static credentials.
+    # If credentials are required, point to a Secret with AWS_ACCESS_KEY_ID
+    # and AWS_SECRET_ACCESS_KEY entries.
+    credentialsSecret: ""
+
+  azure:
+    enabled: false
+    subscriptionId: ""
+    resourceGroup: ""
+    services: "virtual_machines"
+    # Secret with AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID
+    credentialsSecret: ""
+
+  gcp:
+    enabled: false
+    projectId: ""
+    services: "compute_engine"
+    # Secret containing a "key.json" entry (service account JSON key)
+    credentialsSecret: ""
+
+  kubernetes:
+    enabled: false
+    namespaces: "default"
+    # In-cluster mode uses the pod's service account — recommended.
+    # Set kubeconfigSecret to point to an out-of-cluster kubeconfig instead.
+    inCluster: true
+    kubeconfigSecret: ""
+
+  sagemaker:
+    enabled: false
+    services: "training_jobs,endpoints"
+
+# ── Optional feature monitors ────────────────────────────────────────
+features:
+  nvml:
+    enabled: false
+    sampleInterval: 10
+    idleGpuThreshold: 10
+    idleMemoryThreshold: 10
+    idleDuration: 120
+
+  aiSpend:
+    enabled: false
+
+  inferenceServer:
+    enabled: false
+
+  trainingMonitor:
+    enabled: false
+
+  llmGateway:
+    enabled: false
+
+  clusterMonitor:
+    enabled: false
+
+  spotHandler:
+    enabled: false
+    pollInterval: 5
+
+# ── Observability ────────────────────────────────────────────────────
+telemetry:
+  otel:
+    enabled: false
+    # OTLP endpoint — if empty, defaults to the Collector sidecar at localhost:4317
+    exporterEndpoint: ""
+
+# ── Kubernetes resources ─────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# ── Scheduling ───────────────────────────────────────────────────────
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# When workload.kind=DaemonSet and you want the agent only on GPU nodes:
+#   nodeSelector:
+#     nvidia.com/gpu.present: "true"
+#   tolerations:
+#     - key: nvidia.com/gpu
+#       operator: Exists
+#       effect: NoSchedule
+
+# ── Service account ──────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # For AWS EKS IRSA, set:
+  #   annotations:
+  #     eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/gpu-agent
+
+# ── Pod security ─────────────────────────────────────────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false  # agent writes to ./logs and ./data
+  capabilities:
+    drop:
+      - ALL
+
+# ── Health checks ────────────────────────────────────────────────────
+# Agent writes a heartbeat file (see Dockerfile HEALTHCHECK); no HTTP server.
+healthCheck:
+  enabled: true
+  heartbeatPath: /app/data/heartbeat
+  maxAgeSeconds: 120
+  livenessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+  readinessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3

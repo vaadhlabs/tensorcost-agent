@@ -1,0 +1,3 @@
+# Local development — installs everything including test deps
+# Docker images use variant-specific files (requirements-core/aws/gcp/azure/full.txt)
+-r requirements-dev.txt

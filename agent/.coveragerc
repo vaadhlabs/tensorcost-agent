@@ -1,0 +1,36 @@
+# Coverage.py configuration for the unified-gpu-agent test suite.
+#
+# The 80% floor is set in pytest.ini's addopts (--cov-fail-under=80) and
+# kept in lockstep here so direct `coverage run` invocations honour the
+# same gate.
+
+[run]
+source = src
+# branch = True is intentionally OFF for now. Branch coverage is the
+# next-rigour bump; flipping it on today would offset the proto-stub
+# exclusion's gate margin and is a separate decision.
+branch = False
+omit =
+    # Generated protocol-buffer stubs — regenerated from
+    # tensorcost-agent.proto via bin/regen-proto.sh. Hand-writing
+    # tests against generated code is anti-pattern; the consuming
+    # code in src/grpc_client.py exercises them indirectly.
+    src/proto/agent_pb2.py
+    src/proto/agent_pb2_grpc.py
+
+[report]
+# Skip empty __init__.py files and lines that pragma out coverage.
+exclude_lines =
+    pragma: no cover
+    # Defensive imports for optional cloud SDKs (boto3 / azure-* /
+    # google-cloud-*) — present in some build variants, absent in
+    # others. Type-only re-export shims should not gate coverage.
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    if __name__ == .__main__.:
+
+[html]
+directory = htmlcov
+
+[xml]
+output = coverage.xml

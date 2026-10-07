@@ -1,0 +1,20 @@
+**/__pycache__/
+*.pyc
+*.pyo
+.claude/
+.coverage/
+logs
+
+.coverage
+.send_queue.json
+
+# Python virtual environments — these are operator-local installs.
+# `.regen-venv/` is the 3.11 venv kept for proto regeneration after
+# the system Python moved to 3.13 (see the gpu_index commit body).
+venv/
+.regen-venv/
+.venv/
+
+# Coverage and editor metadata.
+coverage/
+.DS_Store

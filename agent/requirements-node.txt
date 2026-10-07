@@ -1,0 +1,3 @@
+# Node variant — NVML local GPU metrics only, no cloud SDKs (~120 MB image)
+# Use this for per-GPU-node DaemonSet / sidecar deployments
+-r requirements-core.txt

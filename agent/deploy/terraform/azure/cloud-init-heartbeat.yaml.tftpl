@@ -1,0 +1,98 @@
+#cloud-config
+# ─── TensorCost agent heartbeat VM (no GPU) ─────────────────────────────
+# Lightweight bootstrap for Connect Agents / Fleet liveness when GPU quota
+# is zero. Skips NVIDIA drivers; agent runs with NVML disabled and Azure
+# cost monitor only.
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - curl
+  - wget
+  - jq
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - apt-transport-https
+
+write_files:
+  - path: /etc/default/unified-gpu-agent
+    permissions: '0600'
+    owner: root:root
+    content: |
+      BACKEND_API_URL=${backend_api_url}
+      BACKEND_API_KEY=${backend_api_key}
+      AGENT_API_KEY=${backend_api_key}
+      TENANT_ID=${tenant_id}
+      # Install identity from mint (AGENT_HOSTNAME) — not DNS; pins heartbeats to gpu.agent row
+      AGENT_HOSTNAME=${agent_hostname}
+      AGENT_KEY_ID=${agent_key_id}
+      AGENT_HMAC_PEPPER=${agent_hmac_pepper_hex}
+      GRPC_TARGET=${grpc_host}:${grpc_port}
+      GRPC_USE_TLS=true
+      COMM_MODE=${grpc_host == "" ? "http" : "both"}
+      NVML_ENABLED=false
+      MONITORING_INTERVAL=${metrics_push_interval}
+      ACTIVE_MONITORS=azure
+      AZURE_ENABLED=true
+      AZURE_SUBSCRIPTION_ID=${azure_subscription_id}
+      AZURE_RESOURCE_GROUP=${resource_group}
+
+  - path: /etc/docker/daemon.json
+    permissions: '0644'
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "50m", "max-file": "3" }
+      }
+
+  - path: /etc/systemd/system/unified-gpu-agent.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=TensorCost agent (heartbeat / Azure cost)
+      Requires=docker.service
+      After=docker.service network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      Restart=always
+      RestartSec=10s
+      EnvironmentFile=/etc/default/unified-gpu-agent
+      ExecStartPre=-/usr/bin/docker stop unified-gpu-agent
+      ExecStartPre=-/usr/bin/docker rm unified-gpu-agent
+%{ if use_private_acr ~}
+      ExecStartPre=/usr/bin/az login --identity
+      ExecStartPre=/usr/bin/az acr login --name ${acr_login_server}
+%{ endif ~}
+      ExecStartPre=/usr/bin/docker pull ${agent_image}
+      ExecStart=/usr/bin/docker run --rm \
+        --name unified-gpu-agent \
+        --network host \
+        --env-file /etc/default/unified-gpu-agent \
+        ${agent_image}
+      ExecStop=/usr/bin/docker stop unified-gpu-agent
+
+      [Install]
+      WantedBy=multi-user.target
+
+apt:
+  sources:
+    docker:
+      source: "deb [arch=amd64] https://download.docker.com/linux/ubuntu $RELEASE stable"
+      keyid: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+
+runcmd:
+  - apt-get update
+%{ if use_private_acr ~}
+  - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+%{ endif ~}
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - systemctl enable --now docker
+  - systemctl daemon-reload
+  - systemctl enable --now unified-gpu-agent.service
+  - echo "[$(date)] heartbeat cloud-init complete" > /var/log/gpu-init-complete.log
+
+final_message: "Heartbeat VM ready — agent should POST to ${backend_api_url} within ~60s."

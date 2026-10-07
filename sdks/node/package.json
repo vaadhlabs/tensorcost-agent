@@ -1,0 +1,63 @@
+{
+  "name": "@tensorcost/sdk",
+  "version": "1.3.0",
+  "description": "One-line wrapper SDK for TensorCost — fire-and-forget LLM observability for OpenAI, Anthropic, AWS Bedrock, and Google Vertex AI clients.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "llm",
+    "openai",
+    "anthropic",
+    "bedrock",
+    "vertex",
+    "google",
+    "aws",
+    "observability",
+    "cost",
+    "tensorcost"
+  ],
+  "author": "Vaadh Labs / TensorCost <engineering@tensorcost.com>",
+  "homepage": "https://tensorcost.com",
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsc -b --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --coverage",
+    "lint": "echo 'no lint configured'"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-bedrock-runtime": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^2.1",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

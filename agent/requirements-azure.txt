@@ -1,0 +1,9 @@
+# Azure variant — core + Azure SDK
+-r requirements-core.txt
+
+azure-identity==1.15.0
+azure-mgmt-compute==30.5.0
+azure-mgmt-monitor==6.0.2
+azure-mgmt-consumption==10.0.0
+azure-mgmt-resource==23.0.1
+azure-mgmt-costmanagement==4.0.0

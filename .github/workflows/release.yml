@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: docker/setup-qemu-action@291f638a3d1541480d7ea0a3604ed6ee390875e
+      - uses: docker/setup-buildx-action@b5ca514318bd6eacf1d6611faeabe877d9a3fbb
+      - uses: docker/login-action@74a5d1423316ad94822efe7d9b1e96650e30a1a4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@8e5442c4f9f7f108ef1ccc6a2663e8c6c0a6b6e
+        with:
+          images: ghcr.io/tensorcost/agent
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@263435896674E1BB9688410621E9635F068203B
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VARIANT=full
+          provenance: true
+          sbom: true
+
+  npm:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/node
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@39370e3970a6d50c2d111c1985d56786760d276a
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm ci && npm run build
+      - run: npm publish --provenance --access public
+
+  pypi:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/python
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@0a5c615913736394b2f866a58fbc4dfa1334b659
+        with:
+          python-version: "3.11"
+      - uses: pypa/gh-action-pypi-publish@release/v1
