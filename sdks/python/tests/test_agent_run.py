@@ -26,6 +26,25 @@ class TestAgentRunConfig:
         assert cfg.agent_id == "env-agent"
         assert cfg.workflow_id == "env-workflow"
 
+    def test_auto_workflow_id_off_by_default(self, monkeypatch):
+        monkeypatch.setenv("TENSORCOST_API_KEY", "k")
+        monkeypatch.delenv("TENSORCOST_WORKFLOW_ID", raising=False)
+        monkeypatch.delenv("TENSORCOST_AUTO_WORKFLOW_ID", raising=False)
+        cfg = resolve_config(agent_id="support-bot")
+        assert cfg.workflow_id is None
+
+    def test_auto_workflow_id_when_enabled(self, monkeypatch):
+        monkeypatch.setenv("TENSORCOST_API_KEY", "k")
+        cfg = resolve_config(agent_id="support-bot", auto_workflow_id=True)
+        assert cfg.workflow_id is not None
+        assert len(cfg.workflow_id) >= 32
+
+    def test_auto_workflow_id_env_flag(self, monkeypatch):
+        monkeypatch.setenv("TENSORCOST_API_KEY", "k")
+        monkeypatch.setenv("TENSORCOST_AUTO_WORKFLOW_ID", "1")
+        cfg = resolve_config(agent_id="support-bot")
+        assert cfg.workflow_id is not None
+
     def test_max_length_128(self, monkeypatch):
         monkeypatch.setenv("TENSORCOST_API_KEY", "k")
         with pytest.raises(MissingConfigError, match="agent_id"):

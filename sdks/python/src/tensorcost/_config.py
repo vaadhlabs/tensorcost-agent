@@ -19,6 +19,7 @@ loudly so the problem surfaces in development, not in production.
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -119,6 +120,7 @@ def resolve_config(
     feature: Optional[str] = None,
     agent_id: Optional[str] = None,
     workflow_id: Optional[str] = None,
+    auto_workflow_id: Optional[bool] = None,
     team_id: Optional[str] = None,
 ) -> ResolvedConfig:
     """Resolve final config values, env vars filling in any blanks."""
@@ -217,6 +219,11 @@ def resolve_config(
         workflow_id or os.environ.get("TENSORCOST_WORKFLOW_ID"),
         "workflow_id",
     )
+    auto_workflow_enabled = auto_workflow_id is True or (
+        os.environ.get("TENSORCOST_AUTO_WORKFLOW_ID", "").strip() == "1"
+    )
+    if final_workflow_id is None and final_agent_id and auto_workflow_enabled:
+        final_workflow_id = str(uuid.uuid4())
     raw_team = team_id or os.environ.get("TENSORCOST_TEAM_ID")
     final_team_id: Optional[str] = None
     if raw_team is not None:

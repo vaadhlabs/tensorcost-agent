@@ -357,8 +357,17 @@ export interface WrapOptions {
    * jobs, Bedrock clients with no per-call hook).
    *
    * Falls back to `TENSORCOST_WORKFLOW_ID` env var.
+   *
+   * When `agentId` is set and `workflowId` is omitted, a UUID is minted at
+   * wrap time when `autoWorkflowId: true` or
+   * `TENSORCOST_AUTO_WORKFLOW_ID=1`.
    */
   workflowId?: string;
+  /**
+   * When true and `agentId` is set without `workflowId`, mint one run id per
+   * wrapped client. Also enabled via `TENSORCOST_AUTO_WORKFLOW_ID=1`.
+   */
+  autoWorkflowId?: boolean;
   /**
    * Routing-policy application scope. Sent as `x-tc-application` on proxy
    * requests. Falls back to `TC_APPLICATION` / `TENSORCOST_APPLICATION`.

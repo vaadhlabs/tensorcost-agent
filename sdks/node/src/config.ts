@@ -16,6 +16,8 @@
  * and env, TensorCostConfigError is thrown.
  */
 
+import { randomUUID } from "node:crypto";
+
 import type { ResolvedConfig, WrapOptions } from "./types.js";
 import { DEFAULT_RETRY_CONFIG } from "./retry.js";
 import {
@@ -151,8 +153,15 @@ export function resolveConfig(options: WrapOptions = {}): ResolvedConfig {
 
   const workflowIdRaw =
     options.workflowId ?? process.env.TENSORCOST_WORKFLOW_ID ?? null;
-  const workflowId =
+  let workflowId =
     workflowIdRaw !== null ? String(workflowIdRaw).trim() || null : null;
+
+  const autoWorkflowEnabled =
+    options.autoWorkflowId === true ||
+    process.env.TENSORCOST_AUTO_WORKFLOW_ID === "1";
+  if (!workflowId && agentId && autoWorkflowEnabled) {
+    workflowId = randomUUID();
+  }
 
   const applicationRaw =
     options.application ??
