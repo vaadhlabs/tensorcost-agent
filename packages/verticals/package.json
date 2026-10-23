@@ -1,6 +1,6 @@
 {
   "name": "@tensorcost/verticals",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Install-scope vertical flags (TC_VERTICAL_*) for modular control-plane deployments.",
   "license": "Apache-2.0",
   "type": "module",

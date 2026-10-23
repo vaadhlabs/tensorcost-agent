@@ -21,8 +21,11 @@ const ENV_BY_VERTICAL: Record<VerticalName, string> = {
 export function isVerticalEnabled(name: VerticalName, env: NodeJS.ProcessEnv = process.env): boolean {
   const key = ENV_BY_VERTICAL[name];
   const raw = env[key];
-  if (raw === undefined || raw === "") return true;
-  return raw === "true" || raw === "1";
+  const enabled = raw === undefined || raw === "" ? true : raw === "true" || raw === "1";
+  if (name === "aiMl" && enabled) {
+    return isVerticalEnabled("ai", env);
+  }
+  return enabled;
 }
 
 export function installedVerticals(env: NodeJS.ProcessEnv = process.env): Record<VerticalName, boolean> {
@@ -66,6 +69,5 @@ export function serviceVerticalGate(serviceName: string): VerticalName | undefin
 export function isServiceDeployed(serviceName: string, env: NodeJS.ProcessEnv = process.env): boolean {
   const gate = serviceVerticalGate(serviceName);
   if (!gate) return true;
-  if (gate === "aiMl" && !isVerticalEnabled("ai", env)) return false;
   return isVerticalEnabled(gate, env);
 }
