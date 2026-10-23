@@ -7,6 +7,11 @@ Apache-2.0 collection layer for **GPU telemetry** and **LLM usage metadata**. Ru
 | GPU agent | [`agent/`](./agent/) | Docker `ghcr.io/vaadhlabs/tensorcost-agent` |
 | Node SDK | [`sdks/node/`](./sdks/node/) | npm `@tensorcost/sdk` |
 | Python SDK | [`sdks/python/`](./sdks/python/) | PyPI `tensorcost` |
+| Install vertical flags | [`packages/verticals/`](./packages/verticals/) | npm `@tensorcost/verticals` |
+| Agent install (bare metal / k8s / compose) | [`install/`](./install/) | scripts in-repo |
+| SDK examples | [`examples/`](./examples/) | copy-paste integrations |
+
+Open vs commercial split: [docs/OSS-BOUNDARY.md](./docs/OSS-BOUNDARY.md). Install profiles (BYOC flags): [docs/install-profiles/](./docs/install-profiles/).
 
 **Ingest contract (v1):** [docs/ingest-contract.md](./docs/ingest-contract.md)
 

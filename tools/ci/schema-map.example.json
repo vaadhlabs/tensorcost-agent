@@ -1,0 +1,9 @@
+{
+  "servicesDir": "backend/services",
+  "schemaByService": {
+    "billing-service": "billing",
+    "orders-service": "orders",
+    "catalog-service": "catalog"
+  },
+  "optionalVerticalSchemas": ["billing", "orders", "catalog"]
+}

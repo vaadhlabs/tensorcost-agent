@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tensorcost.com/schemas/install-verticals.json",
+  "title": "InstallVerticalManifest",
+  "type": "object",
+  "required": ["profiles", "groups"],
+  "properties": {
+    "profiles": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "ai": { "type": "boolean" },
+          "aiMl": { "type": "boolean" },
+          "fleet": { "type": "boolean" },
+          "controls": { "type": "boolean" },
+          "reporting": { "type": "boolean" },
+          "billing": { "type": "boolean" },
+          "devTools": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "groups": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "always": { "type": "boolean" },
+          "services": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        },
+        "required": ["services"]
+      }
+    }
+  }
+}

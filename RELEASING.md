@@ -22,7 +22,8 @@ That triggers [`.github/workflows/release.yml`](./.github/workflows/release.yml)
 | Job | Output |
 |-----|--------|
 | **docker** | Multi-arch image to **GHCR** `ghcr.io/vaadhlabs/tensorcost-agent` (tags: semver, `latest` on release) |
-| **npm** | **`@tensorcost/sdk`** on [npmjs.com](https://www.npmjs.com/package/@tensorcost/sdk) |
+| **npm-sdk** | **`@tensorcost/sdk`** on [npmjs.com](https://www.npmjs.com/package/@tensorcost/sdk) |
+| **npm-verticals** | **`@tensorcost/verticals`** on npm |
 | **pypi** | **`tensorcost`** on [PyPI](https://pypi.org/project/tensorcost/) |
 
 CI on every push does **not** publish; only `v*` tags do.

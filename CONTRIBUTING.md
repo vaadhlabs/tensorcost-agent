@@ -4,7 +4,14 @@ Thanks for helping improve TensorCost’s open-source collection layer.
 
 ## Scope
 
-This repository contains the GPU telemetry agent and LLM SDK wrappers. The control plane (attribution, routing, savings proof, governance) is not developed here.
+This repository is the **Apache-2.0** home for TensorCost’s collection and integration layer:
+
+- GPU telemetry **agent** and customer **install** paths
+- Node/Python **SDKs** (`@tensorcost/sdk`, `tensorcost`)
+- Published libraries under **`packages/`** (vertical install flags, CLI, MCP framework, etc.)
+- **Examples** and generic **CI tools** (e.g. cross-schema migration checks)
+
+The **control plane** (multi-tenant services, billing, proprietary analytics) is developed in the private monorepo. See [docs/OSS-BOUNDARY.md](./docs/OSS-BOUNDARY.md).
 
 ## Development
 

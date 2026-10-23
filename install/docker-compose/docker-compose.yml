@@ -1,0 +1,91 @@
+version: '3.8'
+
+# TensorCost GPU Agent — Docker Compose quick-start
+#
+# Prerequisites:
+#   1. Docker with the NVIDIA container toolkit installed and the daemon
+#      restarted after toolkit installation.
+#   2. Copy .env.example to .env and fill in your credentials from the
+#      TensorCost onboarding wizard.
+#
+# Usage:
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d
+#   docker compose logs -f
+#
+# To stop:
+#   docker compose down
+
+services:
+  gpu-agent:
+    # Published by vaadhlabs/gpu-agents CI (Docker Hub; anonymous pull).
+    image: public.ecr.aws/tensorcost/gpu-agent:latest
+    container_name: tensorcost-agent
+    restart: unless-stopped
+
+    # GPU access — requires nvidia-container-toolkit on the Docker host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Use host networking so the agent correctly identifies the host's network
+    # interfaces and hostname. If host networking is not available, set
+    # AGENT_HOSTNAME explicitly in .env to match the server-side agent record.
+    network_mode: host
+
+    environment:
+      # Credentials — loaded from .env file.
+      BACKEND_API_URL: ${BACKEND_API_URL}
+      TENANT_ID: ${TENANT_ID}
+      AGENT_HOSTNAME: ${AGENT_HOSTNAME:-}
+      AGENT_API_KEY: ${AGENT_API_KEY}
+      AGENT_KEY_ID: ${AGENT_KEY_ID}
+      AGENT_HMAC_PEPPER: ${AGENT_HMAC_PEPPER}
+
+      # Transport — plain HTTP by default; switch to "both" and set GRPC_TARGET
+      # to enable real-time gRPC streaming.
+      COMM_MODE: ${COMM_MODE:-http}
+      GRPC_TARGET: ${GRPC_TARGET:-}
+      GRPC_USE_TLS: ${GRPC_USE_TLS:-true}
+
+      # Cloud monitoring — all off by default for the quickstart.
+      # Set any of these to "true" to enable cloud cost collection.
+      AWS_ENABLED: ${AWS_ENABLED:-false}
+      GCP_ENABLED: ${GCP_ENABLED:-false}
+      AZURE_ENABLED: ${AZURE_ENABLED:-false}
+      K8S_ENABLED: ${K8S_ENABLED:-false}
+
+      # Monitoring cadence and verbosity.
+      MONITORING_INTERVAL: ${MONITORING_INTERVAL:-300}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+    volumes:
+      # Persist agent state between restarts (heartbeat file, queue, etc.)
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+      # Uncomment to mount cloud credentials for cost collection:
+      # AWS credentials file (alternative to IAM instance profile):
+      #   - ~/.aws:/home/gpuagent/.aws:ro
+      # GCP service account key (needed when GCP_ENABLED=true):
+      #   - ./gcp-key.json:/secrets/gcp-key.json:ro
+      # Kubeconfig (needed when K8S_ENABLED=true):
+      #   - ~/.kube/config:/root/.kube/config:ro
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import os, time, sys
+          p = '/app/data/heartbeat'
+          sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 600 else 1)
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3

@@ -1,0 +1,29 @@
+# Example only — dummy services. Real product maps stay in the private control-plane repo.
+
+profiles:
+  full:
+    ai: true
+    fleet: true
+    reporting: true
+  no-fleet:
+    ai: true
+    fleet: false
+    reporting: true
+  core-only:
+    ai: false
+    fleet: false
+    reporting: false
+
+groups:
+  core:
+    always: true
+    services:
+      - api-gateway
+      - identity
+      - ledger
+  fleet:
+    services:
+      - gpu-ingest
+  ai:
+    services:
+      - llm-ingest

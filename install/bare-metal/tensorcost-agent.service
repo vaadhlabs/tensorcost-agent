@@ -1,0 +1,52 @@
+[Unit]
+Description=TensorCost GPU Agent
+Documentation=https://tensorcost.com/docs/agent
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+TimeoutStartSec=60
+
+# Load secrets from the env file written by install.sh.
+# Only root can read this file — set by install.sh chmod 600.
+EnvironmentFile=/etc/tensorcost/agent.env
+
+# Pull-then-run pattern: always re-pull on start so fleet upgrades happen
+# automatically on service restart. Remove the ExecStartPre line if you
+# want pinned behavior (pull manually, then restart the service).
+ExecStartPre=-/usr/bin/docker rm -f tensorcost-agent
+ExecStartPre=/usr/bin/docker pull AGENT_IMAGE_PLACEHOLDER
+
+ExecStart=/usr/bin/docker run --rm \
+  --name tensorcost-agent \
+  --gpus all \
+  --network host \
+  --env-file /etc/tensorcost/agent.env \
+  -v /var/lib/tensorcost/data:/app/data \
+  -v /var/lib/tensorcost/logs:/app/logs \
+  AGENT_IMAGE_PLACEHOLDER
+
+ExecStop=/usr/bin/docker stop tensorcost-agent
+
+# Create the runtime directories if they don't exist.
+ExecStartPre=/bin/mkdir -p /var/lib/tensorcost/data /var/lib/tensorcost/logs
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tensorcost-agent
+
+# Give the agent access to the host's GPU device nodes.
+# On most distributions the Docker --gpus all flag handles this, but
+# explicit access grants here prevent breakage if device nodes are
+# created after Docker daemon start.
+DeviceAllow=/dev/nvidia* rwm
+DeviceAllow=/dev/nvidiactl rwm
+DeviceAllow=/dev/nvidia-uvm rwm
+DeviceAllow=/dev/nvidia-uvm-tools rwm
+
+[Install]
+WantedBy=multi-user.target

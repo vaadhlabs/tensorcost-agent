@@ -1,0 +1,216 @@
+# TensorCost GPU Agent — Kubernetes DaemonSet
+#
+# Deploys the agent on every node labeled nvidia.com/gpu: "true".
+#
+# BEFORE APPLYING: replace every <placeholder> below with real values.
+# See kubernetes/README.md for where each value comes from.
+#
+# Apply:
+#   kubectl apply -f agent-daemonset.yaml
+#
+# Follow logs:
+#   kubectl -n tensorcost logs -l app=tensorcost-agent -f
+# ─────────────────────────────────────────────────────────────────────────────
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tensorcost
+  labels:
+    app.kubernetes.io/managed-by: tensorcost
+
+---
+# Secret — holds the agent credentials from the onboarding wizard.
+# Use stringData: so kubectl handles base64 encoding automatically.
+# In production, inject this from Vault / AWS Secrets Manager / External Secrets
+# rather than storing plaintext in your repo.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tensorcost-agent-credentials
+  namespace: tensorcost
+  labels:
+    app: tensorcost-agent
+type: Opaque
+stringData:
+  TENANT_ID: "<your-tenant-uuid>"
+  AGENT_API_KEY: "<your-agent-api-key>"
+  AGENT_KEY_ID: "<your-agent-key-id>"
+  AGENT_HMAC_PEPPER: "<your-agent-hmac-pepper>"
+
+---
+# ConfigMap — non-secret configuration. Safe to commit once filled in.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tensorcost-agent-config
+  namespace: tensorcost
+  labels:
+    app: tensorcost-agent
+data:
+  BACKEND_API_URL: "<gateway-url>"  # e.g. https://api.dev.tensorcost.com
+  # GPU metrics: the agent defaults NVML_ENABLED to false, so a DaemonSet on GPU
+  # nodes reports no GPU data unless this is set. Turn it on here.
+  NVML_ENABLED: "true"
+  NVML_SAMPLE_INTERVAL: "10"
+  # Set COMM_MODE to "both" and fill in GRPC_TARGET to enable gRPC streaming:
+  COMM_MODE: "http"
+  GRPC_TARGET: ""      # e.g. api.dev.tensorcost.com:443
+  GRPC_USE_TLS: "true"
+  # Agent variant to run. "node" is the lightest image for pure NVML sampling.
+  # Use "full", "aws", "gcp", or "azure" if you also want cloud cost collection.
+  MONITORING_INTERVAL: "300"
+  LOG_LEVEL: "INFO"
+  K8S_ENABLED: "true"  # Let the agent read pod/node metadata via the in-cluster API
+
+---
+# ServiceAccount — in-cluster identity for the agent pods.
+# Annotate with eks.amazonaws.com/role-arn for IRSA (EKS).
+# On GKE, workload identity binds via a different annotation — see GKE docs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tensorcost-agent
+  namespace: tensorcost
+  labels:
+    app: tensorcost-agent
+
+---
+# ClusterRole — minimal read access to GPU node + pod metadata.
+# The agent does NOT need write access to any Kubernetes resource.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tensorcost-agent
+  labels:
+    app: tensorcost-agent
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tensorcost-agent
+  labels:
+    app: tensorcost-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tensorcost-agent
+subjects:
+  - kind: ServiceAccount
+    name: tensorcost-agent
+    namespace: tensorcost
+
+---
+# DaemonSet — one agent pod per GPU-bearing node.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tensorcost-agent
+  namespace: tensorcost
+  labels:
+    app: tensorcost-agent
+spec:
+  selector:
+    matchLabels:
+      app: tensorcost-agent
+
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+
+  template:
+    metadata:
+      labels:
+        app: tensorcost-agent
+        # Version tag — bump this when you change the image so kubectl rollout
+        # history gives you meaningful diffs.
+        app.kubernetes.io/version: "latest"
+
+    spec:
+      serviceAccountName: tensorcost-agent
+
+      # Only schedule on nodes with GPUs.
+      nodeSelector:
+        nvidia.com/gpu: "true"
+
+      tolerations:
+        # NVIDIA device plugin typically taints GPU nodes; tolerate it.
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      # Host PID/network required for accurate NVML enumeration on some kernel
+      # versions and for the agent to report the correct node hostname.
+      hostPID: false
+      hostNetwork: false
+
+      containers:
+        - name: tensorcost-agent
+          # Published by vaadhlabs/gpu-agents CI (Docker Hub; tag :node for k8s sidecar).
+          image: public.ecr.aws/tensorcost/gpu-agent:latest
+          imagePullPolicy: Always
+
+          # AGENT_HOSTNAME must match the server-side agent record.
+          # Using the Kubernetes node name is the natural choice for DaemonSets.
+          env:
+            - name: AGENT_HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          envFrom:
+            - secretRef:
+                name: tensorcost-agent-credentials
+            - configMapRef:
+                name: tensorcost-agent-config
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+
+          # GPU access — the nvidia.com/gpu resource request is needed so the
+          # device plugin mounts the NVIDIA devices into the container.
+          # Setting the limit to 0 requests access WITHOUT consuming a GPU slot
+          # (read-only NVML sampling does not require a compute context).
+          # If your cluster's device plugin requires a non-zero limit, set it to 1.
+          #   limits:
+          #     nvidia.com/gpu: 0   # change to 1 if needed
+
+          volumeMounts:
+            - name: agent-data
+              mountPath: /app/data
+            - name: agent-logs
+              mountPath: /app/logs
+
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import os, time, sys
+                  p = '/app/data/heartbeat'
+                  sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 600 else 1)
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            failureThreshold: 3
+
+      volumes:
+        - name: agent-data
+          emptyDir: {}
+        - name: agent-logs
+          emptyDir: {}
