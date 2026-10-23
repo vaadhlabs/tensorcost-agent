@@ -63,7 +63,14 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
       - run: npm ci && npm run build
-      - run: npm publish --provenance --access public
+      - name: Publish to npm (skip if version already live)
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if npm view "@tensorcost/sdk@${VERSION}" version 2>/dev/null; then
+            echo "@tensorcost/sdk@${VERSION} is already on npm; skipping publish."
+            exit 0
+          fi
+          npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -81,7 +88,15 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
       - run: npm ci && npm run build && npm test
-      - run: npm publish --provenance --access public
+      - name: Publish to npm (skip if version already live)
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if npm view "@tensorcost/verticals@${VERSION}" version 2>/dev/null; then
+            echo "@tensorcost/verticals@${VERSION} is already on npm; skipping publish."
+            echo "::warning::Version was published outside this job (no npm provenance attestation). Prefer tag-only releases and let CI publish."
+            exit 0
+          fi
+          npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
