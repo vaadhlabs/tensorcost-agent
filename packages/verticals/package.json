@@ -20,6 +20,12 @@
   "publishConfig": {
     "access": "public"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vaadhlabs/tensorcost-agent.git",
+    "directory": "packages/verticals"
+  },
+  "homepage": "https://tensorcost.com",
   "engines": {
     "node": ">=18"
   },
