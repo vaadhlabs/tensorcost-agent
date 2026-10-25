@@ -171,15 +171,30 @@ describe("runRunaway", () => {
     expect(text).toMatch(/inference-proxy\.sandbox\.enabled/);
   });
 
-  it("uses the messages path for the anthropic shape", async () => {
-    const stub = stubBackend([() => json(403, STOPPED_BODY)]);
-    const { deps } = makeDeps(stub.fetchImpl);
-    await runRunaway(
-      opts({ provider: "anthropic", providerUrl: "https://sandbox.inference.test/v1/messages" }),
-      deps,
-    );
-    expect(stub.proxyCalls[0]!.url).toBe(`https://tc.test${PROXY_PATH}messages`);
-    expect(stub.proxyCalls[0]!.body).toHaveProperty("max_tokens");
+  it("a 403 that isn't a TensorCost refusal prints 403 UNKNOWN and exits 1, not 3", async () => {
+    // What a WAF or load balancer sends: no TensorCost error body at all.
+    for (const reply of [
+      () => new Response("<html><body>403 Forbidden</body></html>", { status: 403, headers: { "content-type": "text/html" } }),
+      () => json(403, { message: "Forbidden" }),
+      () => json(403, { error: { code: "FORBIDDEN", message: "bad token" } }),
+    ]) {
+      const stub = stubBackend([reply]);
+      const { deps, out, err } = makeDeps(stub.fetchImpl);
+      expect(await runRunaway(opts(), deps)).toBe(1);
+      expect(out.some((l) => /status=403/.test(l))).toBe(true);
+      expect(out.some((l) => l.startsWith("403 UNKNOWN: "))).toBe(true);
+      expect(out.some((l) => /^403 (RUN_STOPPED|RUN_BUDGET_EXCEEDED)/.test(l))).toBe(false);
+      expect(err.join("\n")).toMatch(/did not come from a TensorCost stop or cap/);
+    }
+  });
+
+  it("exits 3 for any other TensorCost policy refusal, with its code", async () => {
+    const stub = stubBackend([
+      () => json(403, { error: { code: "MODEL_GOVERNANCE_DENIED", message: "model denied" } }),
+    ]);
+    const { deps, out } = makeDeps(stub.fetchImpl);
+    expect(await runRunaway(opts(), deps)).toBe(3);
+    expect(out.some((l) => l.startsWith("403 MODEL_GOVERNANCE_DENIED: "))).toBe(true);
   });
 
   it("exits 3 for a run-cap refusal too", async () => {
@@ -205,6 +220,27 @@ describe("runRunaway", () => {
 });
 
 describe("main (CLI wrapper)", () => {
+  it("refuses --provider anthropic up front, since the proxy routes only chat/completions", async () => {
+    const stub = stubBackend([]);
+    const { deps, err } = makeDeps(stub.fetchImpl);
+    const code = await main(
+      [
+        "--model", "claude-3-5-haiku-latest",
+        "--api-key", "k",
+        "--tenant-id", "t",
+        "--provider", "anthropic",
+        "--provider-url", "https://sandbox.inference.test/v1/messages",
+      ],
+      {},
+      deps,
+    );
+    expect(code).toBe(1);
+    const text = err.join("\n");
+    expect(text).toMatch(/--provider anthropic is not supported/);
+    expect(text).toMatch(/chat\/completions/);
+    expect(stub.proxyCalls).toHaveLength(0);
+  });
+
   it("is a usage error without --model", async () => {
     const stub = stubBackend([]);
     const { deps, err } = makeDeps(stub.fetchImpl);

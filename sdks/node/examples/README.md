@@ -16,9 +16,12 @@ step   3  input_tokens=~246  status=403
 403 RUN_STOPPED: Agent run <id> was stopped by <who> at <time>: <reason>
 ```
 
-When the proxy refuses a call with a 403 (an operator stopped the run, or the run hit
-its hard cap) it prints `403 <code>: <message>` and exits 3. Any other error exits 1,
-and so does a usage mistake. Reaching `--max-steps` exits 0. A `~` before the token
+When TensorCost refuses a call with a 403 (an operator stopped the run, the run hit
+its hard cap, or another TensorCost policy said no) it prints `403 <code>: <message>`
+and exits 3. A 403 that is not one of those, say from a WAF or a load balancer in
+front of the proxy, prints `403 UNKNOWN: <message>` and exits 1, so a
+misconfiguration never looks like a stop. Any other error exits 1, and so does a
+usage mistake. Reaching `--max-steps` exits 0. A `~` before the token
 count means the call was refused, so the number is an estimate from the request size.
 
 ## Run it
@@ -48,9 +51,15 @@ provider bill. It only does that for a tenant with the
 prints the error, a hint naming the flag, and exits 1. Ask TensorCost to turn the flag
 on for your tenant.
 
-The sandbox answers non-streaming calls only, which is all this agent makes. For the
-Anthropic shape use `--provider anthropic` and
-`https://sandbox.inference.tensorcost.com/v1/messages`.
+The sandbox answers non-streaming calls only, which is all this agent makes.
+
+### OpenAI shape only
+
+The proxy routes OpenAI-style `/v1/chat/completions` and nothing else today. The
+Anthropic SDK posts `/v1/messages`, which the proxy would answer with 404 before any
+cap or stop applied, so `--provider anthropic` is refused up front with a message
+saying so. Use `--provider openai` (the default) and a model the sandbox has a rate
+for.
 
 ## Flags
 
@@ -65,7 +74,7 @@ required too, but can come from the environment.
 | `--provider-url` | `TENSORCOST_PROVIDER_URL` | required |
 | `--base-url` | `TENSORCOST_BASE_URL` | `https://api.tensorcost.com` |
 | `--proxy-url` | `TENSORCOST_PROXY_URL` | the base URL |
-| `--provider` | | `openai` (or `anthropic`) |
+| `--provider` | | `openai` (the only shape the proxy routes) |
 | `--workflow-id` | | `runaway-<uuid>` |
 | `--agent-id` | | `research-agent` (a label) |
 | `--growth` | | `1.5` |

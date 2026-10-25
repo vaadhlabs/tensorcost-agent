@@ -7,7 +7,13 @@
  * climb until something stops it. It makes its calls through the TensorCost
  * proxy with wrap({ maxLayer: "route" }), tagged with a run id and an agent
  * id. When an operator stops the run, or the run hits its cap, the proxy
- * answers 403, the agent prints the refusal and exits 3.
+ * answers 403, the agent prints the refusal and exits 3. A 403 that is not a
+ * TensorCost policy refusal (a WAF or load balancer, say) prints
+ * `403 UNKNOWN: <message>` and exits 1, so a misconfiguration never looks
+ * like a stop.
+ *
+ * Calls are OpenAI chat completions only: that is the one shape the proxy
+ * routes today.
  *
  * Point --provider-url at the sandbox endpoint and nothing is sent to a real
  * model provider: the proxy answers the call itself. The tenant needs the
@@ -26,9 +32,18 @@ import {
   TensorCostRunBudgetExceededError,
   TensorCostPeriodBudgetExceededError,
   TensorCostRunStoppedError,
+  TensorCostModelGovernanceDeniedError,
+  TensorCostGuardrailHardStopError,
+  TensorCostComplianceDeniedError,
+  TensorCostComplianceTeamMismatchError,
 } from "../src/index.js";
 
-export type RunawayProvider = "openai" | "anthropic";
+/**
+ * Only the OpenAI shape. The proxy routes /v1/chat/completions; the Anthropic
+ * SDK posts /v1/messages, which the proxy does not route, so every call
+ * would fail with 404 before a cap or a stop could ever apply.
+ */
+export type RunawayProvider = "openai";
 
 export interface RunawayOptions {
   apiKey: string;
@@ -86,7 +101,7 @@ const USAGE = `usage: runaway-agent --model <id> [options]
   --base-url <url>       TensorCost backend              (TENSORCOST_BASE_URL)
   --proxy-url <url>      inference proxy, if not the base (TENSORCOST_PROXY_URL)
   --tenant-id <id>       tenant for token exchange       (TENSORCOST_TENANT_ID)
-  --provider <name>      openai | anthropic              (default openai)
+  --provider <name>      openai (the only shape the proxy routes)
   --provider-url <url>   provider endpoint, e.g. the sandbox (TENSORCOST_PROVIDER_URL)
   --model <id>           model to call                   (required)
   --workflow-id <id>     run id                          (default runaway-<uuid>)
@@ -149,8 +164,16 @@ export function parseOptions(argv: readonly string[], env: Env): RunawayOptions 
   if (!tenantId) throw new UsageError("--tenant-id (or TENSORCOST_TENANT_ID) is required");
 
   const provider = f.get("provider") ?? DEFAULTS.provider;
-  if (provider !== "openai" && provider !== "anthropic") {
-    throw new UsageError("--provider must be openai or anthropic");
+  if (provider === "anthropic") {
+    throw new UsageError(
+      "--provider anthropic is not supported: the TensorCost proxy routes only " +
+        "OpenAI-style /v1/chat/completions, and the Anthropic shape posts /v1/messages, " +
+        "which it would answer with 404. Use --provider openai (the default) with a " +
+        "model the sandbox or your OpenAI-compatible endpoint serves.",
+    );
+  }
+  if (provider !== "openai") {
+    throw new UsageError("--provider must be openai");
   }
 
   const baseUrl = (pick("base-url", "TENSORCOST_BASE_URL") ?? DEFAULTS.baseUrl).replace(/\/+$/, "");
@@ -178,7 +201,7 @@ export function parseOptions(argv: readonly string[], env: Env): RunawayOptions 
  * if the proxy were unreachable, and this example never wants that: a run
  * that cannot reach TensorCost should end, not go around it.
  */
-function sealedClient(provider: RunawayProvider, providerUrl: string) {
+function sealedClient(providerUrl: string) {
   const refuse = async (): Promise<never> => {
     throw new Error("direct provider calls are disabled in this example");
   };
@@ -189,9 +212,7 @@ function sealedClient(provider: RunawayProvider, providerUrl: string) {
     apiKey: "not-used",
     defaultHeaders: {} as Record<string, string>,
   };
-  return provider === "openai"
-    ? { ...common, chat: { completions: { create: refuse } } }
-    : { ...common, messages: { create: refuse } };
+  return { ...common, chat: { completions: { create: refuse } } };
 }
 
 interface Reply {
@@ -207,25 +228,31 @@ function bodyFor(o: RunawayOptions, step: number): Record<string, unknown> {
   const messages = [
     { role: "user", content: `Step ${step}. Keep researching.\n${promptFor(step, o.growth)}` },
   ];
-  return o.provider === "anthropic"
-    ? { model: o.model, max_tokens: 256, messages }
-    : { model: o.model, messages };
+  return { model: o.model, messages };
 }
 
-/** The code and message of a refusal, however the SDK surfaced it. */
+const withoutPrefix = (m: string): string => m.replace(/^tensorcost: /, "");
+
+/**
+ * The code and message of a TensorCost policy refusal, however the SDK
+ * surfaced it, or null for anything else. Only the SDK's typed refusals
+ * count: they are built from the proxy's own 403 body. A bare 403 from
+ * something in front of the proxy is not one of them.
+ */
 function refusalOf(e: unknown): { code: string; message: string } | null {
   if (e instanceof TensorCostRunStoppedError) {
     return { code: e.code, message: e.message };
   }
-  const withoutPrefix = (m: string): string => m.replace(/^tensorcost: /, "");
-  if (e instanceof TensorCostRunBudgetExceededError) {
-    return { code: "RUN_BUDGET_EXCEEDED", message: withoutPrefix(e.message) };
-  }
-  if (e instanceof TensorCostPeriodBudgetExceededError) {
-    return { code: "PERIOD_BUDGET_EXCEEDED", message: withoutPrefix(e.message) };
-  }
-  if (e instanceof TensorCostError && e.status === 403) {
-    return { code: e.name, message: withoutPrefix(e.message) };
+  const typed: Array<[new (...a: never[]) => Error, string]> = [
+    [TensorCostRunBudgetExceededError, "RUN_BUDGET_EXCEEDED"],
+    [TensorCostPeriodBudgetExceededError, "PERIOD_BUDGET_EXCEEDED"],
+    [TensorCostModelGovernanceDeniedError, "MODEL_GOVERNANCE_DENIED"],
+    [TensorCostGuardrailHardStopError, "GUARDRAIL_HARD_STOP"],
+    [TensorCostComplianceDeniedError, "COMPLIANCE_DENIED"],
+    [TensorCostComplianceTeamMismatchError, "COMPLIANCE_TEAM_MISMATCH"],
+  ];
+  for (const [cls, code] of typed) {
+    if (e instanceof cls) return { code, message: withoutPrefix(e.message) };
   }
   return null;
 }
@@ -243,13 +270,14 @@ function pad(n: number, width: number): string {
 
 /**
  * Runs the loop and returns the process exit code: 0 after max-steps,
- * 3 when the proxy refused a call with a 403, 1 for anything else.
+ * 3 when TensorCost refused a call (a stop or a cap), 1 for anything else,
+ * including a 403 that did not come from a TensorCost policy.
  */
 export async function runRunaway(o: RunawayOptions, deps: RunawayDeps): Promise<number> {
   const realFetch = globalThis.fetch;
   if (deps.fetch) globalThis.fetch = deps.fetch;
   try {
-    const client = wrap(sealedClient(o.provider, o.providerUrl), {
+    const client = wrap(sealedClient(o.providerUrl), {
       apiKey: o.apiKey,
       baseUrl: o.baseUrl,
       proxyUrl: o.proxyUrl,
@@ -262,11 +290,9 @@ export async function runRunaway(o: RunawayOptions, deps: RunawayDeps): Promise<
     });
 
     const api = client as {
-      chat?: { completions: { create: (b: unknown) => Promise<Reply> } };
-      messages?: { create: (b: unknown) => Promise<Reply> };
+      chat: { completions: { create: (b: unknown) => Promise<Reply> } };
     };
-    const call = (body: Record<string, unknown>): Promise<Reply> =>
-      o.provider === "openai" ? api.chat!.completions.create(body) : api.messages!.create(body);
+    const call = (body: Record<string, unknown>): Promise<Reply> => api.chat.completions.create(body);
 
     for (let step = 1; step <= o.maxSteps; step += 1) {
       const body = bodyFor(o, step);
@@ -283,8 +309,20 @@ export async function runRunaway(o: RunawayOptions, deps: RunawayDeps): Promise<
           deps.out(`403 ${refusal.code}: ${refusal.message}`);
           return EXIT_REFUSED;
         }
-        const status = e instanceof TensorCostError && e.status !== null ? e.status : "error";
+        // The SDK can wrap the proxy's answer, so read the status through it.
+        const status = providerStatusOf(e) ?? "error";
         deps.out(`step ${pad(step, 3)}  input_tokens=~${estimate}  status=${status}`);
+        if (providerStatusOf(e) === 403) {
+          // A 403 the SDK could not read as a TensorCost refusal: a WAF, a
+          // load balancer, a bad key. Say so plainly, and do not exit 3.
+          const message = e instanceof Error ? withoutPrefix(e.message) : String(e);
+          deps.out(`403 UNKNOWN: ${message}`);
+          deps.err(
+            "The 403 did not come from a TensorCost stop or cap. Check the API key, " +
+              "the proxy URL and anything in front of the proxy (a WAF or load balancer).",
+          );
+          return EXIT_ERROR;
+        }
         deps.err(e instanceof Error ? e.message : String(e));
         if (providerStatusOf(e) === 400) {
           // The SDK keeps the status of a 400 but not its body. With the
