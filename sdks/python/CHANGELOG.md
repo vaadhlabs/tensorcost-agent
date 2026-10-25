@@ -3,7 +3,17 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 1.4.0 — 2026-10-25
+
+### Added
+
+**`TensorCostRunStoppedError`** — maps proxy `403` / `RUN_STOPPED` (an operator
+stopped the agent run), on the applied-mode chat path and on the govern-layer
+`/v1/admit`. Carries `workflow_id`, `stopped_by`, `stopped_at` and `reason`.
+Terminal: `should_fall_back_to_provider()` returns False for it, so with
+`fail_open_enabled` (the default) a stopped run no longer goes to the
+provider directly. Before this, the 403 surfaced as a generic provider error
+and fail-open called the provider anyway.
 
 ## 1.3.0 — 2026-09-26
 

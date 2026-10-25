@@ -142,6 +142,61 @@ export class TensorCostRunBudgetExceededError extends TensorCostError {
 }
 
 /**
+ * An operator stopped the agent run this call belongs to, and the proxy
+ * refused the request (HTTP 403, `code: "RUN_STOPPED"`).
+ *
+ * Terminal for the same reason as the budget refusals: a stop is a decision
+ * from a healthy proxy, so falling back to the provider would simply undo
+ * it. Carries the who / when / why the proxy recorded.
+ */
+export class TensorCostRunStoppedError extends TensorCostError {
+  /**
+   * Build the error from the proxy's 403 `error` object. Shared by the
+   * chat-completions client and the govern-layer admit client, which both
+   * receive the same body.
+   */
+  static fromProxyBody(
+    detail: Record<string, unknown> | undefined,
+    opts: TensorCostErrorOptions = {},
+  ): TensorCostRunStoppedError {
+    const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+    return new TensorCostRunStoppedError(
+      str(detail?.["message"]) ?? "tensorcost: agent run was stopped",
+      {
+        workflowId: str(detail?.["workflow_id"]),
+        stoppedBy: str(detail?.["stopped_by"]),
+        stoppedAt: str(detail?.["stopped_at"]),
+        reason: str(detail?.["reason"]),
+      },
+      opts,
+    );
+  }
+
+  readonly code = "RUN_STOPPED";
+  readonly workflowId: string | null;
+  readonly stoppedBy: string | null;
+  readonly stoppedAt: string | null;
+  readonly reason: string | null;
+
+  constructor(
+    message: string,
+    detail: {
+      workflowId?: string | null;
+      stoppedBy?: string | null;
+      stoppedAt?: string | null;
+      reason?: string | null;
+    } = {},
+    opts: TensorCostErrorOptions = {},
+  ) {
+    super(message, { ...opts, status: opts.status ?? 403 });
+    this.workflowId = detail.workflowId ?? null;
+    this.stoppedBy = detail.stoppedBy ?? null;
+    this.stoppedAt = detail.stoppedAt ?? null;
+    this.reason = detail.reason ?? null;
+  }
+}
+
+/**
  * Daily or monthly agent/team spend cap exceeded (HTTP 403,
  * `code: "PERIOD_BUDGET_EXCEEDED"`). Terminal — must not fall back to the
  * provider or the cap becomes a suggestion.

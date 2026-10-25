@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 — 2026-10-25
+
+### Added
+
+**`TensorCostRunStoppedError`** — maps proxy `403` / `RUN_STOPPED` (an operator
+stopped the agent run). Carries `workflowId`, `stoppedBy`, `stoppedAt` and
+`reason`. Terminal: it never falls back to the provider, so a stopped run
+stays stopped. Before this, a stop surfaced as a generic provider error and
+applied mode's fail-open path would call the provider directly.
+
+### Fixed
+
+**Govern layer: a stopped run throws `TensorCostRunStoppedError`.** The proxy
+now refuses a stopped run on `/v1/admit` too. The OpenAI and Anthropic
+wrappers throw the stop with its detail instead of a generic "refused at
+govern layer" governance error, and never call the provider.
 
 ## 1.3.0 — 2026-09-26
 

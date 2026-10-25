@@ -152,6 +152,65 @@ class TensorCostRunBudgetExceededError(TensorCostError):
         self.spent_cents = spent_cents
 
 
+class TensorCostRunStoppedError(TensorCostError):
+    """An operator stopped this agent run (HTTP 403, ``code: RUN_STOPPED``).
+
+    Terminal for the same reason as the budget refusals: the stop comes from
+    a healthy proxy, so falling back to the provider would undo it. Carries
+    the who / when / why the proxy recorded.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        workflow_id: Optional[str] = None,
+        stopped_by: Optional[str] = None,
+        stopped_at: Optional[str] = None,
+        reason: Optional[str] = None,
+        *,
+        root_cause: Optional[Exception] = None,
+        status: int = 403,
+        request_id: Optional[str] = None,
+        attempt: int = 1,
+    ) -> None:
+        super().__init__(
+            message,
+            root_cause=root_cause,
+            status=status,
+            request_id=request_id,
+            attempt=attempt,
+        )
+        self.workflow_id = workflow_id
+        self.stopped_by = stopped_by
+        self.stopped_at = stopped_at
+        self.reason = reason
+
+    @classmethod
+    def from_proxy_detail(
+        cls,
+        detail: dict,
+        *,
+        request_id: Optional[str] = None,
+        attempt: int = 1,
+    ) -> "TensorCostRunStoppedError":
+        """Build from the proxy's 403 ``error`` object (chat path and /admit)."""
+
+        def _s(key: str) -> Optional[str]:
+            v = detail.get(key)
+            return v if isinstance(v, str) else None
+
+        return cls(
+            _s("message") or "tensorcost: agent run was stopped",
+            workflow_id=_s("workflow_id"),
+            stopped_by=_s("stopped_by"),
+            stopped_at=_s("stopped_at"),
+            reason=_s("reason"),
+            status=403,
+            request_id=request_id,
+            attempt=attempt,
+        )
+
+
 class TensorCostPeriodBudgetExceededError(TensorCostError):
     """Daily/monthly agent or team cap reached (HTTP 403,
     ``code: PERIOD_BUDGET_EXCEEDED``). Terminal — must not fail-open.

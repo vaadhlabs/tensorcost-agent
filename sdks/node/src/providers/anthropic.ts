@@ -30,6 +30,7 @@ import {
   TensorCostModelGovernanceDeniedError,
   TensorCostComplianceDeniedError,
   TensorCostComplianceTeamMismatchError,
+  TensorCostRunStoppedError,
 } from "../errors.js";
 import { TensorCostConfigError } from "../config.js";
 import type { CircuitBreaker } from "../circuit.js";
@@ -217,6 +218,7 @@ function wrapMethod(
           });
         });
         if (!admit.allowed) {
+          if (admit.refusal) throw admit.refusal;
           throw new TensorCostModelGovernanceDeniedError(
             "tensorcost: request refused at govern layer",
             "anthropic",
@@ -227,7 +229,12 @@ function wrapMethod(
         }
         decisionMeta = decisionMetadata(admit.decisionHeader);
       } catch (err) {
-        if (err instanceof TensorCostModelGovernanceDeniedError) throw err;
+        if (
+          err instanceof TensorCostModelGovernanceDeniedError ||
+          err instanceof TensorCostRunStoppedError
+        ) {
+          throw err;
+        }
       }
     }
 

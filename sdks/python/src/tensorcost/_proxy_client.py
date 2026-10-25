@@ -34,6 +34,7 @@ from ._errors import (
     TensorCostQuotaError,
     TensorCostPeriodBudgetExceededError,
     TensorCostRunBudgetExceededError,
+    TensorCostRunStoppedError,
     TensorCostTimeoutError,
 )
 from ._retry import (
@@ -583,6 +584,10 @@ def _terminal_proxy_refusal_error(
 ) -> Optional[BaseException]:
     """Map a 403 proxy body to a terminal refusal error, or None if not ours."""
     code, detail = _extract_proxy_refusal_code(content)
+    if code == "RUN_STOPPED":
+        return TensorCostRunStoppedError.from_proxy_detail(
+            detail, request_id=request_id, attempt=attempt
+        )
     if code in ("RUN_BUDGET_EXCEEDED", "PERIOD_BUDGET_EXCEEDED"):
         if code == "PERIOD_BUDGET_EXCEEDED":
             return TensorCostPeriodBudgetExceededError(
@@ -797,6 +802,7 @@ def should_fall_back_to_provider(err: BaseException) -> bool:
         err,
         (
             TensorCostRunBudgetExceededError,
+            TensorCostRunStoppedError,
             TensorCostPeriodBudgetExceededError,
             TensorCostModelGovernanceDeniedError,
             TensorCostGuardrailHardStopError,

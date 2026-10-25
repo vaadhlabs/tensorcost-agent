@@ -27,7 +27,7 @@ def test_generate_content_observation_shape(vertex_client, recording_transport):
     assert obs["status"] == "success"
     assert obs["input_tokens"] == 42
     assert obs["output_tokens"] == 17
-    assert obs["sdk_version"] == "tensorcost-python/1.3.0"
+    assert obs["sdk_version"] == "tensorcost-python/1.4.0"
     assert obs["correlation_id"]
 
 

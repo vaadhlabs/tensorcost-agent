@@ -42,6 +42,7 @@ import {
   TensorCostQuotaError,
   TensorCostProviderError,
   TensorCostRunBudgetExceededError,
+  TensorCostRunStoppedError,
   TensorCostPeriodBudgetExceededError,
   TensorCostModelGovernanceDeniedError,
   TensorCostGuardrailHardStopError,
@@ -530,6 +531,26 @@ export async function proxyRequest(
         throw tcErr;
       }
 
+      if (code === "RUN_STOPPED") {
+        const tcErr = runStoppedError(detail, {
+          status: 403,
+          requestId,
+          attempt: attempt + 1,
+        });
+        // Healthy proxy, correct answer — not a circuit failure.
+        emitEvent(opts.onLifecycleEvent, {
+          kind: "on_error",
+          provider: opts.provider,
+          model: opts.model,
+          operation: opts.operation,
+          attemptNumber: attempt + 1,
+          elapsedMs: Date.now() - callStart,
+          errorClass: tcErr.constructor.name,
+          status: 403,
+        });
+        throw tcErr;
+      }
+
       if (code === "MODEL_GOVERNANCE_DENIED") {
         const tcErr = new TensorCostModelGovernanceDeniedError(
           typeof detail?.["message"] === "string"
@@ -640,6 +661,14 @@ export async function proxyRequest(
   throw lastError ?? new TensorCostProxyError("tensorcost: max attempts reached");
 }
 
+/** Build the terminal error for a `RUN_STOPPED` 403 from the proxy's body. */
+function runStoppedError(
+  detail: Record<string, unknown> | undefined,
+  opts: { status: number; requestId: string | null; attempt: number },
+): TensorCostRunStoppedError {
+  return TensorCostRunStoppedError.fromProxyBody(detail, opts);
+}
+
 /**
  * Should a failed proxy attempt fall back to calling the provider
  * directly?
@@ -656,6 +685,7 @@ export async function proxyRequest(
 export function shouldFallBackToProvider(err: unknown): boolean {
   return !(
     err instanceof TensorCostRunBudgetExceededError ||
+    err instanceof TensorCostRunStoppedError ||
     err instanceof TensorCostPeriodBudgetExceededError ||
     err instanceof TensorCostModelGovernanceDeniedError ||
     err instanceof TensorCostGuardrailHardStopError ||
@@ -899,6 +929,9 @@ export async function proxyRequestStream(
         numOrNull(detail?.["spent_cents"]),
         { status: 403, requestId, attempt: attempt + 1 },
       );
+    }
+    if (code === "RUN_STOPPED") {
+      throw runStoppedError(detail, { status: 403, requestId, attempt: attempt + 1 });
     }
     if (code === "MODEL_GOVERNANCE_DENIED") {
       throw new TensorCostModelGovernanceDeniedError(

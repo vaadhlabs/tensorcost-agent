@@ -29,6 +29,7 @@ from ._errors import (
     TensorCostQuotaError,
     TensorCostProviderError,
     TensorCostRunBudgetExceededError,
+    TensorCostRunStoppedError,
     TensorCostPeriodBudgetExceededError,
     TensorCostComplianceDeniedError,
     TensorCostComplianceTeamMismatchError,
@@ -44,7 +45,7 @@ from ._telemetry import (
 )
 from ._retry import RetryConfig
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __all__ = [
     "wrap",
     "prewarm",
@@ -59,6 +60,7 @@ __all__ = [
     "TensorCostQuotaError",
     "TensorCostProviderError",
     "TensorCostRunBudgetExceededError",
+    "TensorCostRunStoppedError",
     "TensorCostPeriodBudgetExceededError",
     "TensorCostComplianceDeniedError",
     "TensorCostComplianceTeamMismatchError",
