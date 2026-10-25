@@ -666,17 +666,7 @@ function runStoppedError(
   detail: Record<string, unknown> | undefined,
   opts: { status: number; requestId: string | null; attempt: number },
 ): TensorCostRunStoppedError {
-  const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
-  return new TensorCostRunStoppedError(
-    str(detail?.["message"]) ?? "tensorcost: agent run was stopped",
-    {
-      workflowId: str(detail?.["workflow_id"]),
-      stoppedBy: str(detail?.["stopped_by"]),
-      stoppedAt: str(detail?.["stopped_at"]),
-      reason: str(detail?.["reason"]),
-    },
-    opts,
-  );
+  return TensorCostRunStoppedError.fromProxyBody(detail, opts);
 }
 
 /**

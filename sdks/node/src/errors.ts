@@ -150,6 +150,28 @@ export class TensorCostRunBudgetExceededError extends TensorCostError {
  * it. Carries the who / when / why the proxy recorded.
  */
 export class TensorCostRunStoppedError extends TensorCostError {
+  /**
+   * Build the error from the proxy's 403 `error` object. Shared by the
+   * chat-completions client and the govern-layer admit client, which both
+   * receive the same body.
+   */
+  static fromProxyBody(
+    detail: Record<string, unknown> | undefined,
+    opts: TensorCostErrorOptions = {},
+  ): TensorCostRunStoppedError {
+    const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+    return new TensorCostRunStoppedError(
+      str(detail?.["message"]) ?? "tensorcost: agent run was stopped",
+      {
+        workflowId: str(detail?.["workflow_id"]),
+        stoppedBy: str(detail?.["stopped_by"]),
+        stoppedAt: str(detail?.["stopped_at"]),
+        reason: str(detail?.["reason"]),
+      },
+      opts,
+    );
+  }
+
   readonly code = "RUN_STOPPED";
   readonly workflowId: string | null;
   readonly stoppedBy: string | null;

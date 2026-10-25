@@ -1,4 +1,9 @@
-"""Govern-layer admit — metadata-only POST /api/inference-proxy/v1/admit."""
+"""Govern-layer admit — metadata-only POST /api/inference-proxy/v1/admit.
+
+Fail-open on transport errors. A 403 is a refusal, never a transport error;
+when its body says RUN_STOPPED this raises TensorCostRunStoppedError so the
+caller gets who stopped the run and why instead of a generic govern refusal.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ from typing import Any, Callable, Optional
 
 import httpx
 
+from ._errors import TensorCostRunStoppedError
 from ._layer import ADMIT_PATH, ADMIT_TIMEOUT_S, ControlLayer
 from ._transport import ObservationTransport
 from ._version import SDK_VERSION, sdk_capability_header
@@ -27,7 +33,10 @@ def admit_request(
     timeout_s: float = ADMIT_TIMEOUT_S,
     http_client: Optional[httpx.Client] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Returns (allowed, decision_header). Fail-open on transport errors."""
+    """Returns (allowed, decision_header). Fail-open on transport errors.
+
+    Raises TensorCostRunStoppedError for a RUN_STOPPED 403.
+    """
     url = base_url.rstrip("/") + ADMIT_PATH
     headers = {
         "Authorization": f"Bearer {bearer_token}",
@@ -39,18 +48,23 @@ def admit_request(
 
     own_client = http_client is None
     client = http_client or httpx.Client(timeout=timeout_s)
+    # Raised after the try below: inside it, fail-open would swallow it.
+    stopped: Optional[TensorCostRunStoppedError] = None
     try:
         resp = client.post(url, headers=headers, json=metadata)
         decision_header = resp.headers.get("x-tc-decision")
         if resp.status_code == 403:
-            return False, decision_header
-        if resp.status_code >= 400:
+            stopped = _run_stopped_from(resp)
+            if stopped is None:
+                return False, decision_header
+        elif resp.status_code >= 400:
             raise httpx.HTTPStatusError(
                 f"admit POST failed status={resp.status_code}",
                 request=resp.request,
                 response=resp,
             )
-        return True, decision_header
+        else:
+            return True, decision_header
     except Exception as exc:
         if fail_open:
             if transport is not None:
@@ -82,3 +96,18 @@ def admit_request(
     finally:
         if own_client:
             client.close()
+    assert stopped is not None
+    raise stopped
+
+
+def _run_stopped_from(resp: httpx.Response) -> Optional[TensorCostRunStoppedError]:
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict) and err.get("code") == "RUN_STOPPED":
+        return TensorCostRunStoppedError.from_proxy_detail(
+            err, request_id=resp.headers.get("x-tc-request-id")
+        )
+    return None
