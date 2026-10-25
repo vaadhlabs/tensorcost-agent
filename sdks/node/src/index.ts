@@ -10,6 +10,7 @@ export {
   TensorCostQuotaError,
   TensorCostProviderError,
   TensorCostRunBudgetExceededError,
+  TensorCostRunStoppedError,
   TensorCostPeriodBudgetExceededError,
   TensorCostModelGovernanceDeniedError,
   TensorCostGuardrailHardStopError,

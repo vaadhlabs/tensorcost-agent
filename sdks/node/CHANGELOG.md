@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+**`TensorCostRunStoppedError`** — maps proxy `403` / `RUN_STOPPED` (an operator
+stopped the agent run). Carries `workflowId`, `stoppedBy`, `stoppedAt` and
+`reason`. Terminal: it never falls back to the provider, so a stopped run
+stays stopped. Before this, a stop surfaced as a generic provider error and
+applied mode's fail-open path would call the provider directly.
+
 ## 1.3.0 — 2026-09-26
 
 Minor release: period-budget refusals and agent-run span linking so proxied

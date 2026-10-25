@@ -314,6 +314,7 @@ try {
 ```
 
 Per-run caps still raise `TensorCostRunBudgetExceededError` (`RUN_BUDGET_EXCEEDED`).
+A run an operator has stopped raises `TensorCostRunStoppedError` (`RUN_STOPPED`) with `stoppedBy`, `stoppedAt` and `reason`; like the cap errors it never fails open to the provider.
 
 ## Data grants (`maxGrants`)
 
