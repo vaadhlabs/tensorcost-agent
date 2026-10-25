@@ -3,7 +3,7 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 1.4.0 — 2026-10-25
 
 ### Added
 
