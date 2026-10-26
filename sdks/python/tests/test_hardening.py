@@ -281,7 +281,7 @@ def _admit_answering(status: int, body: Any = None):
 
 
 class TestAnthropicHardeningViaWrap:
-    """1.4.1: Anthropic is pinned to govern, so 'hardening' here is the
+    """1.5.0: Anthropic is pinned to govern, so 'hardening' here is the
     /admit path: allow → direct call, outage → fail-open per the flag."""
 
     def test_pinned_admit_allow_calls_anthropic_not_the_proxy(self):

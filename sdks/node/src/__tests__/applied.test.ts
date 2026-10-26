@@ -141,7 +141,7 @@ describe("auth formatters", () => {
 // installAppliedMode — per-provider header injection
 // ---------------------------------------------------------------------------
 
-describe("installAppliedMode leaves the client alone (1.4.1)", () => {
+describe("installAppliedMode leaves the client alone (1.5.0)", () => {
   // Through 1.4.0 this rewrote baseURL to the proxy and replaced
   // defaultHeaders with a plain object, which broke openai@4 (its
   // defaultHeaders is a method) and sent the "direct" fallback to the proxy.

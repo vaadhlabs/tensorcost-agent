@@ -1,6 +1,6 @@
 {
   "name": "@tensorcost/sdk",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "One-line wrapper SDK for TensorCost — fire-and-forget LLM observability for OpenAI, Anthropic, AWS Bedrock, and Google Vertex AI clients.",
   "license": "Apache-2.0",
   "type": "module",

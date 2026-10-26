@@ -1,5 +1,5 @@
 /**
- * 1.4.1 wiring: the Anthropic govern pin through wrap(), the tenant-id
+ * 1.5.0 wiring: the Anthropic govern pin through wrap(), the tenant-id
  * requirement, the Bedrock/Vertex govern warning, observation `application`
  * / `tags` (held back behind an internal flag), and the token exchange
  * typing what it gets back.
@@ -177,7 +177,7 @@ describe("Bedrock and Vertex at govern warn that nothing is enforced", () => {
   });
 });
 
-describe("observations: application and tags are held back in 1.4.1", () => {
+describe("observations: application and tags are held back in 1.5.0", () => {
   const run = async () => {
     const calls = stubApi();
     const client = openaiFake();
@@ -200,7 +200,7 @@ describe("observations: application and tags are held back in 1.4.1", () => {
     expect(obs[0]).not.toHaveProperty("tags");
   });
 
-  it("are sent when the internal flag is on (1.5)", async () => {
+  it("are sent when the internal flag is on (a later release)", async () => {
     overheadTest.setObservationScope(true);
     const obs = await run();
     expect(obs[0]).toMatchObject({ application: "checkout", tags: ["team=pay", "tier=gold"] });

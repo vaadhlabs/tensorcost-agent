@@ -749,7 +749,7 @@ def proxy_request_stream(
         ),
     )
     # Transport failures are typed here so the fail-open predicate (an
-    # allow-list since 1.4.1) recognises them as outages.
+    # allow-list since 1.5.0) recognises them as outages.
     try:
         resp = stream_ctx.__enter__()
     except httpx.TimeoutException as exc:

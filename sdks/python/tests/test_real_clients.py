@@ -1,7 +1,7 @@
 """wrap() against the real provider SDKs, not MagicMocks.
 
 openai and anthropic aren't dependencies of this package, so this module
-skips unless both import. To run it, put a copy on PYTHONPATH (the 1.4.1
+skips unless both import. To run it, put a copy on PYTHONPATH (the 1.5.0
 run used openai 2.32.0 and anthropic 0.96.0 from an existing local venv).
 """
 

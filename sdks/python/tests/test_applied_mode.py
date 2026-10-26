@@ -326,7 +326,7 @@ class TestOpenAIAppliedMode:
 
         with patch("tensorcost._providers._openai.proxy_request") as mock_proxy:
             # proxy_request only ever raises typed errors; an outage is
-            # TensorCostProxyError (1.4.1: raw exceptions don't fall back).
+            # TensorCostProxyError (1.5.0: raw exceptions don't fall back).
             mock_proxy.side_effect = TensorCostProxyError("proxy down")
             result = client.chat.completions.create(
                 model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}]
@@ -415,7 +415,7 @@ class TestAnthropicAppliedMode:
         assert result is sentinel
         assert len(recording_transport.observations) == 1
 
-    # 1.4.1: the proxy has no Anthropic Messages route, so applied mode /
+    # 1.5.0: the proxy has no Anthropic Messages route, so applied mode /
     # steer / route for an Anthropic client runs as govern. The old
     # proxy-path tests here asserted header shapes on a call that, against a
     # real proxy, could only fail open around TensorCost.

@@ -45,4 +45,4 @@ export { wrapCrewAI } from "./adapters/crewai.js";
 export { wrapVercelAi } from "./adapters/vercel-ai.js";
 export { intersectGrants } from "./layer.js";
 
-export const version = "1.4.1";
+export const version = "1.5.0";

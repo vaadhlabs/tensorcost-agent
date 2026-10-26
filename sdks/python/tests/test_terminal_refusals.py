@@ -1,4 +1,4 @@
-"""1.4.1: the fail-open rule is an allow-list of outages.
+"""1.5.0: the fail-open rule is an allow-list of outages.
 
 1.4.0 decided "may this call go around TensorCost?" with a deny-list of
 refusal classes. A money budget's hard cap (BUDGET_HARD_CAP) wasn't on it, so
@@ -538,7 +538,7 @@ def test_lowercase_provider_code_in_a_403_is_not_a_refusal(tensorcost_api, recor
 
 
 # ---------------------------------------------------------------------------
-# Observations: application and tags are held back in 1.4.1 (byoc-v0.1.40
+# Observations: application and tags are held back in 1.5.0 (byoc-v0.1.40
 # rejects them), behind _observation_scope.SEND.
 
 

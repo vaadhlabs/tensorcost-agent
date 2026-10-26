@@ -220,7 +220,7 @@ def _post_obs(
         **({"agent_id": agent_id} if agent_id is not None else {}),
         **({"workflow_id": workflow_id} if workflow_id is not None else {}),
         # Routing-policy scope from wrap(application=, tags=); empty while
-        # _observation_scope.SEND is off (1.4.1), see that module.
+        # _observation_scope.SEND is off (1.5.0), see that module.
         **observation_scope(application, tags),
     }
     try:

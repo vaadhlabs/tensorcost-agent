@@ -14,7 +14,7 @@
  *   TENSORCOST_TEST_OPENAI=/path/to/node_modules/openai/index.mjs
  *   TENSORCOST_TEST_ANTHROPIC=/path/to/node_modules/@anthropic-ai/sdk/index.mjs
  *
- * 1.4.1 was checked against openai@4.104.0 and @anthropic-ai/sdk@0.65.0.
+ * 1.5.0 was checked against openai@4.104.0 and @anthropic-ai/sdk@0.65.0.
  */
 
 import { existsSync } from "node:fs";
@@ -165,6 +165,13 @@ describe.skipIf(!OPENAI || !existsSync(OPENAI))("a real openai@4 client", () => 
     expect(calls.filter((c) => c.url.startsWith("https://api.openai.com"))).toHaveLength(0);
   });
 
+  it("keeps openai@4's request id (plain-object header contract)", async () => {
+    const body = { error: { message: "bad", type: "invalid_request_error", code: "invalid_value" } };
+    const { create } = await client({ proxy: () => json(400, body, { "x-request-id": "req_v4" }) });
+    const err = (await create().catch((e: unknown) => e)) as { request_id?: string };
+    expect(err.request_id).toBe("req_v4");
+  });
+
   it("a relayed provider 401 is openai's AuthenticationError", async () => {
     const { create, OpenAI } = await client({
       proxy: () => json(401, { error: { message: "Incorrect API key", type: "invalid_request_error", code: "invalid_api_key" } }),
@@ -226,6 +233,22 @@ describe.skipIf(!ANTHROPIC || !existsSync(ANTHROPIC))("a real @anthropic-ai/sdk 
       "https://api.anthropic.com/v1/messages",
     ]);
     expect(warn.mock.calls.map((a) => String(a[0])).filter((m) => m.includes("Anthropic"))).toHaveLength(1);
+  });
+
+  it("its factory (headers.get contract) builds BadRequestError with the request id", async () => {
+    const { default: Anthropic } = (await import(ANTHROPIC)) as { default: any };
+    const { providerNativeError } = await import("../provider-errors.js");
+    const { TensorCostProviderError } = await import("../errors.js");
+    const c = new Anthropic({ apiKey: "sk-ant" });
+    const err = new TensorCostProviderError("tensorcost: upstream provider returned 400", {
+      status: 400,
+      body: { type: "error", error: { type: "invalid_request_error", message: "max_tokens required" } },
+      headers: { "request-id": "req_ant" },
+    });
+    const native = providerNativeError(c, err) as any;
+    expect(native).toBeInstanceOf(Anthropic.BadRequestError);
+    expect(native.requestID).toBe("req_ant");
+    expect(native.tensorcost).toBe(err);
   });
 
   it("a money-budget hard cap on /admit stops the call before Anthropic", async () => {

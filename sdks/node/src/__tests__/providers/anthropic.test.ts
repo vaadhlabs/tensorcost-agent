@@ -158,7 +158,7 @@ describe("anthropic provider wrapper", () => {
 
 describe("anthropic provider — applied mode via wrapMethod", () => {
   it("pins route to govern: admits, never calls the proxy, calls Anthropic directly, warns once", async () => {
-    // 1.4.1: the proxy has no Anthropic Messages route, so steer/route for
+    // 1.5.0: the proxy has no Anthropic Messages route, so steer/route for
     // a Claude client would only ever fail open around TensorCost. Govern
     // keeps the pre-call /admit check, which is what can stop a run.
     anthropicProvider.__test__.resetPinWarning();
@@ -318,7 +318,7 @@ describe("anthropic provider — applied mode via wrapMethod", () => {
     await flush();
   });
 
-  it("throws TensorCostProxyError on a TensorCost 503 with failOpenEnabled=false (govern honours it since 1.4.1)", async () => {
+  it("throws TensorCostProxyError on a TensorCost 503 with failOpenEnabled=false (govern honours it since 1.5.0)", async () => {
     const log = { observations: [] as any[] };
     const transport = new ObservationTransport({
       tenantId: "t-1",

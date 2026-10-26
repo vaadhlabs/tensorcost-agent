@@ -113,7 +113,7 @@ def _post_obs(
         **({"agent_id": agent_id} if agent_id is not None else {}),
         **({"workflow_id": workflow_id} if workflow_id is not None else {}),
         # Routing-policy scope from wrap(application=, tags=); empty while
-        # _observation_scope.SEND is off (1.4.1), see that module.
+        # _observation_scope.SEND is off (1.5.0), see that module.
         **observation_scope(application, tags),
     }
     try:
@@ -423,7 +423,7 @@ def anthropic_layer(requested: ControlLayer) -> ControlLayer:
     """The layer an Anthropic client actually runs at.
 
     The proxy has no Anthropic Messages route yet, so steer/route can't put
-    the proxy in the request path for Claude. Before 1.4.1 that proxy call
+    the proxy in the request path for Claude. Before 1.5.0 that proxy call
     failed and fail-open sent the call straight to Anthropic, which meant
     nothing could stop a Claude run. Govern runs the pre-call /admit check
     instead, so stops, caps and budgets still apply. One warning per process

@@ -80,7 +80,7 @@ describe("admitRequest", () => {
     expect(shouldFallBackToProvider(err)).toBe(false);
   });
 
-  it("types every other 403 refusal by its code (1.4.1)", async () => {
+  it("types every other 403 refusal by its code (1.5.0)", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(403, { error: { code: "MODEL_GOVERNANCE_DENIED", message: "no" } }),
     );
@@ -96,7 +96,7 @@ describe("admitRequest", () => {
     expect(res.refusal?.code).toBe("MODEL_GOVERNANCE_DENIED");
   });
 
-  it("a 403 with a body that isn't JSON is a gateway rejection, still blocked (1.4.1)", async () => {
+  it("a 403 with a body that isn't JSON is a gateway rejection, still blocked (1.5.0)", async () => {
     const fetchImpl = vi.fn(async () => new Response("<html>403</html>", { status: 403 }));
     const res = await admitRequest({
       baseUrl: "http://proxy.local",

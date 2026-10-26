@@ -3,7 +3,7 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## 1.4.1 — 2026-10-25
+## 1.5.0 — 2026-10-26
 
 **1.4.0 could route around a hard spend cap when fail-open was on (the
 default); upgrade.** When a money budget's hard cap refused a call (403
@@ -11,22 +11,34 @@ with `code: "BUDGET_HARD_CAP"`), 1.4.0 read the refusal as a provider error,
 and with `fail_open_enabled` on it sent the call to the provider anyway. The
 cap was enforced by the proxy and then skipped by the SDK.
 
-**`govern`, `steer` and `route` now require a tenant id.** The token
-exchange needs it, so without one the SDK never talked to TensorCost at
-all: no `/v1/admit`, no proxy call, no observation, and every call went
-straight to the provider while the README called the variable optional.
-`wrap()` now raises `MissingConfigError` at those layers when neither
-`tenant_id` nor `TENSORCOST_TENANT_ID` is set, whatever `fail_open_enabled`
-says (1.4.0 skipped TensorCost silently, or with `fail_open_enabled=False`
-in route raised `TensorCostProxyError` on every call). The console shows the
-id under Developers › SDK setup. `observe` without one keeps working and
-logs one warning that nothing is being sent.
+This is a minor release, not a patch: it adds public error classes and
+makes `wrap()` raise at startup without a tenant id. Read the upgrade notes.
+
+### Upgrading from 1.4.x
+
+- **`wrap()` requires a tenant id at `govern`, `steer` and `route`.** The
+  token exchange needs it, so without one the SDK never talked to TensorCost
+  at all: no `/v1/admit`, no proxy call, no observation, and every call went
+  straight to the provider while the README called the variable optional.
+  `wrap()` now raises `MissingConfigError` at those layers when neither
+  `tenant_id` nor `TENSORCOST_TENANT_ID` is set, whatever `fail_open_enabled` says (1.4.0 skipped
+  TensorCost silently, or with `fail_open_enabled=False` in route raised
+  `TensorCostProxyError` on every call). Find the id in the TensorCost
+  console under **Developers › SDK setup**, in the `TENSORCOST_TENANT_ID`
+  line of the env block. `observe` without one keeps working and logs one
+  warning that nothing is being sent.
+- **Unknown refusals are terminal.** A refusal code this version doesn't
+  know stops the call as `TensorCostRefusedError`; it no longer falls back
+  to the provider. Details below.
+- **A revoked key fails closed.** A TensorCost key the token exchange,
+  `/v1/admit` or the proxy rejects is `TensorCostKeyRejectedError`, and the
+  call isn't sent. 1.4.0 sent it to the provider anyway when fail-open was on.
 
 ### Changed: an unknown refusal is now terminal
 
 1.4.0 decided whether a failed proxy call could go straight to the provider
 with a list of refusals that must not. Any refusal missing from that list,
-including ones added on the server later, fell back. 1.4.1 turns the rule
+including ones added on the server later, fell back. 1.5.0 turns the rule
 around: a call goes around TensorCost only when TensorCost is unavailable.
 
 - Falls back (with `fail_open_enabled` on): network errors and connection
@@ -46,7 +58,7 @@ around: a call goes around TensorCost only when TensorCost is unavailable.
   `AuthenticationError` and the rest; neither has a public equivalent), with
   the original `TensorCostProviderError` on its `tensorcost` attribute. A
   client that can't build one gets the `TensorCostProviderError` (`status`,
-  `body`, `headers`).
+  `body`, `headers`). Tested against openai 2.32.0 and anthropic 0.96.0.
 - A 4xx that isn't JSON (a firewall's HTML page, an empty body) is
   `TensorCostGatewayRejectedError`: the request was turned away before it
   reached TensorCost or the provider. Terminal.
@@ -138,18 +150,18 @@ as `TensorCostProviderError`, and a connection failure as a raw `httpx`
 exception; they are `TensorCostProxyError` / `TensorCostQuotaError` /
 `TensorCostNetworkError` / `TensorCostTimeoutError` now.
 
-### Not in 1.4.1: `application` and `tags` on observations
+### Not in 1.5.0: `application` and `tags` on observations
 
 The server's observation endpoint reads `application` and `tags`, and the
 SDK sends them only as `x-tc-application` / `x-tc-tags` on proxied calls.
 Adding them to observations is built but switched off: byoc-v0.1.40
 validates observations strictly and doesn't know the fields, so it would
-reject every observation that carried them. They come in 1.5, alongside the
-server release that accepts them.
+reject every observation that carried them. They come in a later release, alongside the server release that accepts
+them.
 
 ### Compatibility
 
-- Server: no minimum version. 1.4.1 reads both the money-budget shape the
+- Server: no minimum version. 1.5.0 reads both the money-budget shape the
   proxy sends since the change that added `budget_code` and the older
   `code: "BUDGET_HARD_CAP"` shape. Nothing new is sent to the server, so
   byoc-v0.1.40 keeps accepting every request and observation.
@@ -159,7 +171,7 @@ server release that accepts them.
   and for errors that aren't `TensorCost*` outages (1.4.0 returned True).
 - A relayed provider 4xx: with fail-open on, 1.4.0 sent the call to the
   provider a second time and you got the provider SDK's error from that
-  second call; with fail-open off you got `TensorCostProxyError`. 1.4.1
+  second call; with fail-open off you got `TensorCostProxyError`. 1.5.0
   raises the same provider error type, built from the relayed response,
   after one call.
 - A TensorCost 4xx that isn't an outage (a rejected key, a refusal with an

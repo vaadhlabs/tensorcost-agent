@@ -52,7 +52,7 @@ codebase needs to change.
 | Variable | Required | Description |
 |---|---|---|
 | `TENSORCOST_API_KEY` | Yes | Long-lived API key from the TensorCost console |
-| `TENSORCOST_TENANT_ID` | **Yes** | Your tenant id (console: **Developers › SDK setup**). Without it the SDK never reaches TensorCost; from 1.4.1 `wrap()` refuses `govern` and above without it |
+| `TENSORCOST_TENANT_ID` | **Yes** | Your tenant id (console: **Developers › SDK setup**). Without it the SDK never reaches TensorCost; from 1.5.0 `wrap()` refuses `govern` and above without it |
 | `TENSORCOST_BASE_URL` | No | Backend base URL (default: `https://api.tensorcost.com`) |
 | `TENSORCOST_ENVIRONMENT` | No | Environment tag stamped on every observation (e.g. `staging`) |
 | `TENSORCOST_CONNECTION_ID` | No | Provider-connection identifier for per-connection cost attribution |

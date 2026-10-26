@@ -2,7 +2,7 @@
 
 One-line wrapper for TensorCost — fire-and-forget LLM observability and optional inference control for OpenAI, Anthropic, AWS Bedrock, and Google Vertex AI clients in Node.js.
 
-**Current version:** 1.4.1 — fixes 1.4.0 routing around a money budget's hard cap when fail-open was on (the default); upgrade. See [CHANGELOG](./CHANGELOG.md), [SDK compliance](https://github.com/vaadhlabs/tensorcost/blob/main/docs/features/sdk-compliance.md), and [Migrating from 0.x](#migrating-from-0x).
+**Current version:** 1.5.0 — fixes 1.4.0 routing around a money budget's hard cap when fail-open was on (the default); upgrade. See [CHANGELOG](./CHANGELOG.md), [SDK compliance](https://github.com/vaadhlabs/tensorcost/blob/main/docs/features/sdk-compliance.md), and [Migrating from 0.x](#migrating-from-0x).
 
 ## Install
 
@@ -245,13 +245,13 @@ const client = wrap(new OpenAI(...), {
 
 | Option | Default | `TensorCostTimeoutError.kind` | On timeout (steer/route) |
 |---|---|---|---|
-| `headersTimeoutMs` | 2s | `"headers"` | Streaming only (when SSE client ships); **not used for buffered JSON** |
+| `headersTimeoutMs` | 2s | `"headers"` | Streaming (`stream: true`) proxy calls; **not used for buffered JSON** |
 | `timeoutMs` | 60s | `"total"` | TTFB + body for non-streaming proxy calls; fail-open when `failOpenEnabled: true` |
-| `idleTimeoutMs` | 30s | `"idle"` | Reserved for future steer SSE client |
+| `idleTimeoutMs` | 30s | `"idle"` | Streaming proxy calls: no bytes for this long ends the stream |
 
 For **non-streaming** steer/route, the SDK waits up to **`timeoutMs` for response headers** because the proxy may buffer the full upstream response before sending headers — using a 2s headers cap would fail-open and **double-bill** while the proxy still completes.
 
-**Streaming (`stream: true`):** not implemented through the steer proxy client (1.1.1). With `failOpenEnabled: true` (default), calls go **direct** to the provider. With `failOpenEnabled: false`, `TensorCostConfigError` is thrown.
+**Streaming (`stream: true`):** OpenAI chat completions stream through the proxy at steer/route; the SDK reads the proxy's SSE and hands you the chunks. Before the stream starts, refusals and outages are handled like a buffered call (a refusal is terminal; an outage fails open when `failOpenEnabled` is on). Once bytes are flowing, an idle gap longer than `idleTimeoutMs` ends the stream with `TensorCostTimeoutError` (`"idle"`).
 
 ### Lifecycle hooks
 
@@ -386,13 +386,14 @@ an agent link still attributes by `agentId` / `workflowId` alone.
 
 If TensorCost is slow or down, your customer call still succeeds. Internal errors are swallowed and logged via `console.warn` (or your lifecycle hook).
 
-Since 1.4.1 "down" is an allow-list: a call goes around TensorCost only on a network error, a timeout, a 5xx, or a 429 without a refusal body, and only with `failOpenEnabled` on. Everything else is an answer and reaches your code:
+Since 1.5.0 "down" is an allow-list: a call goes around TensorCost only on a network error, a timeout, a 5xx, or a 429 or 402 without a refusal body, and only with `failOpenEnabled` on. Everything else is an answer and reaches your code:
 
 - Missing `TENSORCOST_API_KEY` → `MissingConfigError` at `wrap()` time
-- Missing `TENSORCOST_TENANT_ID` when `maxLayer` is `govern`, `steer` or `route` → `MissingConfigError` at `wrap()` time (1.4.1)
+- Missing `TENSORCOST_TENANT_ID` when `maxLayer` is `govern`, `steer` or `route` → `MissingConfigError` at `wrap()` time (1.5.0)
 - Missing `proxyUrl` when `maxLayer` is `steer` or `route` → `TensorCostConfigError` at `wrap()` time
 - Any TensorCost refusal (budget, hard cap, run stop, governance, guardrail, compliance, or a code this SDK version doesn't know) → a `TensorCostRefusedError` subclass, never retried, never fail-opened
-- A provider's own 4xx relayed by the proxy → `TensorCostProviderError` with the provider's `status` and `body`
+- A provider's own 4xx relayed by the proxy → the provider SDK's own error (`openai.BadRequestError` and so on), built by your client; `TensorCostProviderError` with `status` and `body` when the client can't build one
+- A 4xx that isn't JSON (a firewall page) → `TensorCostGatewayRejectedError`; a rejected TensorCost key → `TensorCostKeyRejectedError`
 
 ### Duplicate spend (honest)
 
@@ -444,13 +445,15 @@ Proxied requests include `x-tc-sdk-version`, `x-tc-sdk-capabilities`, and `x-tc-
 
 | Provider | Package | Layers | Operations |
 |---|---|---|---|
-| OpenAI | `openai` ≥ 4.x | observe → route | chat, completions, embeddings, responses |
-| Anthropic | `@anthropic-ai/sdk` | observe, govern (steer/route run as govern, 1.4.1) | messages |
+| OpenAI | `openai` ≥ 4.x | observe → route | `chat.completions` (observe, govern, steer/route, streaming); legacy `completions` (observed only) |
+| Anthropic | `@anthropic-ai/sdk` | observe, govern (steer/route run as govern) | `messages` |
 | Azure OpenAI | `openai` (`AzureOpenAI`) | observe → route | same as OpenAI (`provider: "openai"`) |
 | AWS Bedrock | `@aws-sdk/client-bedrock-runtime` | observe (govern accepted, not enforced yet) | InvokeModel, Converse (token placeholders) |
 | Google Vertex | `@google/genai` (`vertexai: true`) | observe (govern accepted, not enforced yet) | generateContent (token placeholders) |
 
-**Steer/route streaming:** SDK routes `stream: true` **direct** to the provider (or errors if fail-open off). Proxy server supports SSE; SDK SSE client not shipped yet.
+Nothing else on the client is wrapped: `embeddings`, `responses` and the rest go straight to the provider and are not observed.
+
+**Steer/route streaming:** OpenAI `stream: true` chat completions go through the proxy's SSE (see Timeouts above). Anthropic streams go to Anthropic after the `/admit` check.
 
 Full matrix: [`docs/demo/data-path-one-pager.md`](https://github.com/vaadhlabs/tensorcost/blob/main/docs/demo/data-path-one-pager.md).
 

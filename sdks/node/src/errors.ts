@@ -228,7 +228,7 @@ export class TensorCostRefusedError extends TensorCostError {
  *
  * See `shouldFallBackToProvider()` in proxy-client.ts, which is the single
  * predicate every provider wrapper consults before falling back. Since
- * 1.4.1 it is an allow-list of outages, so a refusal can't slip past it.
+ * 1.5.0 it is an allow-list of outages, so a refusal can't slip past it.
  */
 export class TensorCostRunBudgetExceededError extends TensorCostRefusedError {
   constructor(

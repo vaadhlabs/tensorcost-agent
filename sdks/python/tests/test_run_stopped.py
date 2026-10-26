@@ -135,7 +135,7 @@ def test_admit_other_403_is_typed_by_its_code():
 
 
 def test_admit_403_with_non_json_body_is_a_gateway_rejection():
-    # 1.4.1 round 2: HTML means something in front of TensorCost said no.
+    # 1.5.0 round 2: HTML means something in front of TensorCost said no.
     from tensorcost import TensorCostGatewayRejectedError
 
     with pytest.raises(TensorCostGatewayRejectedError) as info:
@@ -154,7 +154,7 @@ def test_admit_still_fails_open_on_transport_error_and_5xx():
 
 
 def test_admit_5xx_raises_when_fail_open_is_off():
-    # Typed since 1.4.1 (was httpx.HTTPStatusError).
+    # Typed since 1.5.0 (was httpx.HTTPStatusError).
     with pytest.raises(TensorCostProxyError):
         _admit(lambda _r: _resp(503, {}), fail_open=False)
 

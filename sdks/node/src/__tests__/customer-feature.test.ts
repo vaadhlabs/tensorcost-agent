@@ -276,7 +276,7 @@ describe("Bedrock — wrap-time only", () => {
 });
 
 describe("applied mode — x-tc-customer / x-tc-feature headers", () => {
-  it("sends chargeback headers on the proxied call, not on the client (1.4.1)", async () => {
+  it("sends chargeback headers on the proxied call, not on the client (1.5.0)", async () => {
     const client = fakeOpenAIClient();
     const seen: Record<string, string>[] = [];
     const saved = globalThis.fetch;

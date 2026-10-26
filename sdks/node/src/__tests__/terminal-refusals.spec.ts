@@ -1,5 +1,5 @@
 /**
- * 1.4.1: the fail-open rule is an allow-list of outages.
+ * 1.5.0: the fail-open rule is an allow-list of outages.
  *
  * 1.4.0 decided "may this call go around TensorCost?" with a deny-list of
  * refusal classes. A money budget's hard cap (BUDGET_HARD_CAP) wasn't on

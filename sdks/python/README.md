@@ -2,7 +2,7 @@
 
 One-line wrapper for [TensorCost](https://tensorcost.com). Adds fire-and-forget cost observability and optional inference control to OpenAI, Anthropic, AWS Bedrock, and Google Vertex AI clients without changing how your code calls the underlying provider.
 
-**Current version:** 1.4.1 — fixes 1.4.0 routing around a money budget's hard cap when fail-open was on (the default); upgrade. See [CHANGELOG](./CHANGELOG.md), [SDK compliance](https://github.com/vaadhlabs/tensorcost/blob/main/docs/features/sdk-compliance.md), and [Migrating from 0.x](#migrating-from-0x).
+**Current version:** 1.5.0 — fixes 1.4.0 routing around a money budget's hard cap when fail-open was on (the default); upgrade. See [CHANGELOG](./CHANGELOG.md), [SDK compliance](https://github.com/vaadhlabs/tensorcost/blob/main/docs/features/sdk-compliance.md), and [Migrating from 0.x](#migrating-from-0x).
 
 ## Install
 
@@ -321,7 +321,7 @@ Plain `wrap()` without a link still attributes by `agent_id` / `workflow_id`.
 
 If TensorCost is unreachable or slow, your underlying provider call still completes normally. The SDK logs a warning via `logging.getLogger("tensorcost")`.
 
-Since 1.4.1 "unreachable" is an allow-list: a call goes around TensorCost only on a network error, a timeout, a 5xx, or a 429 without a refusal body, and only with `fail_open_enabled` on. A TensorCost refusal (any code, known or not) raises a `TensorCostRefusedError` subclass, and a provider's own 4xx relayed by the proxy raises `TensorCostProviderError`; neither falls back.
+Since 1.5.0 "unreachable" is an allow-list: a call goes around TensorCost only on a network error, a timeout, a 5xx, or a 429 or 402 without a refusal body, and only with `fail_open_enabled` on. A TensorCost refusal (any code, known or not) raises a `TensorCostRefusedError` subclass; a provider's own 4xx relayed by the proxy raises the provider SDK's own error (`openai.BadRequestError` and so on), or `TensorCostProviderError` when the client can't build one; a non-JSON 4xx raises `TensorCostGatewayRejectedError` and a rejected TensorCost key `TensorCostKeyRejectedError`. None of them falls back.
 
 **Duplicate spend:** fail-open after a failed proxy may double-bill if the proxy already reached the provider. Use `fail_open_enabled=False` for in-VPC sidecar-only steer.
 
@@ -336,7 +336,7 @@ See [`docs/demo/data-path-one-pager.md`](https://github.com/vaadhlabs/tensorcost
 Exceptions:
 
 - Missing `TENSORCOST_API_KEY` → `MissingConfigError` at `wrap()` time
-- Missing `TENSORCOST_TENANT_ID` when `max_layer` is `govern`, `steer` or `route` → `MissingConfigError` at `wrap()` time (1.4.1)
+- Missing `TENSORCOST_TENANT_ID` when `max_layer` is `govern`, `steer` or `route` → `MissingConfigError` at `wrap()` time (1.5.0)
 - Missing `proxy_url` when `max_layer` is `steer` or `route` → `MissingConfigError`
 - Govern **refusals** (403 from `/admit`) → call blocked by design
 - Steer **run-budget** / **period-budget** refusals → not fail-opened
@@ -359,7 +359,7 @@ Authentication uses a short-lived JWT from `POST /api/inference-proxy/sdk-token/
 | Provider | Package | Layers | Operations |
 |---|---|---|---|
 | OpenAI | `openai` ≥ 1.0 | observe → route | chat, completions, embeddings, responses (+ streaming) |
-| Anthropic | `anthropic` ≥ 0.20 | observe, govern (steer/route run as govern, 1.4.1) | messages (+ streaming) |
+| Anthropic | `anthropic` ≥ 0.20 | observe, govern (steer/route run as govern, 1.5.0) | messages (+ streaming) |
 | Azure OpenAI | `openai` (`AzureOpenAI`) | observe → route | same as OpenAI (`provider: openai`) |
 | AWS Bedrock | `boto3` bedrock-runtime | observe (govern accepted, not enforced yet) | invoke, converse (+ streaming placeholders) |
 | Google Vertex | `google-genai` (`vertexai=True`) | observe (govern accepted, not enforced yet) | generate_content (+ streaming) |

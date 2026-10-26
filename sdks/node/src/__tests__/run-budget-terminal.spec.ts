@@ -130,7 +130,7 @@ describe("run-budget refusal is terminal in the SDK", () => {
     ).toBe(false);
   });
 
-  it("permits the fallback only for genuine TensorCost outages (1.4.1 allow-list)", () => {
+  it("permits the fallback only for genuine TensorCost outages (1.5.0 allow-list)", () => {
     // The fail-open contract survives intact for everything that is
     // actually TensorCost being unhealthy...
     expect(shouldFallBackToProvider(new TensorCostProxyError("proxy 503"))).toBe(true);
@@ -156,7 +156,7 @@ describe("run-budget refusal is terminal in the SDK", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  it("treats a non-JSON 403 as a gateway rejection, terminal (1.4.1)", async () => {
+  it("treats a non-JSON 403 as a gateway rejection, terminal (1.5.0)", async () => {
     const fetchImpl = vi.fn(
       async () => new Response("nope", { status: 403 }),
     );

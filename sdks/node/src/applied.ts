@@ -101,7 +101,7 @@ function azureAuth(apiKey: string): string {
 /**
  * Check a client can be used in applied mode. Called once by `wrap()`.
  *
- * Since 1.4.1 it changes nothing on the client (see the note at the end);
+ * Since 1.5.0 it changes nothing on the client (see the note at the end);
  * the wrapper sends the proxied call itself with the values from
  * `providerTarget()`.
  *
@@ -160,7 +160,7 @@ export function installAppliedMode(
     );
   }
 
-  // Nothing on the client is changed. Until 1.4.1 this rewrote
+  // Nothing on the client is changed. Until 1.5.0 this rewrote
   // `client.baseURL` to the proxy and replaced `client.defaultHeaders` with
   // a plain object. openai@4 has `defaultHeaders()` as a method, so every
   // call that reached the client's own request path (the fail-open

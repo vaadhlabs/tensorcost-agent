@@ -36,7 +36,7 @@ def test_messages_observation_shape(anthropic_client, recording_transport):
     assert obs["input_tokens"] == 21
     assert obs["output_tokens"] == 43
     assert "tenant_id" not in obs
-    assert obs["sdk_version"] == "tensorcost-python/1.4.1"
+    assert obs["sdk_version"] == "tensorcost-python/1.5.0"
     assert obs["correlation_id"]
     assert "connection_id" not in obs
 

@@ -68,10 +68,10 @@ export function postObservation(
 }
 
 /**
- * Off in 1.4.1. The server's ObservationDto reads `application` and `tags`,
+ * Off in 1.5.0. The server's ObservationDto reads `application` and `tags`,
  * but byoc-v0.1.40 (what design partners run) validates observations with
  * forbidNonWhitelisted and has neither field, so an observation carrying
- * them is rejected with a 400 and dropped. Turned on in 1.5 alongside the
+ * them is rejected with a 400 and dropped. Turned on in a later release alongside the
  * server release that accepts them everywhere.
  */
 let sendObservationScope = false;
@@ -94,7 +94,7 @@ export function observationScope(
 
 export const __test__ = {
   WrapOverhead,
-  /** Internal: flips the 1.5 observation fields on, for tests only. */
+  /** Internal: flips the held-back observation fields on, for tests only. */
   setObservationScope(on: boolean): void {
     sendObservationScope = on;
   },

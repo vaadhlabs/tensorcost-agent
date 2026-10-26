@@ -289,7 +289,7 @@ export interface WrapOptions {
    * sidecar proxy where direct-provider access is not available.
    *
    * When false, proxy 5xx errors surface as `TensorCostProxyError` with
-   * no automatic fallback, and (since 1.4.1) a govern-layer /admit outage
+   * no automatic fallback, and (since 1.5.0) a govern-layer /admit outage
    * refuses the call instead of letting it through.
    *
    * Whatever this is set to, only outages fall back: network errors,
