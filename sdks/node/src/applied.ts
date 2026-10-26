@@ -99,12 +99,11 @@ function azureAuth(apiKey: string): string {
 }
 
 /**
- * Install applied-mode routing on the client. Called once by `wrap()`.
+ * Check a client can be used in applied mode. Called once by `wrap()`.
  *
- * Mutates `client.baseURL` to point at the proxy endpoint and injects
- * `x-tc-provider-url` / `x-tc-provider-auth` into `client.defaultHeaders`.
- * These headers survive for the lifetime of the client — every subsequent
- * request automatically carries them.
+ * Since 1.4.1 it changes nothing on the client (see the note at the end);
+ * the wrapper sends the proxied call itself with the values from
+ * `providerTarget()`.
  *
  * @param client   - The customer's AI SDK client (duck-typed).
  * @param proxyUrl - The TensorCost proxy base URL (already stripped of trailing slash).
@@ -161,52 +160,52 @@ export function installAppliedMode(
     );
   }
 
-  // Build the auth header value to forward. The proxy sends this value
-  // as the upstream Authorization (or api-key) header verbatim.
-  let providerAuth: string;
-  if (provider === "anthropic") {
-    providerAuth = anthropicAuth(apiKey);
-  } else if (isAzureOpenAI(c)) {
-    providerAuth = azureAuth(apiKey);
-  } else {
-    providerAuth = bearerAuth(apiKey);
-  }
+  // Nothing on the client is changed. Until 1.4.1 this rewrote
+  // `client.baseURL` to the proxy and replaced `client.defaultHeaders` with
+  // a plain object. openai@4 has `defaultHeaders()` as a method, so every
+  // call that reached the client's own request path (the fail-open
+  // fallback, and every call below steer) died with "this.defaultHeaders is
+  // not a function"; and the fallback, when it worked, went to the proxy
+  // URL rather than the provider. The SDK sends the proxied call itself, so
+  // the client only needs to be read, and `providerTarget()` reads it per
+  // call so a rotated key is picked up.
+  void scope;
+}
 
-  // Redirect the client's base URL to the proxy. The path suffix
-  // (/api/inference-proxy/v1) is appended here so that the OpenAI-compatible
-  // client doesn't double-prepend its own /v1 path. Both the OpenAI and
-  // Anthropic SDKs append the method path to baseURL; the proxy endpoint is
-  // OpenAI-compatible, so the client will build:
-  //   baseURL + "/chat/completions"
-  // We set baseURL to the proxy's parent path to get the right URL.
-  const cleanProxyUrl = proxyUrl.replace(/\/+$/, "");
-  c["baseURL"] = `${cleanProxyUrl}/api/inference-proxy/v1`;
+function providerAuthFor(
+  c: Record<string, unknown>,
+  provider: "openai" | "anthropic",
+  apiKey: string,
+): string {
+  if (provider === "anthropic") return anthropicAuth(apiKey);
+  if (isAzureOpenAI(c)) return azureAuth(apiKey);
+  return bearerAuth(apiKey);
+}
 
-  // Inject the custom headers into the client's defaultHeaders object.
-  // Both SDKs merge defaultHeaders with every outgoing request.
-  const existing = c["defaultHeaders"];
-  const headers: Record<string, string> =
-    existing && typeof existing === "object" && !Array.isArray(existing)
-      ? (existing as Record<string, string>)
-      : {};
-  headers["x-tc-provider-url"] = originalBaseUrl;
-  headers["x-tc-provider-auth"] = providerAuth;
-  if (scope?.application) {
-    headers["x-tc-application"] = scope.application;
-  }
-  if (scope?.tags && scope.tags.length > 0) {
-    headers["x-tc-tags"] = scope.tags.join(",");
-  }
-  if (scope?.customer) {
-    headers["x-tc-customer"] = scope.customer;
-  }
-  if (scope?.feature) {
-    headers["x-tc-feature"] = scope.feature;
-  }
-  if (scope?.teamId) {
-    headers["x-tc-team-id"] = scope.teamId;
-  }
-  c["defaultHeaders"] = headers;
+/**
+ * Where the proxy should forward this client's call: the client's own base
+ * URL and its auth, formatted for `x-tc-provider-url` / `x-tc-provider-auth`.
+ *
+ * A client that already carries those as plain `defaultHeaders` entries
+ * (callers who set them by hand) keeps them.
+ */
+export function providerTarget(
+  client: unknown,
+  provider: "openai" | "anthropic",
+  defaultUrl: string,
+): { providerUrl: string; providerAuth: string } {
+  const c = (client && typeof client === "object" ? client : {}) as Record<string, unknown>;
+  const dh = c["defaultHeaders"];
+  const manual =
+    dh && typeof dh === "object" && !Array.isArray(dh) ? (dh as Record<string, unknown>) : {};
+  const manualUrl = typeof manual["x-tc-provider-url"] === "string" ? manual["x-tc-provider-url"] : null;
+  const manualAuth =
+    typeof manual["x-tc-provider-auth"] === "string" ? manual["x-tc-provider-auth"] : null;
+  const apiKey = readApiKey(c);
+  return {
+    providerUrl: manualUrl ?? readBaseUrl(c) ?? defaultUrl,
+    providerAuth: manualAuth ?? (apiKey ? providerAuthFor(c, provider, apiKey) : ""),
+  };
 }
 
 export const PROXY_PATH_SUFFIX = PROXY_PATH;

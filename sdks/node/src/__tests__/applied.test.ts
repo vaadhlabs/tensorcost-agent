@@ -10,7 +10,7 @@ import { TensorCostConfigError } from "../config.js";
 import { ObservationTransport } from "../transport.js";
 import * as openaiProvider from "../providers/openai.js";
 import { wrap } from "../wrap.js";
-import { installAppliedMode, __test__ } from "../applied.js";
+import { installAppliedMode, providerTarget, __test__ } from "../applied.js";
 import { defaultHardening } from "./test-harness.js";
 
 const { readBaseUrl, readApiKey, isAzureOpenAI, bearerAuth, anthropicAuth, azureAuth } =
@@ -141,38 +141,34 @@ describe("auth formatters", () => {
 // installAppliedMode — per-provider header injection
 // ---------------------------------------------------------------------------
 
-describe("installAppliedMode — OpenAI", () => {
-  it("overrides baseURL to the proxy v1 path", () => {
-    const c = fakeOpenAIClient();
-    installAppliedMode(c, "https://proxy.tensorcost.com", "openai");
-    expect(c.baseURL).toBe("https://proxy.tensorcost.com/api/inference-proxy/v1");
+describe("installAppliedMode leaves the client alone (1.4.1)", () => {
+  // Through 1.4.0 this rewrote baseURL to the proxy and replaced
+  // defaultHeaders with a plain object, which broke openai@4 (its
+  // defaultHeaders is a method) and sent the "direct" fallback to the proxy.
+  it.each([
+    ["openai", () => fakeOpenAIClient()],
+    ["anthropic", () => fakeAnthropicClient()],
+    ["openai", () => fakeAzureClient()],
+  ] as const)("%s: baseURL and defaultHeaders are untouched", (provider, make) => {
+    const c = make();
+    const before = { baseURL: c.baseURL, defaultHeaders: c.defaultHeaders, keys: Object.keys(c.defaultHeaders) };
+    installAppliedMode(c, "https://proxy.tensorcost.com/", provider, {
+      application: "a",
+      tags: ["t=1"],
+      customer: "c",
+    });
+    expect(c.baseURL).toBe(before.baseURL);
+    expect(c.defaultHeaders).toBe(before.defaultHeaders);
+    expect(Object.keys(c.defaultHeaders)).toEqual(before.keys);
   });
 
-  it("injects x-tc-provider-url with the original provider URL", () => {
-    const c = fakeOpenAIClient();
+  it("keeps a defaultHeaders method intact", () => {
+    const defaultHeaders = function () {
+      return { "x-custom": "hello" };
+    };
+    const c = { ...fakeOpenAIClient(), defaultHeaders };
     installAppliedMode(c, "https://proxy.tensorcost.com", "openai");
-    expect(c.defaultHeaders["x-tc-provider-url"]).toBe(
-      "https://api.openai.com/v1",
-    );
-  });
-
-  it("injects x-tc-provider-auth as Bearer token", () => {
-    const c = fakeOpenAIClient();
-    installAppliedMode(c, "https://proxy.tensorcost.com", "openai");
-    expect(c.defaultHeaders["x-tc-provider-auth"]).toBe("Bearer sk-test-key");
-  });
-
-  it("preserves other defaultHeaders that were already set", () => {
-    const c = fakeOpenAIClient({ defaultHeaders: { "x-custom": "hello" } });
-    installAppliedMode(c, "https://proxy.tensorcost.com", "openai");
-    expect((c.defaultHeaders as Record<string, string>)["x-custom"]).toBe("hello");
-    expect((c.defaultHeaders as Record<string, string>)["x-tc-provider-url"]).toBeDefined();
-  });
-
-  it("strips trailing slashes from proxyUrl", () => {
-    const c = fakeOpenAIClient();
-    installAppliedMode(c, "https://proxy.tensorcost.com/", "openai");
-    expect(c.baseURL).toBe("https://proxy.tensorcost.com/api/inference-proxy/v1");
+    expect(c.defaultHeaders).toBe(defaultHeaders);
   });
 
   it("throws when the client has no baseURL", () => {
@@ -190,39 +186,42 @@ describe("installAppliedMode — OpenAI", () => {
   });
 });
 
-describe("installAppliedMode — Anthropic", () => {
-  it("overrides baseURL to the proxy v1 path", () => {
-    const c = fakeAnthropicClient();
-    installAppliedMode(c, "https://proxy.tensorcost.com", "anthropic");
-    expect(c.baseURL).toBe("https://proxy.tensorcost.com/api/inference-proxy/v1");
+describe("providerTarget — what the proxy forwards to", () => {
+  it("OpenAI: the client's base URL and a Bearer key", () => {
+    expect(providerTarget(fakeOpenAIClient(), "openai", "x")).toEqual({
+      providerUrl: "https://api.openai.com/v1",
+      providerAuth: "Bearer sk-test-key",
+    });
   });
 
-  it("injects x-tc-provider-url with the original Anthropic base URL", () => {
-    const c = fakeAnthropicClient();
-    installAppliedMode(c, "https://proxy.tensorcost.com", "anthropic");
-    expect(c.defaultHeaders["x-tc-provider-url"]).toBe("https://api.anthropic.com");
+  it("Anthropic: x-api-key format", () => {
+    expect(providerTarget(fakeAnthropicClient(), "anthropic", "x")).toEqual({
+      providerUrl: "https://api.anthropic.com",
+      providerAuth: "x-api-key anth-test-key",
+    });
   });
 
-  it("injects x-tc-provider-auth in x-api-key format", () => {
-    const c = fakeAnthropicClient();
-    installAppliedMode(c, "https://proxy.tensorcost.com", "anthropic");
-    expect(c.defaultHeaders["x-tc-provider-auth"]).toBe("x-api-key anth-test-key");
-  });
-});
-
-describe("installAppliedMode — Azure OpenAI", () => {
-  it("injects x-tc-provider-auth in api-key format", () => {
-    const c = fakeAzureClient();
-    installAppliedMode(c, "https://proxy.tensorcost.com", "openai");
-    expect(c.defaultHeaders["x-tc-provider-auth"]).toBe("api-key azure-api-key");
+  it("Azure: the deployment URL and api-key format", () => {
+    expect(providerTarget(fakeAzureClient(), "openai", "x")).toEqual({
+      providerUrl: "https://my-resource.openai.azure.com/openai/deployments/my-model",
+      providerAuth: "api-key azure-api-key",
+    });
   });
 
-  it("preserves the Azure original URL in x-tc-provider-url", () => {
-    const c = fakeAzureClient();
-    installAppliedMode(c, "https://proxy.tensorcost.com", "openai");
-    expect(c.defaultHeaders["x-tc-provider-url"]).toBe(
-      "https://my-resource.openai.azure.com/openai/deployments/my-model",
-    );
+  it("reads the key per call, so a rotated key is used", () => {
+    const c = fakeOpenAIClient();
+    c.apiKey = "sk-rotated";
+    expect(providerTarget(c, "openai", "x").providerAuth).toBe("Bearer sk-rotated");
+  });
+
+  it("honours x-tc-provider-* set by hand on plain defaultHeaders", () => {
+    const c = fakeOpenAIClient({
+      defaultHeaders: { "x-tc-provider-url": "https://gw.example", "x-tc-provider-auth": "Bearer gw" },
+    });
+    expect(providerTarget(c, "openai", "x")).toEqual({
+      providerUrl: "https://gw.example",
+      providerAuth: "Bearer gw",
+    });
   });
 });
 
@@ -257,34 +256,31 @@ describe("wrap() applied-mode config", () => {
     expect(c.chat.completions.create).not.toBe(original); // wrapped for telemetry
   });
 
-  it("appliedMode: true + proxyUrl set — redirects baseURL", () => {
+  it("appliedMode: true + proxyUrl set — wraps the client without changing it", () => {
     const c = fakeOpenAIClient();
+    const original = c.chat.completions.create;
     wrap(c, {
       apiKey: "tc-key",
+      tenantId: "t-1",
       baseUrl: "http://localhost:1",
       appliedMode: true,
       proxyUrl: "https://proxy.tensorcost.com",
     });
-    expect(c.baseURL).toBe("https://proxy.tensorcost.com/api/inference-proxy/v1");
-    expect((c.defaultHeaders as Record<string, string>)["x-tc-provider-url"]).toBe(
-      "https://api.openai.com/v1",
-    );
-    expect((c.defaultHeaders as Record<string, string>)["x-tc-provider-auth"]).toBe(
-      "Bearer sk-test-key",
-    );
+    expect(c.baseURL).toBe("https://api.openai.com/v1");
+    expect(c.defaultHeaders).toEqual({});
+    expect(c.chat.completions.create).not.toBe(original);
   });
 
-  it("appliedMode: true + TENSORCOST_PROXY_URL env — redirects baseURL", () => {
+  it("appliedMode: true + TENSORCOST_PROXY_URL env — accepted, client unchanged", () => {
     process.env.TENSORCOST_PROXY_URL = "https://proxy-env.tensorcost.com";
     const c = fakeOpenAIClient();
     wrap(c, {
       apiKey: "tc-key",
+      tenantId: "t-1",
       baseUrl: "http://localhost:1",
       appliedMode: true,
     });
-    expect(c.baseURL).toBe(
-      "https://proxy-env.tensorcost.com/api/inference-proxy/v1",
-    );
+    expect(c.baseURL).toBe("https://api.openai.com/v1");
   });
 
   it("appliedMode: true + neither proxyUrl nor env — throws TensorCostConfigError at wrap time", () => {
@@ -292,6 +288,7 @@ describe("wrap() applied-mode config", () => {
     expect(() =>
       wrap(c, {
         apiKey: "tc-key",
+        tenantId: "t-1",
         baseUrl: "http://localhost:1",
         appliedMode: true,
         // no proxyUrl; TENSORCOST_PROXY_URL deleted in beforeEach
@@ -372,6 +369,7 @@ describe("response body passthrough", () => {
     const c = fakeOpenAIClient();
     wrap(c, {
       apiKey: "tc-key",
+      tenantId: "t-1",
       baseUrl: "http://localhost:1",
       appliedMode: true,
       proxyUrl: "https://proxy.tensorcost.com",

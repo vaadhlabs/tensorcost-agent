@@ -37,6 +37,8 @@ import {
   TensorCostRefusedError,
 } from "../errors.js";
 import { TensorCostConfigError } from "../config.js";
+import { providerTarget } from "../applied.js";
+import { providerNativeError } from "../provider-errors.js";
 import type { CircuitBreaker } from "../circuit.js";
 import { emitEvent } from "../telemetry.js";
 import type { LifecycleEventCallback } from "../telemetry.js";
@@ -95,30 +97,6 @@ function extractUsage(
   const output =
     typeof u.completion_tokens === "number" ? u.completion_tokens : null;
   return { input, output };
-}
-
-/**
- * Read the provider base URL from the client. Used to reconstruct the
- * direct-provider endpoint for fail-open fallback calls.
- */
-function readClientBaseUrl(client: unknown): string {
-  if (!client || typeof client !== "object") return "https://api.openai.com/v1";
-  const raw = (client as Record<string, unknown>)["baseURL"];
-  // After installAppliedMode, baseURL points at the proxy — so for the
-  // fallback we cannot use client.baseURL. We store the original URL in
-  // x-tc-provider-url which is already in the client's defaultHeaders.
-  const dh = (client as Record<string, unknown>)["defaultHeaders"];
-  if (dh && typeof dh === "object") {
-    const orig = (dh as Record<string, string>)["x-tc-provider-url"];
-    if (typeof orig === "string" && orig.length > 0) return orig;
-  }
-  return typeof raw === "string" ? raw : "https://api.openai.com/v1";
-}
-
-function readClientApiKey(client: unknown): string | null {
-  if (!client || typeof client !== "object") return null;
-  const raw = (client as Record<string, unknown>)["apiKey"];
-  return typeof raw === "string" && raw.length > 0 ? raw : null;
 }
 
 /**
@@ -315,14 +293,11 @@ function wrapMethod(
       proxyUrl &&
       opts.operation === "chat.completions"
     ) {
-      const providerUrl = readClientBaseUrl(opts.clientRef);
-      // x-tc-provider-auth is already in the client's defaultHeaders after
-      // installAppliedMode. We re-read it rather than reconstructing it so
-      // that key rotation on the client is respected.
-      const dh = opts.clientRef && typeof opts.clientRef === "object"
-        ? ((opts.clientRef as Record<string, unknown>)["defaultHeaders"] as Record<string, string> | undefined)
-        : undefined;
-      const providerAuth = dh?.["x-tc-provider-auth"] ?? "";
+      const { providerUrl, providerAuth } = providerTarget(
+        opts.clientRef,
+        "openai",
+        "https://api.openai.com/v1",
+      );
 
       const body: Record<string, unknown> = {
         ...(firstArg && typeof firstArg === "object" ? firstArg : {}),
@@ -377,7 +352,7 @@ function wrapMethod(
             decisionMeta = decisionMetadata(proxyStreamResp.decisionHeader);
             proxyResult = sseChunksFromStream(proxyStreamResp.stream);
           } catch (proxyErr) {
-            if (!shouldFallBackToProvider(proxyErr)) throw proxyErr;
+            if (!shouldFallBackToProvider(proxyErr)) throw providerNativeError(opts.clientRef, proxyErr);
             proxyFailed = true;
             proxyFailureError = proxyErr as Error;
           } finally {
@@ -433,7 +408,7 @@ function wrapMethod(
           // immediately so it never reaches the fail-open fallback below —
           // otherwise the cap would be enforced by the proxy and then
           // silently bypassed by us calling OpenAI directly.
-          if (!shouldFallBackToProvider(proxyErr)) throw proxyErr;
+          if (!shouldFallBackToProvider(proxyErr)) throw providerNativeError(opts.clientRef, proxyErr);
           proxyFailed = true;
           proxyFailureError = proxyErr as Error;
         } finally {

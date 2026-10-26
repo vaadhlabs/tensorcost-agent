@@ -21,7 +21,9 @@ import { shouldFallBackToProvider } from "../proxy-client.js";
 import {
   TensorCostBudgetHardCapError,
   TensorCostComplianceDeniedError,
+  TensorCostGatewayRejectedError,
   TensorCostGuardrailHardStopError,
+  TensorCostKeyRejectedError,
   TensorCostModelGovernanceDeniedError,
   TensorCostPeriodBudgetExceededError,
   TensorCostProviderError,
@@ -425,15 +427,63 @@ describe.each(PATHS)("terminal refusals on the $name path", ({ name, layer, stre
 });
 
 describe("the admit path no longer mislabels a refusal as model governance", () => {
-  it("a 403 with no readable code is a plain TensorCostRefusedError", async () => {
+  it("a JSON 403 with no readable code is a plain TensorCostRefusedError", async () => {
     const { client, direct } = install("govern");
-    stubTensorCost(async () => new Response("<html>403</html>", { status: 403 }));
+    stubTensorCost(async () => json(403, { statusCode: 403, message: "Forbidden" }));
     const err = await client.chat.completions.create({ model: "gpt-4o" }).catch((e: unknown) => e);
     expect(direct).not.toHaveBeenCalled();
     expect(err).toBeInstanceOf(TensorCostRefusedError);
     expect(err).not.toBeInstanceOf(TensorCostModelGovernanceDeniedError);
     expect((err as TensorCostRefusedError).code).toBeNull();
   });
+});
+
+const WAF_HTML =
+  "<html><head><title>403 Forbidden</title></head><body><center><h1>403 Forbidden</h1></center></body></html>";
+
+describe.each(PATHS)("a non-JSON 4xx on the $name path", ({ layer, stream }) => {
+  it.each([
+    ["HTML 403", () => new Response(WAF_HTML, { status: 403, headers: { "content-type": "text/html" } })],
+    ["empty 403", () => new Response(null, { status: 403 })],
+    ["HTML 401", () => new Response("<html>401</html>", { status: 401 })],
+  ] as const)("%s is TensorCostGatewayRejectedError, terminal", async (_n, respond) => {
+    const { client, direct } = install(layer);
+    const calls = stubTensorCost(async () => respond());
+    const err = await client.chat.completions
+      .create({ model: "gpt-4o", messages: [], ...(stream ? { stream: true } : {}) })
+      .catch((e: unknown) => e);
+    expect(calls).toHaveLength(1);
+    expect(direct).not.toHaveBeenCalled();
+    expect(err).toBeInstanceOf(TensorCostGatewayRejectedError);
+    expect((err as TensorCostGatewayRejectedError).message).toMatch(
+      /rejected with 40[13] before it reached TensorCost or the provider/,
+    );
+    expect(shouldFallBackToProvider(err)).toBe(false);
+  });
+});
+
+describe.each(PATHS)("TensorCost's own NestJS 4xx on the $name path", ({ layer, stream }) => {
+  it("401 { statusCode, message } is TensorCostKeyRejectedError, not a provider error", async () => {
+    const { client, direct } = install(layer);
+    stubTensorCost(async () => json(401, { statusCode: 401, message: "Unauthorized" }));
+    const err = await client.chat.completions
+      .create({ model: "gpt-4o", messages: [], ...(stream ? { stream: true } : {}) })
+      .catch((e: unknown) => e);
+    expect(direct).not.toHaveBeenCalled();
+    expect(err).toBeInstanceOf(TensorCostKeyRejectedError);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+  });
+});
+
+it("a NestJS 400 from the proxy is a TensorCostRefusedError with its message", async () => {
+  const { client, direct } = install("route");
+  stubTensorCost(async () =>
+    json(400, { statusCode: 400, message: "x-tc-provider-url header is required", error: "Bad Request" }),
+  );
+  const err = await client.chat.completions.create({ model: "gpt-4o" }).catch((e: unknown) => e);
+  expect(direct).not.toHaveBeenCalled();
+  expect(err).toBeInstanceOf(TensorCostRefusedError);
+  expect((err as Error).message).toContain("x-tc-provider-url header is required");
 });
 
 // ---------------------------------------------------------------------------

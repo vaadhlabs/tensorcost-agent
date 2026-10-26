@@ -34,6 +34,7 @@ from typing import Any, Callable, Optional
 
 from .._models import Observation
 from .._transport import ObservationTransport
+from .._observation_scope import observation_scope
 from .._version import SDK_VERSION as _SDK_VERSION
 
 _APPLIED_MODE_ERROR = (
@@ -110,11 +111,9 @@ def _post_obs(
         **({"feature": feature} if feature is not None else {}),
         **({"agent_id": agent_id} if agent_id is not None else {}),
         **({"workflow_id": workflow_id} if workflow_id is not None else {}),
-        # Routing-policy scope from wrap(application=, tags=). The server reads
-        # both off the observation (ObservationDto); before 1.4.1 they only rode
-        # on proxied calls as x-tc-application / x-tc-tags.
-        **({"application": application} if application else {}),
-        **({"tags": list(tags)} if tags else {}),
+        # Routing-policy scope from wrap(application=, tags=); empty while
+        # _observation_scope.SEND is off (1.4.1), see that module.
+        **observation_scope(application, tags),
     }
     try:
         transport.post(obs)

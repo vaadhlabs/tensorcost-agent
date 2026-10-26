@@ -134,10 +134,13 @@ def test_admit_other_403_is_typed_by_its_code():
     assert info.value.code == "MODEL_GOVERNANCE_DENIED"
 
 
-def test_admit_403_with_non_json_body_is_still_a_refusal():
-    with pytest.raises(TensorCostRefusedError) as info:
+def test_admit_403_with_non_json_body_is_a_gateway_rejection():
+    # 1.4.1 round 2: HTML means something in front of TensorCost said no.
+    from tensorcost import TensorCostGatewayRejectedError
+
+    with pytest.raises(TensorCostGatewayRejectedError) as info:
         _admit(lambda _r: _resp(403, b"<html>403</html>"))
-    assert info.value.code is None
+    assert info.value.status == 403
     assert should_fall_back_to_provider(info.value) is False
 
 

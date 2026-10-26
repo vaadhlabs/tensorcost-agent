@@ -12,7 +12,7 @@
  *   steer/route — proxy in request path (OpenAI / Anthropic only)
  */
 
-import { resolveConfig } from "./config.js";
+import { MissingConfigError, resolveConfig } from "./config.js";
 import { TensorCostConfigError } from "./config.js";
 import { detectProvider } from "./providers/detect.js";
 import { installAppliedMode } from "./applied.js";
@@ -22,7 +22,7 @@ import * as bedrockProvider from "./providers/bedrock.js";
 import * as vertexProvider from "./providers/vertex.js";
 import { CircuitBreaker } from "./circuit.js";
 import { bindCircuitObservations } from "./circuit-observations.js";
-import { layerRank, needsProxyUrl } from "./layer.js";
+import { layerRank, needsAdmit, needsProxyUrl } from "./layer.js";
 import { getSharedRuntime, warmupSharedRuntime } from "./runtime.js";
 import type { WrapOptions } from "./types.js";
 
@@ -35,6 +35,30 @@ function steerRouteUnsupportedError(
       "Bedrock and Vertex use provider-native signing that cannot be intercepted at " +
       "the proxy layer. Use maxLayer 'govern' or lower for telemetry, or wrap an " +
       "OpenAI / Anthropic client for steer/route.",
+  );
+}
+
+const warned = new Set<string>();
+
+function warnOnce(key: string, message: string): void {
+  if (warned.has(key)) return;
+  warned.add(key);
+  // eslint-disable-next-line no-console
+  console.warn(message);
+}
+
+/**
+ * Every layer talks to TensorCost with a short-lived token, and the token
+ * exchange needs the tenant id. Without one, no token: no /admit, no proxy
+ * call, no observation, and every call goes straight to the provider.
+ * Through 1.4.0 that happened silently, whatever maxLayer said.
+ */
+function noTenantError(layer: string): MissingConfigError {
+  return new MissingConfigError(
+    `TensorCost maxLayer '${layer}' needs your tenant id, and none is set, so the SDK ` +
+      "could never check a call: stops, caps and budgets would not be enforced. Pass " +
+      "{ tenantId } to wrap() or set TENSORCOST_TENANT_ID. The console shows it under " +
+      "Developers › SDK setup, in the TENSORCOST_TENANT_ID line of the env block.",
   );
 }
 
@@ -53,6 +77,26 @@ export function wrap<T>(client: T, options: WrapOptions = {}): T {
     (provider === "bedrock" || provider === "vertex")
   ) {
     throw steerRouteUnsupportedError(provider, config.maxLayer);
+  }
+
+  if (!config.tenantId) {
+    if (needsAdmit(config.maxLayer)) throw noTenantError(config.maxLayer);
+    warnOnce(
+      "no-tenant",
+      "tensorcost: no tenant id is set (tenantId or TENSORCOST_TENANT_ID), so the SDK " +
+        "can't get a token and no observations reach TensorCost. Calls are not affected. " +
+        "The console shows the id under Developers › SDK setup.",
+    );
+  }
+
+  // Bedrock and Vertex have no /admit check yet: govern is accepted but only
+  // observes. Said once, so nobody believes a cap is enforced there.
+  if ((provider === "bedrock" || provider === "vertex") && needsAdmit(config.maxLayer)) {
+    warnOnce(
+      `govern-${provider}`,
+      `tensorcost: govern isn't available for ${provider === "bedrock" ? "Bedrock" : "Vertex"} ` +
+        "yet; calls are observed only. Stops, caps and budgets are not enforced on this client.",
+    );
   }
 
   // Anthropic runs at govern at most until the proxy has a Messages route
@@ -170,4 +214,7 @@ export function wrap<T>(client: T, options: WrapOptions = {}): T {
 export const __test__ = {
   layerRank,
   steerRouteUnsupportedError,
+  resetWarnings(): void {
+    warned.clear();
+  },
 };

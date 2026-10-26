@@ -5,8 +5,19 @@
 **1.4.0 could route around a hard spend cap when fail-open was on (the
 default); upgrade.** When a money budget's hard cap refused a call (403
 with `code: "BUDGET_HARD_CAP"`), 1.4.0 read the refusal as a provider error,
-and with `failOpenEnabled` on it called the provider directly. The cap was enforced
-by the proxy and then skipped by the SDK, and the call was billed.
+and with `failOpenEnabled` on it sent the call to the provider anyway. The
+cap was enforced by the proxy and then skipped by the SDK.
+
+**`govern`, `steer` and `route` now require a tenant id.** The token
+exchange needs it, so without one the SDK never talked to TensorCost at
+all: no `/v1/admit`, no proxy call, no observation, and every call went
+straight to the provider while the README called the variable optional.
+`wrap()` now throws `MissingConfigError` at those layers when neither
+`tenantId` nor `TENSORCOST_TENANT_ID` is set, whatever `failOpenEnabled`
+says (1.4.0 skipped TensorCost silently, or with `failOpenEnabled: false`
+in route threw `TensorCostProxyError` on every call). The console shows the
+id under Developers › SDK setup. `observe` without one keeps working and
+logs one warning that nothing is being sent.
 
 ### Changed: an unknown refusal is now terminal
 
@@ -20,27 +31,35 @@ around: a call goes around TensorCost only when TensorCost is unavailable.
   5xx from the proxy or an open circuit (`TensorCostProxyError`), and a 429
   or 402 from the proxy with no refusal body (`TensorCostQuotaError`; the
   429 is TensorCost's rate limit, the 402 the plan's monthly request
-  ceiling). Also the case where no tenant id is configured, so TensorCost
-  is never asked; that now logs one warning saying caps and stops are not
-  enforced.
+  ceiling). The same outages on the token exchange count too.
 - Never falls back: any 4xx carrying a TensorCost refusal, whatever the
   code. A code this version doesn't know arrives as `TensorCostRefusedError`
   with `code`, `reason` and the server's message intact. A refusal is never
   retried, even on a 429.
-- A provider's own 4xx relayed by the proxy (an OpenAI 400, say) throws
-  `TensorCostProviderError` with the provider's `status`, its `body`, and its
-  message in the error text. It no longer falls back.
+- A provider's own 4xx relayed by the proxy (an OpenAI 400, say) doesn't
+  fall back either. It is thrown as the provider SDK's own error, built by
+  the client itself (`client.makeStatusError`, which is how openai@4 and
+  @anthropic-ai/sdk build `BadRequestError`, `AuthenticationError` and the
+  rest), with the original `TensorCostProviderError` on its `tensorcost`
+  property. A client that can't build one gets the `TensorCostProviderError`
+  (`status`, `body`, `headers`).
+- A 4xx that isn't JSON (a firewall's HTML page, an empty body) is
+  `TensorCostGatewayRejectedError`: the request was turned away before it
+  reached TensorCost or the provider. Terminal.
+- The proxy's own NestJS error body (`{ statusCode, message }`) is
+  TensorCost's, not the provider's: a 401 there is
+  `TensorCostKeyRejectedError`, anything else a `TensorCostRefusedError`
+  with the message.
 
 A refusal is any 4xx whose body has an upper-case code at `error.code` or a
 top-level `code` (`{"error": {"code": "SOME_CODE", ...}}` or
 `{"code": "SOME_CODE", ...}`), or whose `x-tc-decision` header says
 `action=refuse`. Lower-case codes (OpenAI's `invalid_api_key` and the like)
-are provider errors. On `/v1/admit` every 4xx except a bare 429 or 402
-refuses the call, since nothing there comes from a provider.
+belong to the provider.
 
-The same rule now applies to the govern layer: `/v1/admit` fails open only on
-an outage, and only while `failOpenEnabled` is on. Before, admit failed open
-on everything except a 403, whatever `failOpenEnabled` said.
+The govern layer follows the same rule: `/v1/admit` fails open only on an
+outage, and only while `failOpenEnabled` is on. Before, admit failed open on
+everything except a 403, whatever `failOpenEnabled` said.
 
 ### Added
 
@@ -54,15 +73,16 @@ on everything except a 403, whatever `failOpenEnabled` said.
 
 **`TensorCostBudgetHardCapError`** for a money budget's hard cap. It extends
 `TensorCostPeriodBudgetExceededError`, so a `catch` written against 1.4.0 for
-the shape below still matches. Fields: `budgetId`, `budgetName`, `burnPct`,
-`scope`, `period`, `capCents`, `spentCents`, `reason`, `budgetCode`
-(always `"BUDGET_HARD_CAP"`), `retryable` and `retryAfterSeconds`.
-`retryable` is true when the budget's spend hasn't been counted yet
-(`reason: "spend_not_known_yet"` or `retryable: true` on the wire), usually
-for a few seconds after a budget is created or its scope changes, and the
-message then says "the budget's spend hasn't been counted yet; retry in 5 s".
-Otherwise it says "the budget's hard cap is reached". The SDK doesn't retry
-for you. The shapes it accepts, on the chat path and on `/v1/admit`:
+the current wire shape still matches. Fields: `budgetId`, `budgetName`,
+`burnPct`, `scope`, `period`, `capCents`, `spentCents`, `reason`,
+`budgetCode` (always `"BUDGET_HARD_CAP"`), `retryable` and
+`retryAfterSeconds`. `retryable` is true when the budget's spend hasn't been
+counted yet (`reason: "spend_not_known_yet"` or `retryable: true` on the
+wire), usually for a few seconds after a budget is created or its scope
+changes, and the message then says "the budget's spend hasn't been counted
+yet; retry in 5 s". Otherwise it says "the budget's hard cap is reached". The
+SDK doesn't retry for you. The shapes it accepts, on the chat path and on
+`/v1/admit`:
 
 ```json
 { "error": { "code": "PERIOD_BUDGET_EXCEEDED", "budget_code": "BUDGET_HARD_CAP",
@@ -85,53 +105,86 @@ first, then `retry_after_seconds` or `retry_after` in the body. A
 `PERIOD_BUDGET_EXCEEDED` without `budget_code` is still a plain
 `TensorCostPeriodBudgetExceededError`.
 
-**Observations carry `application` and `tags`.** The values from
-`wrap({ application, tags })` were sent as `x-tc-application` / `x-tc-tags`
-on proxied calls only; observations (observe and govern traffic, and every
-Bedrock and Vertex call) went without them, so spend landed under the
-server's default `sdk:tier2` application and route matchers never saw the
-tags. They are now on every observation when set.
+**`TensorCostGatewayRejectedError`** (non-JSON 4xx, above) and
+**`TensorCostKeyRejectedError`** (the token exchange, `/v1/admit` or the
+proxy rejected the TensorCost key: "the TensorCost key was rejected; check
+it's current"). Both are terminal. 1.4.0 threw a plain `Error` for a revoked
+key, and with fail-open on, the call then went to the provider.
 
 ### Fixed
 
-**Govern-layer refusals are typed by their code.** 1.4.0 threw
-`TensorCostModelGovernanceDeniedError` ("request refused at govern layer")
-for every `/v1/admit` refusal except a run stop, budget caps included. Each
-refusal now throws its own class.
+**steer/route with a real openai@4 client.** 1.4.0 rewrote the client's
+`baseURL` to the proxy and replaced its `defaultHeaders()` method with a
+plain object. Every call that reached the client's own request path died
+with `TypeError: this.defaultHeaders is not a function`: every fail-open
+fallback (proxy 5xx, 429, 402, network error, token-exchange outage), and
+every call when a route-configured client ran below steer (published layer
+govern or observe, TensorCost unreachable for more than 5 minutes). Had the
+fallback run, it would have gone to the proxy URL, not the provider. 1.4.1
+doesn't modify the client at all: the SDK sends the proxied call itself and
+reads the provider URL and key from the client per call, and the fallback
+goes to the client's own `baseURL`.
+
+**Real Anthropic clients are detected as Anthropic.** The @anthropic-ai/sdk
+client also has a legacy `completions.create`, so 1.4.0 detected it as an
+OpenAI client and never wrapped `messages.create`: Claude calls were not
+observed, admitted or stopped.
 
 **Anthropic clients run in govern mode.** The proxy has no Anthropic Messages
 route yet, so steer/route for an Anthropic client could only fail open around
-TensorCost, and nothing could stop a Claude run. `maxLayer: "steer"` or
-`"route"` (or `appliedMode: true`) on an Anthropic client now runs as
-`"govern"`: every call is checked with `/v1/admit` before it goes to
-Anthropic, and the client's `baseURL` is left alone. One warning per process
-says so; set `maxLayer: "govern"` to silence it.
+TensorCost. `maxLayer: "steer"` or `"route"` (or `appliedMode: true`) on an
+Anthropic client now runs as `"govern"`: every call is checked with
+`/v1/admit` before it goes to Anthropic. One warning per process says so;
+set `maxLayer: "govern"` to silence it.
 
-**Token exchange types its outages.** A network error, timeout, 5xx or 429
-from the token exchange is a `TensorCostNetworkError` / `TensorCostTimeoutError`
-/ `TensorCostProxyError` / `TensorCostQuotaError`, so fail-open still applies
-when TensorCost is down. Any other status is a plain error and doesn't.
+**Bedrock and Vertex say govern isn't enforced.** There is no `/v1/admit`
+check for them yet, so `maxLayer: "govern"` only observes. The SDK now logs
+one warning per process saying so, and the README no longer lists govern as
+supported for them.
+
+**Govern-layer refusals are typed by their code.** 1.4.0 threw
+`TensorCostModelGovernanceDeniedError` ("request refused at govern layer")
+for every `/v1/admit` refusal except a run stop, budget caps included.
 
 **Streaming proxy errors.** After retries ran out, a 5xx or 429 on the
 streaming path was reported as `TensorCostProviderError`; it is
 `TensorCostProxyError` / `TensorCostQuotaError` now.
 
+### Not in 1.4.1: `application` and `tags` on observations
+
+The server's observation endpoint reads `application` and `tags`, and the
+SDK sends them only as `x-tc-application` / `x-tc-tags` on proxied calls.
+Adding them to observations is built but switched off: byoc-v0.1.40
+validates observations strictly and doesn't know the fields, so it would
+reject every observation that carried them. They come in 1.5, alongside the
+server release that accepts them.
+
 ### Compatibility
 
+- Server: no minimum version. 1.4.1 reads both the money-budget shape the
+  proxy sends since the change that added `budget_code` and the older
+  `code: "BUDGET_HARD_CAP"` shape. Nothing new is sent to the server, so
+  byoc-v0.1.40 keeps accepting every request and observation.
+- `wrap()` at `govern`, `steer` or `route` without a tenant id throws
+  `MissingConfigError` (see above). Set `TENSORCOST_TENANT_ID`.
 - `shouldFallBackToProvider()` returns false for `TensorCostProviderError`
   and for errors that aren't `TensorCost*` outages (1.4.0 returned true).
-- With fail-open on, a relayed provider 4xx used to be retried directly
-  against the provider, so you saw the provider SDK's own error class (for
-  example `openai.BadRequestError`). You now get `TensorCostProviderError`
-  with the provider's `status` and `body`. With fail-open off you used to get
-  `TensorCostProxyError` for it; same change.
-- A 4xx from TensorCost that isn't an outage (a rejected token, a refusal
-  with an unknown code) now stops the call instead of going around it. If
-  you relied on a bad or revoked key failing open, it doesn't any more.
+- A relayed provider 4xx with an openai@4 client: in 1.4.0 the fail-open
+  retry crashed with the `defaultHeaders` TypeError above, so callers never
+  got `openai.BadRequestError` from it; with fail-open off they got
+  `TensorCostProxyError`. 1.4.1 throws the openai error type the client
+  builds, after one call.
+- A TensorCost 4xx that isn't an outage (a rejected key, a refusal with an
+  unknown code, a firewall page) now stops the call instead of going around
+  it.
 - `failOpenEnabled: false` now also fails the call when `/v1/admit` is down.
-- `AdmitResult.refusal` is set on every refusal, not only `RUN_STOPPED`.
+- `AdmitResult.refusal` is set on every refusal, not only `RUN_STOPPED`, and
+  can be a `TensorCostGatewayRejectedError` or `TensorCostKeyRejectedError`.
 - Anthropic clients configured for steer/route make one `/v1/admit` call per
   request instead of a proxy call.
+- `wrap()` no longer sets `baseURL`, `defaultHeaders`, `x-tc-provider-url` or
+  `x-tc-provider-auth` on the client. If you read those back, read your own
+  config instead.
 
 ## 1.4.0 — 2026-10-25
 

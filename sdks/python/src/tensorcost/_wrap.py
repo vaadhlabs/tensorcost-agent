@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Literal, Optional, TypeVar
 
 from ._attribution import attach_with_meta
 from ._circuit import CircuitBreaker
 from ._config import MissingConfigError, resolve_config
-from ._layer import PROXY_HEADERS_TIMEOUT_S, ControlLayer, needs_proxy_url
+from ._layer import PROXY_HEADERS_TIMEOUT_S, ControlLayer, needs_admit, needs_proxy_url
 from ._providers import _anthropic, _bedrock, _openai, _vertex
 from ._providers._detect import detect_provider
 from ._retry import RetryConfig
@@ -15,6 +16,33 @@ from ._runtime import get_shared_runtime, warmup_shared_runtime
 from ._telemetry import LifecycleEventCallback
 
 T = TypeVar("T")
+
+_log = logging.getLogger("tensorcost")
+_warned: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key in _warned:
+        return
+    _warned.add(key)
+    _log.warning(message)
+
+
+def _reset_warnings() -> None:
+    _warned.clear()
+
+
+def _no_tenant_error(layer: str) -> MissingConfigError:
+    # Every layer talks to TensorCost with a short-lived token, and the token
+    # exchange needs the tenant id. Without one: no token, no /admit, no proxy
+    # call, no observation, and every call goes straight to the provider.
+    # Through 1.4.0 that happened silently, whatever max_layer said.
+    return MissingConfigError(
+        f"TensorCost max_layer '{layer}' needs your tenant id, and none is set, so the SDK "
+        "could never check a call: stops, caps and budgets would not be enforced. Pass "
+        "tenant_id=... to wrap() or set TENSORCOST_TENANT_ID. The console shows it under "
+        "Developers › SDK setup, in the TENSORCOST_TENANT_ID line of the env block."
+    )
 
 def _steer_route_error(provider: str, max_layer: str) -> MissingConfigError:
     return MissingConfigError(
@@ -86,6 +114,26 @@ def wrap(
 
     if needs_proxy_url(config.max_layer) and provider in ("bedrock", "vertex"):
         raise _steer_route_error(provider, config.max_layer)
+
+    if not config.tenant_id:
+        if needs_admit(config.max_layer):
+            raise _no_tenant_error(config.max_layer)
+        _warn_once(
+            "no-tenant",
+            "tensorcost: no tenant id is set (tenant_id or TENSORCOST_TENANT_ID), so the SDK "
+            "can't get a token and no observations reach TensorCost. Calls are not affected. "
+            "The console shows the id under Developers › SDK setup.",
+        )
+
+    # Bedrock and Vertex have no /admit check yet: govern is accepted but only
+    # observes. Said once, so nobody believes a cap is enforced there.
+    if provider in ("bedrock", "vertex") and needs_admit(config.max_layer):
+        name = "Bedrock" if provider == "bedrock" else "Vertex"
+        _warn_once(
+            f"govern-{provider}",
+            f"tensorcost: govern isn't available for {name} yet; calls are observed only. "
+            "Stops, caps and budgets are not enforced on this client.",
+        )
 
     transport, sdk_layer = get_shared_runtime(config)
     warmup_shared_runtime(config)

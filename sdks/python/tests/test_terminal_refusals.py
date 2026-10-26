@@ -383,11 +383,58 @@ def test_hard_cap_is_terminal_with_fail_open_disabled(tensorcost_api, recording_
 
 def test_admit_refusal_is_no_longer_mislabelled(tensorcost_api, recording_transport):
     client, direct = _install(recording_transport, "govern")
-    tensorcost_api["handler"] = lambda _r: httpx.Response(403, content=b"<html>403</html>")
+    tensorcost_api["handler"] = lambda _r: httpx.Response(403, json={"statusCode": 403, "message": "Forbidden"})
     with pytest.raises(TensorCostRefusedError) as info:
         _call(client, False)
     assert not isinstance(info.value, (TensorCostModelGovernanceDeniedError, TensorCostProviderError))
     assert info.value.code is None
+    direct.assert_not_called()
+
+
+WAF_HTML = "<html><head><title>403 Forbidden</title></head><body><center><h1>403 Forbidden</h1></center></body></html>"
+
+
+@pytest.mark.parametrize("layer,stream,path", PATHS)
+@pytest.mark.parametrize(
+    "respond",
+    [
+        pytest.param(lambda _r: httpx.Response(403, text=WAF_HTML, headers={"content-type": "text/html"}), id="html-403"),
+        pytest.param(lambda _r: httpx.Response(403), id="empty-403"),
+        pytest.param(lambda _r: httpx.Response(401, text="<html>401</html>"), id="html-401"),
+    ],
+)
+def test_non_json_4xx_is_a_gateway_rejection(tensorcost_api, recording_transport, layer, stream, path, respond):
+    from tensorcost import TensorCostGatewayRejectedError
+
+    client, direct = _install(recording_transport, layer)
+    tensorcost_api["handler"] = respond
+    with pytest.raises(TensorCostGatewayRejectedError) as info:
+        _call(client, stream)
+    assert len(tensorcost_api["calls"]) == 1
+    direct.assert_not_called()
+    assert "before it reached TensorCost or the provider" in str(info.value)
+    assert should_fall_back_to_provider(info.value) is False
+
+
+@pytest.mark.parametrize("layer,stream,path", PATHS)
+def test_nest_401_from_tensorcost_is_key_rejected(tensorcost_api, recording_transport, layer, stream, path):
+    from tensorcost import TensorCostKeyRejectedError
+
+    client, direct = _install(recording_transport, layer)
+    tensorcost_api["handler"] = lambda _r: httpx.Response(401, json={"statusCode": 401, "message": "Unauthorized"})
+    with pytest.raises(TensorCostKeyRejectedError):
+        _call(client, stream)
+    direct.assert_not_called()
+
+
+def test_nest_400_from_the_proxy_is_a_tensorcost_error(tensorcost_api, recording_transport):
+    client, direct = _install(recording_transport, "route")
+    tensorcost_api["handler"] = lambda _r: httpx.Response(
+        400, json={"statusCode": 400, "message": "x-tc-provider-url header is required", "error": "Bad Request"}
+    )
+    with pytest.raises(TensorCostRefusedError) as info:
+        _call(client, False)
+    assert "x-tc-provider-url header is required" in str(info.value)
     direct.assert_not_called()
 
 
@@ -491,10 +538,16 @@ def test_lowercase_provider_code_in_a_403_is_not_a_refusal(tensorcost_api, recor
 
 
 # ---------------------------------------------------------------------------
-# Observations carry application and tags.
+# Observations: application and tags are held back in 1.4.1 (byoc-v0.1.40
+# rejects them), behind _observation_scope.SEND.
 
 
-def test_observations_carry_application_and_tags(recording_transport):
+@pytest.fixture
+def scope_on(monkeypatch):
+    monkeypatch.setattr("tensorcost._observation_scope.SEND", True)
+
+
+def _openai_obs(recording_transport):
     client = MagicMock()
     client.chat.completions.create.return_value = {"id": "c", "usage": {}}
     _openai.install(
@@ -507,23 +560,23 @@ def test_observations_carry_application_and_tags(recording_transport):
         tags=["team=pay", "tier=gold"],
     )
     client.chat.completions.create(model="gpt-4o-mini", messages=[])
-    obs = recording_transport.observations
+    return recording_transport.observations
+
+
+def test_observations_hold_back_application_and_tags_by_default(recording_transport):
+    obs = _openai_obs(recording_transport)
     assert len(obs) == 1
+    assert "application" not in obs[0]
+    assert "tags" not in obs[0]
+
+
+def test_observations_carry_application_and_tags_with_the_flag(recording_transport, scope_on):
+    obs = _openai_obs(recording_transport)
     assert obs[0]["application"] == "checkout"
     assert obs[0]["tags"] == ["team=pay", "tier=gold"]
 
 
-def test_observations_omit_application_and_tags_when_unset(recording_transport):
-    client = MagicMock()
-    client.chat.completions.create.return_value = {"id": "c", "usage": {}}
-    _openai.install(client, recording_transport, tenant_id="t-1", environment=None, connection_id=None)
-    client.chat.completions.create(model="gpt-4o-mini", messages=[])
-    obs = recording_transport.observations[0]
-    assert "application" not in obs
-    assert "tags" not in obs
-
-
-def test_bedrock_and_vertex_observations_carry_application_and_tags(recording_transport):
+def test_bedrock_and_vertex_observations_carry_them_with_the_flag(recording_transport, scope_on):
     from tensorcost._providers import _bedrock, _vertex
 
     br = MagicMock()
@@ -540,31 +593,102 @@ def test_bedrock_and_vertex_observations_carry_application_and_tags(recording_tr
     vx.models.generate_content(model="gemini-1.5-pro", contents="hi")
     apps = {o.get("application") for o in recording_transport.observations}
     assert {"app-b", "app-v"} <= apps
-    tags = [o.get("tags") for o in recording_transport.observations]
-    assert ["x=1"] in tags and ["y=2"] in tags
 
 
 # ---------------------------------------------------------------------------
-# No tenant id: 1.4.0's outcome, said out loud once.
+# Tenant id, Bedrock/Vertex govern, revoked key.
 
 
-def test_no_tenant_id_warns_once_and_goes_direct(caplog):
-    from tensorcost._transport import ObservationTransport, _warn_no_tenant_once  # noqa: F401
-    import tensorcost._transport as transport_mod
+@pytest.fixture
+def fresh_warnings(monkeypatch):
+    import tensorcost._wrap as wrap_mod
 
-    transport_mod._no_tenant_warned = False
-    t = ObservationTransport(api_key="k", base_url="https://tc.test", tenant_id=None)
+    wrap_mod._reset_warnings()
+    monkeypatch.delenv("TENSORCOST_TENANT_ID", raising=False)
+    yield
+    wrap_mod._reset_warnings()
+
+
+@pytest.mark.parametrize("layer", ["govern", "steer", "route"])
+def test_wrap_without_tenant_id_raises_at_govern_and_above(fresh_warnings, layer):
+    from tensorcost import MissingConfigError, wrap
+
     client = MagicMock()
-    client.chat.completions.create.return_value = {"id": "direct"}
-    direct = client.chat.completions.create
-    _openai.install(client, t, tenant_id=None, environment=None, connection_id=None, max_layer="govern", base_url="https://tc.test")
+    client.messages = None
+    with pytest.raises(MissingConfigError) as info:
+        wrap(client, api_key="k", max_layer=layer, proxy_url="https://proxy.test")
+    msg = str(info.value)
+    assert "TENSORCOST_TENANT_ID" in msg and "tenant_id" in msg
+    assert "Developers › SDK setup" in msg
+
+
+def test_wrap_without_tenant_id_raises_even_with_fail_open_off(fresh_warnings):
+    from tensorcost import MissingConfigError, wrap
+
+    client = MagicMock()
+    client.messages = None
+    with pytest.raises(MissingConfigError):
+        wrap(client, api_key="k", max_layer="govern", fail_open_enabled=False)
+
+
+def test_observe_without_tenant_id_works_and_warns_once(fresh_warnings, caplog):
+    from tensorcost import wrap
+
+    def make():
+        c = MagicMock()
+        c.messages = None
+        c.chat.completions.create.return_value = {"id": "c"}
+        return c
+
+    a = make()
+    with caplog.at_level(logging.WARNING, logger="tensorcost"):
+        wrap(a, api_key="k")
+        wrap(make(), api_key="k")
+    assert a.chat.completions.create(model="gpt-4o-mini", messages=[]) == {"id": "c"}
+    w = [r.getMessage() for r in caplog.records if "no tenant id" in r.getMessage()]
+    assert len(w) == 1
+    assert "no observations reach TensorCost" in w[0]
+
+
+@pytest.mark.parametrize("name", ["Bedrock", "Vertex"])
+def test_bedrock_and_vertex_govern_warns_once(fresh_warnings, caplog, monkeypatch, name):
+    from tensorcost import wrap
+
+    monkeypatch.setattr("tensorcost._wrap.detect_provider", lambda _c: name.lower())
+    with caplog.at_level(logging.WARNING, logger="tensorcost"):
+        wrap(MagicMock(), api_key="k", tenant_id="t-1", max_layer="govern")
+        wrap(MagicMock(), api_key="k", tenant_id="t-1", max_layer="govern")
+    w = [r.getMessage() for r in caplog.records if "govern isn't available" in r.getMessage()]
+    assert w == [
+        f"tensorcost: govern isn't available for {name} yet; calls are observed only. "
+        "Stops, caps and budgets are not enforced on this client."
+    ]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_token_exchange_key_rejection_is_typed(status):
+    from tensorcost import TensorCostKeyRejectedError
+    from tensorcost._transport import ObservationTransport
+
+    t = ObservationTransport(api_key="k", base_url="https://tc.test", tenant_id="t-1")
+    t._client = httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(status, json={"message": "revoked"})))
     try:
-        with caplog.at_level(logging.WARNING, logger="tensorcost"):
-            client.chat.completions.create(model="gpt-4o-mini", messages=[])
-            client.chat.completions.create(model="gpt-4o-mini", messages=[])
+        with pytest.raises(TensorCostKeyRejectedError) as info:
+            t.get_token()
     finally:
         t.close()
-    assert direct.call_count == 2
-    warnings = [r for r in caplog.records if "tenant id" in r.getMessage()]
-    assert len(warnings) == 1
-    assert "NOT enforced" in warnings[0].getMessage()
+    assert "the TensorCost key was rejected" in str(info.value)
+    assert should_fall_back_to_provider(info.value) is False
+
+
+def test_token_exchange_5xx_still_falls_back():
+    from tensorcost._transport import ObservationTransport
+
+    t = ObservationTransport(api_key="k", base_url="https://tc.test", tenant_id="t-1")
+    t._client = httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(503)))
+    try:
+        with pytest.raises(TensorCostProxyError) as info:
+            t.get_token()
+    finally:
+        t.close()
+    assert should_fall_back_to_provider(info.value) is True

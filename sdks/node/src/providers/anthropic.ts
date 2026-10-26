@@ -32,6 +32,8 @@ import {
   TensorCostRefusedError,
 } from "../errors.js";
 import { TensorCostConfigError } from "../config.js";
+import { providerTarget } from "../applied.js";
+import { providerNativeError } from "../provider-errors.js";
 import type { CircuitBreaker } from "../circuit.js";
 import { emitEvent } from "../telemetry.js";
 import type { LifecycleEventCallback } from "../telemetry.js";
@@ -263,12 +265,11 @@ function wrapMethod(
 
     const proxyUrl = opts.hardening.proxyUrl;
     if (needsProxyUrl(effectiveLayer) && proxyUrl) {
-      // Read the original provider URL from defaultHeaders (set at installAppliedMode).
-      const dh = opts.clientRef && typeof opts.clientRef === "object"
-        ? ((opts.clientRef as Record<string, unknown>)["defaultHeaders"] as Record<string, string> | undefined)
-        : undefined;
-      const providerUrl = dh?.["x-tc-provider-url"] ?? "https://api.anthropic.com";
-      const providerAuth = dh?.["x-tc-provider-auth"] ?? "";
+      const { providerUrl, providerAuth } = providerTarget(
+        opts.clientRef,
+        "anthropic",
+        "https://api.anthropic.com",
+      );
 
       const body: Record<string, unknown> = {
         ...(firstArg && typeof firstArg === "object" ? firstArg : {}),
@@ -356,7 +357,7 @@ function wrapMethod(
             decisionMeta = decisionMetadata(proxyResp.decisionHeader);
           }
         } catch (proxyErr) {
-          if (!shouldFallBackToProvider(proxyErr)) throw proxyErr;
+          if (!shouldFallBackToProvider(proxyErr)) throw providerNativeError(opts.clientRef, proxyErr);
           proxyFailed = true;
           proxyFailureError = proxyErr as Error;
         } finally {

@@ -74,14 +74,17 @@ export function detectProvider(client: unknown): Provider {
   const hasAnthropicShape =
     messages && typeof messages.create === "function";
 
-  // Disambiguation: OpenAI also has a top-level `completions` AND `chat`.
-  // Anthropic only exposes `messages`. If both shapes match (unusual),
-  // prefer the more specific Anthropic match only when there's no chat.
+  // Disambiguation. The real @anthropic-ai/sdk client also has a legacy
+  // `completions.create`, so "has completions.create" alone used to read a
+  // Claude client as OpenAI: messages.create was never wrapped, so nothing
+  // was observed, admitted or stopped (1.4.0 and earlier). A client with
+  // messages.create and no chat.completions is Anthropic.
+  const hasChatCompletions = !!chatCompletions && typeof chatCompletions.create === "function";
+  if (hasAnthropicShape && !hasChatCompletions) {
+    return "anthropic";
+  }
   if (hasOpenAIShape) {
     return "openai";
-  }
-  if (hasAnthropicShape) {
-    return "anthropic";
   }
   throw new UnsupportedClientError(
     "tensorcost: client does not look like an OpenAI, Anthropic, BedrockRuntimeClient, " +

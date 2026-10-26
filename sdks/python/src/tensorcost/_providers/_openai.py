@@ -51,6 +51,8 @@ from .._retry import DEFAULT_RETRY_CONFIG, RetryConfig
 from .._sdk_layer import PassthroughSdkLayer, SdkLayerClient
 from .._telemetry import LifecycleEventCallback, OnFallbackEvent, emit_event
 from .._transport import ObservationTransport
+from .._observation_scope import observation_scope
+from .._provider_errors import provider_native_error
 from .._version import SDK_VERSION as _SDK_VERSION
 _log = logging.getLogger("tensorcost")
 
@@ -114,11 +116,9 @@ def _post_obs(
         **({"feature": feature} if feature is not None else {}),
         **({"agent_id": agent_id} if agent_id is not None else {}),
         **({"workflow_id": workflow_id} if workflow_id is not None else {}),
-        # Routing-policy scope from wrap(application=, tags=). The server reads
-        # both off the observation (ObservationDto); before 1.4.1 they only rode
-        # on proxied calls as x-tc-application / x-tc-tags.
-        **({"application": application} if application else {}),
-        **({"tags": list(tags)} if tags else {}),
+        # Routing-policy scope from wrap(application=, tags=); empty while
+        # _observation_scope.SEND is off (1.4.1), see that module.
+        **observation_scope(application, tags),
     }
     try:
         transport.post(obs)
@@ -289,7 +289,10 @@ def _wrap_method(
                         from .._proxy_client import should_fall_back_to_provider
 
                         if not should_fall_back_to_provider(exc):
-                            raise
+                            native = provider_native_error(client_ref, exc, provider_url)
+                            if native is exc:
+                                raise
+                            raise native from exc
                         proxy_failed = True
                         proxy_error = exc
                     finally:
@@ -336,7 +339,10 @@ def _wrap_method(
                         from .._proxy_client import should_fall_back_to_provider
 
                         if not should_fall_back_to_provider(exc):
-                            raise
+                            native = provider_native_error(client_ref, exc, provider_url)
+                            if native is exc:
+                                raise
+                            raise native from exc
                         proxy_failed = True
                         proxy_error = exc
                     finally:

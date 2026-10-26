@@ -9,6 +9,8 @@ export {
   TensorCostProxyError,
   TensorCostQuotaError,
   TensorCostProviderError,
+  TensorCostGatewayRejectedError,
+  TensorCostKeyRejectedError,
   TensorCostRefusedError,
   TensorCostBudgetHardCapError,
   TensorCostRunBudgetExceededError,

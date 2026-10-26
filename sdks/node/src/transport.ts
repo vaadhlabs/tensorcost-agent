@@ -21,11 +21,13 @@
  */
 
 import {
+  TensorCostKeyRejectedError,
   TensorCostNetworkError,
   TensorCostProxyError,
   TensorCostQuotaError,
   TensorCostTimeoutError,
 } from "./errors.js";
+import { MissingConfigError } from "./config.js";
 import type { Observation } from "./types.js";
 import { SDK_VERSION } from "./version.js";
 const TOKEN_REFRESH_LEEWAY_MS = 60_000;
@@ -77,6 +79,9 @@ export class ObservationTransport {
    * never thrown, when failOpen is true.
    */
   post(observation: Observation): void {
+    // No tenant id, no token, so nothing can be delivered. wrap() has said so
+    // once already; failing every POST would only repeat it per call.
+    if (!this.tenantId && this.failOpen) return;
     if (this.pending >= MAX_QUEUE_DEPTH) {
       // Backpressure: drop *this* observation (the "oldest" semantically
       // is whichever is in-flight; in a microtask-dispatched queue we
@@ -174,8 +179,9 @@ export class ObservationTransport {
 
   private async exchangeToken(): Promise<string> {
     if (!this.tenantId) {
-      warnNoTenantOnce();
-      throw new TenantIdMissingError(
+      // wrap() refuses govern/steer/route without a tenant id, so this is
+      // only reached by observation delivery (fail-open, logged) in observe.
+      throw new MissingConfigError(
         "tensorcost: tenant_id required for token exchange (pass tenantId to wrap() or set TENSORCOST_TENANT_ID)",
       );
     }
@@ -222,6 +228,9 @@ export class ObservationTransport {
       if (resp.status === 429) {
         throw new TensorCostQuotaError(`token-exchange failed status=${resp.status}`, null);
       }
+      if (resp.status === 401 || resp.status === 403) {
+        throw new TensorCostKeyRejectedError(resp.status);
+      }
       if (!resp.ok) {
         throw new Error(`token-exchange failed status=${resp.status}`);
       }
@@ -249,38 +258,7 @@ export class ObservationTransport {
   }
 }
 
-/**
- * No tenant id, so no token: TensorCost is never asked about the call.
- *
- * The fail-open predicate lets this one through alongside the outages,
- * because nothing was refused (nothing was asked) and 1.4.0 behaved the
- * same way. What changes is that it is said once, out loud.
- */
-export class TenantIdMissingError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "TenantIdMissingError";
-  }
-}
-
-let noTenantWarned = false;
-
-function warnNoTenantOnce(): void {
-  if (noTenantWarned) return;
-  noTenantWarned = true;
-  // eslint-disable-next-line no-console
-  console.warn(
-    "tensorcost: govern/steer/route need a tenant id (tenantId or TENSORCOST_TENANT_ID) " +
-      "for the token exchange, and none is set, so no call can be checked: stops, caps " +
-      "and budgets are NOT enforced and calls go straight to the provider. Set the " +
-      "tenant id to enforce them.",
-  );
-}
-
 export const __test__ = {
-  resetNoTenantWarning(): void {
-    noTenantWarned = false;
-  },
   SDK_VERSION,
   MAX_QUEUE_DEPTH,
 };

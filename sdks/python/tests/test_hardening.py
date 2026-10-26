@@ -97,6 +97,7 @@ class TestOpenAIHardeningViaWrap:
         wrap(
             client,
             api_key="k",
+            tenant_id="t-1",
             base_url="https://api.tensorcost.com",
             applied_mode=True,
             proxy_url="https://proxy.example.com",
@@ -124,6 +125,7 @@ class TestOpenAIHardeningViaWrap:
         wrap(
             client,
             api_key="k",
+            tenant_id="t-1",
             base_url="https://api.tensorcost.com",
             applied_mode=True,
             proxy_url="https://proxy.example.com",
@@ -149,6 +151,7 @@ class TestOpenAIHardeningViaWrap:
         wrap(
             client,
             api_key="k",
+            tenant_id="t-1",
             base_url="https://api.tensorcost.com",
             applied_mode=True,
             proxy_url="https://proxy.example.com",
@@ -169,6 +172,7 @@ class TestOpenAIHardeningViaWrap:
         wrap(
             client,
             api_key="k",
+            tenant_id="t-1",
             base_url="https://api.tensorcost.com",
             applied_mode=True,
             proxy_url="https://proxy.example.com",
@@ -201,6 +205,7 @@ class TestOpenAIHardeningViaWrap:
         wrap(
             client,
             api_key="k",
+            tenant_id="t-1",
             base_url="https://api.tensorcost.com",
             applied_mode=True,
             proxy_url="https://proxy.example.com",
@@ -221,6 +226,7 @@ class TestOpenAIHardeningViaWrap:
         wrap(
             client,
             api_key="k",
+            tenant_id="t-1",
             base_url="https://api.tensorcost.com",
             applied_mode=True,
             proxy_url="https://proxy.example.com",
@@ -240,6 +246,7 @@ class TestOpenAIHardeningViaWrap:
         wrap(
             client,
             api_key="k",
+            tenant_id="t-1",
             base_url="https://api.tensorcost.com",
             applied_mode=True,
             proxy_url="https://proxy.example.com",

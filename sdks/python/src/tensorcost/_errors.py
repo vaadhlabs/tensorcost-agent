@@ -12,6 +12,10 @@ Hierarchy::
     ├── TensorCostProxyError      proxy responded with 5xx                 │ back to the provider
     ├── TensorCostQuotaError      proxy 429, or 402 plan ceiling           ┘
     ├── TensorCostProviderError   proxy relayed an upstream provider 4xx
+    │                             (re-raised as the provider SDK's own error
+    │                             type when the client can build one)
+    ├── TensorCostGatewayRejectedError  non-JSON 4xx from in front of TensorCost
+    ├── TensorCostKeyRejectedError      the TensorCost key was rejected
     └── TensorCostRefusedError    TensorCost refused the call (terminal)
         ├── TensorCostRunBudgetExceededError
         ├── TensorCostRunStoppedError
@@ -141,6 +145,7 @@ class TensorCostProviderError(TensorCostError):
         message: str,
         *,
         body: Any = None,
+        headers: Optional[dict] = None,
         root_cause: Optional[Exception] = None,
         status: Optional[int] = None,
         request_id: Optional[str] = None,
@@ -154,6 +159,57 @@ class TensorCostProviderError(TensorCostError):
             attempt=attempt,
         )
         self.body = body
+        #: Response headers of the relayed error.
+        self.headers = dict(headers or {})
+
+
+class TensorCostGatewayRejectedError(TensorCostError):
+    """Something in front of TensorCost turned the request away: a 4xx whose
+    body isn't JSON (an HTML page from a firewall or load balancer, or
+    nothing at all). Neither TensorCost nor the provider saw the call.
+    Terminal: going around it would mean going around whatever put the
+    firewall there, and the next call would most likely meet it too.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        body_text: Optional[str] = None,
+        *,
+        request_id: Optional[str] = None,
+        attempt: int = 1,
+    ) -> None:
+        super().__init__(
+            f"tensorcost: the request was rejected with {status} before it reached "
+            "TensorCost or the provider (for example by a firewall or load balancer in "
+            "front of the TensorCost proxy). Check the proxy URL and anything in front of it.",
+            status=status,
+            request_id=request_id,
+            attempt=attempt,
+        )
+        #: The first 500 characters of what came back, if anything did.
+        self.body_text = body_text
+
+
+class TensorCostKeyRejectedError(TensorCostError):
+    """The TensorCost API key was rejected (401 or 403): revoked, mistyped,
+    or issued for a different tenant than the one configured. Not an outage,
+    so it never fails open."""
+
+    def __init__(
+        self,
+        status: int,
+        *,
+        request_id: Optional[str] = None,
+        attempt: int = 1,
+    ) -> None:
+        super().__init__(
+            f"tensorcost: the TensorCost key was rejected ({status}); check it's current "
+            "and that it belongs to the configured tenant id",
+            status=status,
+            request_id=request_id,
+            attempt=attempt,
+        )
 
 
 class TensorCostRefusedError(TensorCostError):

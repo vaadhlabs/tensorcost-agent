@@ -223,8 +223,11 @@ describe("hardening D — telemetry hooks", () => {
       },
     };
 
+    const savedFetch = globalThis.fetch;
+    globalThis.fetch = routingFetch(false);
     wrap(client, {
       apiKey: "tc-key",
+      tenantId: "t-1",
       baseUrl: "http://api.local",
       appliedMode: true,
       proxyUrl: "https://proxy.local",
@@ -233,10 +236,15 @@ describe("hardening D — telemetry hooks", () => {
       onLifecycleEvent: (e) => events.push(e),
     });
 
-    await client.chat.completions.create({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: "ultra-secret prompt content" }],
-    });
+    try {
+      await client.chat.completions.create({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "ultra-secret prompt content" }],
+      });
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+    expect(events.length).toBeGreaterThan(0);
 
     for (const event of events) {
       expect(JSON.stringify(event)).not.toContain("ultra-secret");
@@ -261,8 +269,11 @@ describe("hardening E — fail-open circuit breaker", () => {
       },
     };
 
+    const savedFetch = globalThis.fetch;
+    globalThis.fetch = routingFetch(true);
     wrap(client, {
       apiKey: "tc-key",
+      tenantId: "t-1",
       baseUrl: "http://api.local",
       appliedMode: true,
       proxyUrl: "https://proxy.local", // won't resolve
@@ -270,9 +281,13 @@ describe("hardening E — fail-open circuit breaker", () => {
       failOpenEnabled: true,
     });
 
-    const resp = await client.chat.completions.create({ model: "gpt-4o-mini" });
-    // Fallback should return the direct provider response.
-    expect((resp as any).id).toBe("direct-ok");
+    try {
+      const resp = await client.chat.completions.create({ model: "gpt-4o-mini" });
+      // Fallback should return the direct provider response.
+      expect((resp as any).id).toBe("direct-ok");
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
   });
 
   it("throws TensorCostProxyError when failOpenEnabled=false and proxy is unreachable", async () => {

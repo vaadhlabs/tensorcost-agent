@@ -276,19 +276,41 @@ describe("Bedrock — wrap-time only", () => {
 });
 
 describe("applied mode — x-tc-customer / x-tc-feature headers", () => {
-  it("installs chargeback headers on defaultHeaders when appliedMode=true", () => {
+  it("sends chargeback headers on the proxied call, not on the client (1.4.1)", async () => {
     const client = fakeOpenAIClient();
-    wrap(client, {
-      apiKey: "k",
-      baseUrl: "http://localhost:1",
-      appliedMode: true,
-      proxyUrl: "https://proxy.tensorcost.com",
-      customer: "header-customer",
-      feature: "header-feature",
-    });
-
-    const headers = client.defaultHeaders as Record<string, string>;
-    expect(headers["x-tc-customer"]).toBe("header-customer");
-    expect(headers["x-tc-feature"]).toBe("header-feature");
+    const seen: Record<string, string>[] = [];
+    const saved = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("sdk-token/exchange")) {
+        return new Response(JSON.stringify({ token: "jwt", expires_in: 900 }), { status: 200 });
+      }
+      if (url.includes("sdk-layer")) {
+        return new Response(JSON.stringify({ published_layer: "route" }), { status: 200 });
+      }
+      if (url.includes("/v1/chat/completions")) {
+        seen.push(init?.headers as Record<string, string>);
+        return new Response(JSON.stringify({ id: "p", usage: {} }), { status: 200 });
+      }
+      return new Response(null, { status: 202 });
+    }) as typeof fetch;
+    try {
+      wrap(client, {
+        apiKey: "k",
+        tenantId: "t-1",
+        baseUrl: "http://tc.local",
+        appliedMode: true,
+        proxyUrl: "https://proxy.tensorcost.com",
+        customer: "header-customer",
+        feature: "header-feature",
+      });
+      expect(client.defaultHeaders).toEqual({});
+      await client.chat.completions.create({ model: "gpt-4o-mini" });
+    } finally {
+      globalThis.fetch = saved;
+    }
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!["x-tc-customer"]).toBe("header-customer");
+    expect(seen[0]!["x-tc-feature"]).toBe("header-feature");
   });
 });

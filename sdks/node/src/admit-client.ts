@@ -20,6 +20,8 @@ import type { ObservationTransport } from "./transport.js";
 import { ADMIT_PATH, ADMIT_TIMEOUT_MS } from "./layer.js";
 import { SDK_VERSION, sdkCapabilityHeader } from "./version.js";
 import {
+  TensorCostGatewayRejectedError,
+  TensorCostKeyRejectedError,
   TensorCostNetworkError,
   TensorCostProxyError,
   TensorCostQuotaError,
@@ -60,8 +62,12 @@ export interface AdmitRequestOptions {
 export interface AdmitResult {
   allowed: boolean;
   decisionHeader: string | null;
-  /** Set whenever `allowed` is false: the refusal, typed by its code. */
-  refusal?: TensorCostRefusedError;
+  /**
+   * Set whenever `allowed` is false: the refusal, typed by its code, or a
+   * TensorCostGatewayRejectedError when something in front of TensorCost
+   * answered with a non-JSON 4xx.
+   */
+  refusal?: TensorCostRefusedError | TensorCostGatewayRejectedError | TensorCostKeyRejectedError;
 }
 
 export async function admitRequest(
@@ -164,7 +170,9 @@ export async function admitRequest(
 async function refusalFrom4xx(
   resp: Response,
   decisionHeader: string | null,
-): Promise<TensorCostRefusedError | undefined> {
+): Promise<
+  TensorCostRefusedError | TensorCostGatewayRejectedError | TensorCostKeyRejectedError | undefined
+> {
   const text = await resp.text().catch(() => "");
   const parsed = parseRefusalBody(text);
   if (
@@ -180,16 +188,27 @@ async function refusalFrom4xx(
     attempt: 1,
     retryAfterHeader: resp.headers.get("retry-after"),
   };
-  if (parsed !== null || resp.status === 403) {
-    return refusalError(parsed, ctx);
-  }
-  let message: string | null = null;
+  if (parsed !== null) return refusalError(parsed, ctx);
+  let body: unknown;
   try {
-    const body = JSON.parse(text) as Record<string, unknown>;
-    message = typeof body?.["message"] === "string" ? body["message"] : null;
+    body = JSON.parse(text) as unknown;
   } catch {
-    /* not JSON */
+    body = undefined;
   }
+  if (body === undefined || body === null || typeof body !== "object") {
+    if (decisionSaysRefuse(decisionHeader)) return refusalError(null, ctx);
+    // HTML or nothing: something in front of TensorCost said no.
+    return new TensorCostGatewayRejectedError(resp.status, text ? text.slice(0, 500) : null, {
+      requestId: ctx.requestId,
+    });
+  }
+  if (resp.status === 403) return refusalError(null, ctx);
+  if (resp.status === 401) {
+    // /admit rejected the TensorCost token.
+    return new TensorCostKeyRejectedError(401, { requestId: ctx.requestId });
+  }
+  const rec = body as Record<string, unknown>;
+  const message = typeof rec["message"] === "string" ? rec["message"] : null;
   return new TensorCostRefusedError(
     `tensorcost: admission check returned ${resp.status}` +
       (message ? ` (${message})` : "") +

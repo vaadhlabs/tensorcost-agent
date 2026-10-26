@@ -32,6 +32,7 @@ import { wrap } from "@tensorcost/sdk";
 
 const client = wrap(new OpenAI({ apiKey: process.env.OPENAI_API_KEY }), {
   apiKey: process.env.TENSORCOST_API_KEY,
+  tenantId: process.env.TENSORCOST_TENANT_ID,
 });
 
 const resp = await client.chat.completions.create({
@@ -48,6 +49,7 @@ import { wrap } from "@tensorcost/sdk";
 
 const client = wrap(new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }), {
   apiKey: process.env.TENSORCOST_API_KEY,
+  tenantId: process.env.TENSORCOST_TENANT_ID,
 });
 
 await client.messages.create({
@@ -84,6 +86,7 @@ When routing is paused in the console, the published ceiling is capped at `gover
 ```ts
 const client = wrap(new OpenAI({ apiKey: process.env.OPENAI_API_KEY }), {
   apiKey: process.env.TENSORCOST_API_KEY,
+  tenantId: process.env.TENSORCOST_TENANT_ID,
   maxLayer: "route",
   proxyUrl: process.env.TENSORCOST_PROXY_URL, // required for steer | route
 });
@@ -144,12 +147,14 @@ import { prewarm, wrap } from "@tensorcost/sdk";
 
 await prewarm({
   apiKey: process.env.TENSORCOST_API_KEY,
+  tenantId: process.env.TENSORCOST_TENANT_ID,
   baseUrl: process.env.TENSORCOST_BASE_URL,
   maxLayer: "route",
 });
 
 export const client = wrap(new OpenAI({ apiKey: process.env.OPENAI_API_KEY }), {
   apiKey: process.env.TENSORCOST_API_KEY,
+  tenantId: process.env.TENSORCOST_TENANT_ID,
   maxLayer: "route",
   proxyUrl: process.env.TENSORCOST_PROXY_URL,
 });
@@ -184,7 +189,7 @@ Recommended rollout: **`observe` → `govern` → `route`**, raising the console
 | `TENSORCOST_API_KEY` | Long-lived SDK key from **Setup → Keys** | Yes |
 | `TENSORCOST_BASE_URL` | Backend base URL (admit, sdk-layer, token exchange) | No (default `https://api.tensorcost.com`) |
 | `TENSORCOST_PROXY_URL` | Inference-proxy base URL | Required when `maxLayer` is `steer` or `route` |
-| `TENSORCOST_TENANT_ID` | Explicit tenant id (multi-tenant tests) | No |
+| `TENSORCOST_TENANT_ID` | Your tenant id, shown in the console under **Developers › SDK setup**. The token exchange needs it: without it the SDK never reaches TensorCost | **Yes** (`wrap()` throws `MissingConfigError` at `govern` and above without it; `observe` warns once and sends nothing) |
 | `TENSORCOST_ENVIRONMENT` | Environment tag on every observation | No |
 | `TENSORCOST_CONNECTION_ID` | Provider-connection id for environment resolution | No |
 | `TENSORCOST_AGENT_ID` / `TENSORCOST_WORKFLOW_ID` | Agent-run attribution defaults | No |
@@ -384,6 +389,7 @@ If TensorCost is slow or down, your customer call still succeeds. Internal error
 Since 1.4.1 "down" is an allow-list: a call goes around TensorCost only on a network error, a timeout, a 5xx, or a 429 without a refusal body, and only with `failOpenEnabled` on. Everything else is an answer and reaches your code:
 
 - Missing `TENSORCOST_API_KEY` → `MissingConfigError` at `wrap()` time
+- Missing `TENSORCOST_TENANT_ID` when `maxLayer` is `govern`, `steer` or `route` → `MissingConfigError` at `wrap()` time (1.4.1)
 - Missing `proxyUrl` when `maxLayer` is `steer` or `route` → `TensorCostConfigError` at `wrap()` time
 - Any TensorCost refusal (budget, hard cap, run stop, governance, guardrail, compliance, or a code this SDK version doesn't know) → a `TensorCostRefusedError` subclass, never retried, never fail-opened
 - A provider's own 4xx relayed by the proxy → `TensorCostProviderError` with the provider's `status` and `body`
@@ -441,14 +447,14 @@ Proxied requests include `x-tc-sdk-version`, `x-tc-sdk-capabilities`, and `x-tc-
 | OpenAI | `openai` ≥ 4.x | observe → route | chat, completions, embeddings, responses |
 | Anthropic | `@anthropic-ai/sdk` | observe, govern (steer/route run as govern, 1.4.1) | messages |
 | Azure OpenAI | `openai` (`AzureOpenAI`) | observe → route | same as OpenAI (`provider: "openai"`) |
-| AWS Bedrock | `@aws-sdk/client-bedrock-runtime` | observe, govern only | InvokeModel, Converse (token placeholders) |
-| Google Vertex | `@google/genai` (`vertexai: true`) | observe, govern only | generateContent (token placeholders) |
+| AWS Bedrock | `@aws-sdk/client-bedrock-runtime` | observe (govern accepted, not enforced yet) | InvokeModel, Converse (token placeholders) |
+| Google Vertex | `@google/genai` (`vertexai: true`) | observe (govern accepted, not enforced yet) | generateContent (token placeholders) |
 
 **Steer/route streaming:** SDK routes `stream: true` **direct** to the provider (or errors if fail-open off). Proxy server supports SSE; SDK SSE client not shipped yet.
 
 Full matrix: [`docs/demo/data-path-one-pager.md`](https://github.com/vaadhlabs/tensorcost/blob/main/docs/demo/data-path-one-pager.md).
 
-**Bedrock and Vertex:** SigV4 / Vertex signing happens inside the AWS / Google SDK before the proxy can intercept — **`steer` and `route` are not supported**. Use `maxLayer: "govern"` or lower.
+**Bedrock and Vertex:** SigV4 / Vertex signing happens inside the AWS / Google SDK before the proxy can intercept — **`steer` and `route` are not supported**. `govern` is accepted but there is no `/admit` check for Bedrock or Vertex yet, so calls are observed only and stops, caps and budgets are not enforced; the SDK warns once when you set it.
 
 Bedrock peer dependency is optional:
 
@@ -458,6 +464,7 @@ import { wrap } from "@tensorcost/sdk";
 
 const client = wrap(new BedrockRuntimeClient({ region: "us-east-1" }), {
   apiKey: process.env.TENSORCOST_API_KEY,
+  tenantId: process.env.TENSORCOST_TENANT_ID,
 });
 ```
 
@@ -471,6 +478,7 @@ import { wrapLangChain } from "@tensorcost/sdk";
 
 const llm = wrapLangChain(new ChatOpenAI({ model: "gpt-4o-mini" }), {
   apiKey: process.env.TENSORCOST_API_KEY,
+  tenantId: process.env.TENSORCOST_TENANT_ID,
   maxLayer: "observe",
 });
 ```

@@ -37,8 +37,11 @@
  *   - 402 otherwise → TensorCostQuotaError, status 402 (the plan's monthly
  *     proxy-request ceiling). Not retried.
  *   - 5xx → TensorCostProxyError (proxy or upstream unavailable).
- *   - any other 4xx → TensorCostProviderError: the provider's own error,
- *     relayed verbatim by the proxy.
+ *   - any other 4xx with a JSON body → TensorCostProviderError: the
+ *     provider's own error, relayed verbatim by the proxy. The wrappers
+ *     rethrow it as the provider SDK's own error type when they can.
+ *   - any other 4xx without one (HTML, text, empty) →
+ *     TensorCostGatewayRejectedError: turned away before TensorCost.
  *
  * Circuit breaker:
  *   - Maintained on the CircuitBreaker instance passed in.
@@ -54,8 +57,10 @@ import {
   TensorCostProxyError,
   TensorCostQuotaError,
   TensorCostProviderError,
+  TensorCostGatewayRejectedError,
+  TensorCostKeyRejectedError,
+  TensorCostRefusedError,
 } from "./errors.js";
-import { TenantIdMissingError } from "./transport.js";
 import {
   decisionSaysRefuse,
   parseRefusalBody,
@@ -534,15 +539,11 @@ export async function proxyRequest(
       throw tcErr;
     }
 
-    // Any other status — the provider's own error, relayed by the proxy.
-    // Non-retriable, and never a fallback: the provider would answer the
-    // same way again.
-    const providerMsg = providerMessageFrom(errorBody);
-    const tcErr = new TensorCostProviderError(
-      `tensorcost: upstream provider returned ${resp.status}` +
-        (providerMsg !== null ? `: ${providerMsg}` : ""),
-      { status: resp.status, requestId, attempt: attempt + 1, body: errorBody },
-    );
+    // Any other status — the provider's own error, relayed by the proxy
+    // (always JSON), or, when the body isn't JSON, something in front of
+    // TensorCost turning the request away. Non-retriable, and never a
+    // fallback: the provider would answer the same way again.
+    const tcErr = nonRefusal4xx(resp, errorBody, requestId, attempt + 1);
     emitEvent(opts.onLifecycleEvent, {
       kind: "on_error",
       provider: opts.provider,
@@ -558,6 +559,48 @@ export async function proxyRequest(
 
   // Should be unreachable — every loop arm either returns or throws.
   throw lastError ?? new TensorCostProxyError("tensorcost: max attempts reached");
+}
+
+/**
+ * A non-refusal 4xx: the provider's relayed error when the body is JSON, a
+ * gateway rejection when it isn't (HTML, plain text, or empty).
+ */
+function nonRefusal4xx(
+  resp: Response,
+  errorBody: unknown,
+  requestId: string | null,
+  attempt: number,
+): TensorCostProviderError | TensorCostGatewayRejectedError | TensorCostRefusedError | TensorCostKeyRejectedError {
+  if (errorBody === null || typeof errorBody === "string") {
+    return new TensorCostGatewayRejectedError(
+      resp.status,
+      typeof errorBody === "string" ? errorBody.slice(0, 500) : null,
+      { requestId, attempt },
+    );
+  }
+  // NestJS's own error body ({ statusCode, message, error: "Unauthorized" })
+  // is TensorCost's, not a provider's: providers never send `statusCode`.
+  // A 401 there is the proxy rejecting the TensorCost token.
+  const nest = errorBody as Record<string, unknown>;
+  if (typeof nest["statusCode"] === "number" && typeof nest["error"] !== "object") {
+    if (resp.status === 401) return new TensorCostKeyRejectedError(401, { requestId, attempt });
+    const msg = typeof nest["message"] === "string" ? nest["message"] : null;
+    return new TensorCostRefusedError(
+      `tensorcost: the proxy rejected the request (${resp.status}${msg ? `: ${msg}` : ""})`,
+      { code: null, detail: nest },
+      { status: resp.status, requestId, attempt },
+    );
+  }
+  const providerMsg = providerMessageFrom(errorBody);
+  const headers: Record<string, string> = {};
+  resp.headers.forEach((v, k) => {
+    headers[k] = v;
+  });
+  return new TensorCostProviderError(
+    `tensorcost: upstream provider returned ${resp.status}` +
+      (providerMsg !== null ? `: ${providerMsg}` : ""),
+    { status: resp.status, requestId, attempt, body: errorBody, headers },
+  );
 }
 
 /**
@@ -599,10 +642,6 @@ async function readErrorBody(resp: Response, deadlineMs: number): Promise<unknow
  *   - TensorCostQuotaError     429 (rate limit) or 402 (plan ceiling) from
  *                              the proxy, with no refusal body
  *
- * plus one case where TensorCost was never asked at all: no tenant id, so
- * no token (TenantIdMissingError, which warns once). That can't be a
- * skipped refusal, and 1.4.0 behaved the same way.
- *
  * This is an allow-list on purpose. 1.4.0 had the inverse, a list of
  * refusal classes that must NOT fall back, and every refusal code missing
  * from it fell back by default. That is how a money budget's hard cap
@@ -616,8 +655,7 @@ export function shouldFallBackToProvider(err: unknown): boolean {
     err instanceof TensorCostNetworkError ||
     err instanceof TensorCostTimeoutError ||
     err instanceof TensorCostProxyError ||
-    err instanceof TensorCostQuotaError ||
-    err instanceof TenantIdMissingError
+    err instanceof TensorCostQuotaError
   );
 }
 
@@ -871,12 +909,7 @@ export async function proxyRequestStream(
       });
     }
 
-    const providerMsg = providerMessageFrom(errorBody);
-    throw new TensorCostProviderError(
-      `tensorcost: upstream provider returned ${resp.status}` +
-        (providerMsg !== null ? `: ${providerMsg}` : ""),
-      { status: resp.status, requestId, attempt: attempt + 1, body: errorBody },
-    );
+    throw nonRefusal4xx(resp, errorBody, requestId, attempt + 1);
   }
 
   throw lastError ?? new TensorCostProxyError("tensorcost: max attempts reached");

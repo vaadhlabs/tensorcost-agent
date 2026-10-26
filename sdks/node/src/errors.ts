@@ -13,6 +13,10 @@
  *   ├── TensorCostProxyError      proxy responded with 5xx                 │ errors that may fall
  *   ├── TensorCostQuotaError      proxy 429, or 402 plan ceiling           ┘ back to the provider
  *   ├── TensorCostProviderError   proxy relayed an upstream provider 4xx
+ *   │                             (rethrown as the provider SDK's own error
+ *   │                             type when the client can build one)
+ *   ├── TensorCostGatewayRejectedError  non-JSON 4xx from in front of TensorCost
+ *   ├── TensorCostKeyRejectedError      token exchange rejected the API key
  *   └── TensorCostRefusedError    TensorCost refused the call (terminal)
  *       ├── TensorCostRunBudgetExceededError
  *       ├── TensorCostRunStoppedError
@@ -127,10 +131,53 @@ export class TensorCostQuotaError extends TensorCostError {
  */
 export class TensorCostProviderError extends TensorCostError {
   readonly body: unknown;
+  /** Response headers of the relayed error, lower-cased. */
+  readonly headers: Record<string, string>;
 
-  constructor(message: string, opts: TensorCostErrorOptions & { body?: unknown } = {}) {
+  constructor(
+    message: string,
+    opts: TensorCostErrorOptions & { body?: unknown; headers?: Record<string, string> } = {},
+  ) {
     super(message, opts);
     this.body = opts.body ?? null;
+    this.headers = opts.headers ?? {};
+  }
+}
+
+/**
+ * Something in front of TensorCost turned the request away: a 4xx whose
+ * body isn't JSON (an HTML page from a firewall or load balancer, or
+ * nothing at all). Neither TensorCost nor the provider saw the call.
+ * Terminal: going around it would mean going around whatever put the
+ * firewall there, and the next call would most likely meet it too.
+ */
+export class TensorCostGatewayRejectedError extends TensorCostError {
+  /** The first 500 characters of what came back, if anything did. */
+  readonly bodyText: string | null;
+
+  constructor(status: number, bodyText: string | null, opts: TensorCostErrorOptions = {}) {
+    super(
+      `tensorcost: the request was rejected with ${status} before it reached TensorCost ` +
+        "or the provider (for example by a firewall or load balancer in front of the " +
+        "TensorCost proxy). Check the proxy URL and anything in front of it.",
+      { ...opts, status },
+    );
+    this.bodyText = bodyText;
+  }
+}
+
+/**
+ * The token exchange rejected the TensorCost API key (401 or 403): revoked,
+ * mistyped, or issued for a different tenant than the one configured. Not
+ * an outage, so it never fails open.
+ */
+export class TensorCostKeyRejectedError extends TensorCostError {
+  constructor(status: number, opts: TensorCostErrorOptions = {}) {
+    super(
+      `tensorcost: the TensorCost key was rejected (${status}); check it's current and ` +
+        "that it belongs to the configured tenant id",
+      { ...opts, status },
+    );
   }
 }
 

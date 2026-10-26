@@ -14,8 +14,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { admitRequest } from "../admit-client.js";
 import {
+  TensorCostGatewayRejectedError,
   TensorCostModelGovernanceDeniedError,
-  TensorCostRefusedError,
   TensorCostRunStoppedError,
 } from "../errors.js";
 import { shouldFallBackToProvider } from "../proxy-client.js";
@@ -96,7 +96,7 @@ describe("admitRequest", () => {
     expect(res.refusal?.code).toBe("MODEL_GOVERNANCE_DENIED");
   });
 
-  it("a 403 with a body that isn't JSON is still a refusal", async () => {
+  it("a 403 with a body that isn't JSON is a gateway rejection, still blocked (1.4.1)", async () => {
     const fetchImpl = vi.fn(async () => new Response("<html>403</html>", { status: 403 }));
     const res = await admitRequest({
       baseUrl: "http://proxy.local",
@@ -106,8 +106,8 @@ describe("admitRequest", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(res.allowed).toBe(false);
-    expect(res.refusal).toBeInstanceOf(TensorCostRefusedError);
-    expect(res.refusal?.code).toBeNull();
+    expect(res.refusal).toBeInstanceOf(TensorCostGatewayRejectedError);
+    expect(res.refusal?.status).toBe(403);
     expect(shouldFallBackToProvider(res.refusal)).toBe(false);
   });
 

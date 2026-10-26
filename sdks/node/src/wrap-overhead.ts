@@ -68,18 +68,34 @@ export function postObservation(
 }
 
 /**
- * `application` / `tags` for an observation, from the wrap config. The
- * server reads both (ObservationDto); before 1.4.1 they only rode on
- * proxied calls as x-tc-application / x-tc-tags.
+ * Off in 1.4.1. The server's ObservationDto reads `application` and `tags`,
+ * but byoc-v0.1.40 (what design partners run) validates observations with
+ * forbidNonWhitelisted and has neither field, so an observation carrying
+ * them is rejected with a 400 and dropped. Turned on in 1.5 alongside the
+ * server release that accepts them everywhere.
+ */
+let sendObservationScope = false;
+
+/**
+ * `application` / `tags` for an observation, from the wrap config. Before
+ * this they only rode on proxied calls as x-tc-application / x-tc-tags.
+ * Returns nothing while the flag above is off.
  */
 export function observationScope(
   application: string | null | undefined,
   tags: readonly string[] | undefined,
 ): { application?: string; tags?: string[] } {
+  if (!sendObservationScope) return {};
   return {
     ...(application ? { application } : {}),
     ...(tags && tags.length > 0 ? { tags: [...tags] } : {}),
   };
 }
 
-export const __test__ = { WrapOverhead };
+export const __test__ = {
+  WrapOverhead,
+  /** Internal: flips the 1.5 observation fields on, for tests only. */
+  setObservationScope(on: boolean): void {
+    sendObservationScope = on;
+  },
+};

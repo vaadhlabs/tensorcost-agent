@@ -20,12 +20,16 @@ from typing import Any, Optional
 import httpx
 
 from ._errors import (
+    TensorCostError,
+    TensorCostGatewayRejectedError,
+    TensorCostKeyRejectedError,
     TensorCostNetworkError,
     TensorCostProxyError,
     TensorCostQuotaError,
     TensorCostRefusedError,
     TensorCostTimeoutError,
 )
+from ._observation_scope import observation_scope
 from ._layer import ADMIT_PATH, ADMIT_TIMEOUT_S, ControlLayer
 from ._refusal import decision_says_refuse, parse_body, parse_refusal_body, refusal_error
 from ._retry import parse_retry_after_ms
@@ -66,7 +70,7 @@ def admit_request(
     own_client = http_client is None
     client = http_client or httpx.Client(timeout=timeout_s)
     # Raised after the try below: inside it, fail-open would swallow it.
-    refusal: Optional[TensorCostRefusedError] = None
+    refusal: Optional[TensorCostError] = None
     try:
         try:
             resp = client.post(url, headers=headers, json=metadata)
@@ -120,12 +124,7 @@ def admit_request(
                             "status": "success",
                             "error_message": None,
                             "correlation_id": metadata.get("correlation_id", ""),
-                            **(
-                                {"application": metadata["application"]}
-                                if metadata.get("application")
-                                else {}
-                            ),
-                            **({"tags": list(tag_list)} if tag_list else {}),
+                            **observation_scope(metadata.get("application"), tag_list),
                             "metadata": {
                                 "decision_action": "allow",
                                 "decision_reason": "admit_unavailable",
@@ -145,7 +144,7 @@ def admit_request(
 
 def _refusal_from_4xx(
     resp: httpx.Response, decision_header: Optional[str]
-) -> Optional[TensorCostRefusedError]:
+) -> Optional[TensorCostError]:
     """The refusal in a 4xx from /admit, or None for a bare 429 / 402."""
     body = parse_body(resp.content)
     parsed = parse_refusal_body(body)
@@ -156,14 +155,26 @@ def _refusal_from_4xx(
     ):
         return None
     request_id = resp.headers.get("x-tc-request-id")
-    if parsed is not None or resp.status_code == 403:
+    retry_after = resp.headers.get("retry-after")
+    if parsed is not None:
         return refusal_error(
-            parsed,
-            status=resp.status_code,
-            request_id=request_id,
-            retry_after_header=resp.headers.get("retry-after"),
+            parsed, status=resp.status_code, request_id=request_id, retry_after_header=retry_after
         )
-    message = body.get("message") if isinstance(body, dict) else None
+    if not isinstance(body, dict):
+        if decision_says_refuse(decision_header):
+            return refusal_error(None, status=resp.status_code, request_id=request_id)
+        # HTML or nothing: something in front of TensorCost said no.
+        return TensorCostGatewayRejectedError(
+            resp.status_code,
+            body[:500] if isinstance(body, str) else None,
+            request_id=request_id,
+        )
+    if resp.status_code == 403:
+        return refusal_error(None, status=403, request_id=request_id)
+    if resp.status_code == 401:
+        # /admit rejected the TensorCost token.
+        return TensorCostKeyRejectedError(401, request_id=request_id)
+    message = body.get("message")
     return TensorCostRefusedError(
         f"tensorcost: admission check returned {resp.status_code}"
         + (f" ({message})" if isinstance(message, str) and message else "")

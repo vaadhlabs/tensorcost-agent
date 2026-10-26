@@ -17,12 +17,14 @@ Runtime dependency: `httpx` only.
 The default layer is **`observe`**: telemetry only, provider call unchanged.
 
 ```python
+import os
 from openai import OpenAI
 from tensorcost import wrap
 
 client = wrap(
     OpenAI(api_key="sk-..."),
     api_key="tc_live_...",
+    tenant_id=os.environ["TENSORCOST_TENANT_ID"],
 )
 
 resp = client.chat.completions.create(
@@ -34,12 +36,14 @@ resp = client.chat.completions.create(
 Anthropic works identically:
 
 ```python
+import os
 from anthropic import Anthropic
 from tensorcost import wrap
 
 client = wrap(
     Anthropic(api_key="sk-ant-..."),
     api_key="tc_live_...",
+    tenant_id=os.environ["TENSORCOST_TENANT_ID"],
 )
 client.messages.create(
     model="claude-3-5-sonnet-20241022",
@@ -73,12 +77,14 @@ When routing is paused in the console, the published ceiling is capped at `gover
 | `route` | Via proxy | Full applied-mode routing through inference-proxy |
 
 ```python
+import os
 from openai import OpenAI
 from tensorcost import wrap
 
 client = wrap(
     OpenAI(api_key="sk-..."),
     api_key="tc_live_...",
+    tenant_id=os.environ["TENSORCOST_TENANT_ID"],
     max_layer="route",
     proxy_url="https://api.my-instance.tensorcost.com",
 )
@@ -135,11 +141,13 @@ At Lambda/container init, the first steer/route call can otherwise pay for JWT e
 `wrap()` also background-warms that shared runtime on first use; explicit `prewarm()` is recommended when you know traffic is about to arrive.
 
 ```python
+import os
 from openai import OpenAI
 from tensorcost import prewarm, wrap
 
 prewarm(
     api_key="tc_live_...",
+    tenant_id=os.environ["TENSORCOST_TENANT_ID"],
     base_url="https://api.tensorcost.com",
     max_layer="route",
 )
@@ -147,6 +155,7 @@ prewarm(
 client = wrap(
     OpenAI(api_key="sk-..."),
     api_key="tc_live_...",
+    tenant_id=os.environ["TENSORCOST_TENANT_ID"],
     max_layer="route",
     proxy_url="https://...",
 )
@@ -181,7 +190,7 @@ Recommended rollout: **`observe` → `govern` → `route`**, raising the console
 | `TENSORCOST_API_KEY` | Long-lived SDK key from **Setup → Keys** | Yes |
 | `TENSORCOST_BASE_URL` | Backend base URL (admit, sdk-layer, token exchange) | No (default `https://api.tensorcost.com`) |
 | `TENSORCOST_PROXY_URL` | Inference-proxy base URL | Required when `max_layer` is `steer` or `route` |
-| `TENSORCOST_TENANT_ID` | Explicit tenant id | No |
+| `TENSORCOST_TENANT_ID` | Your tenant id, shown in the console under **Developers › SDK setup**. The token exchange needs it: without it the SDK never reaches TensorCost | **Yes** (`wrap()` raises `MissingConfigError` at `govern` and above without it; `observe` warns once and sends nothing) |
 | `TENSORCOST_ENVIRONMENT` | Environment tag on every observation | No |
 | `TENSORCOST_CONNECTION_ID` | Provider-connection id | No |
 | `TENSORCOST_AGENT_ID` / `TENSORCOST_WORKFLOW_ID` | Agent-run attribution defaults | No |
@@ -190,9 +199,11 @@ Recommended rollout: **`observe` → `govern` → `route`**, raising the console
 | `TC_TAGS` / `TENSORCOST_TAGS` | Comma-separated routing tags (proxy) | No |
 
 ```python
+import os
 client = wrap(
     OpenAI(api_key="sk-..."),
     api_key="tc_live_...",
+    tenant_id=os.environ["TENSORCOST_TENANT_ID"],
     max_layer="govern",
     application="customer-support",
     tags=["tier:enterprise"],
@@ -325,6 +336,7 @@ See [`docs/demo/data-path-one-pager.md`](https://github.com/vaadhlabs/tensorcost
 Exceptions:
 
 - Missing `TENSORCOST_API_KEY` → `MissingConfigError` at `wrap()` time
+- Missing `TENSORCOST_TENANT_ID` when `max_layer` is `govern`, `steer` or `route` → `MissingConfigError` at `wrap()` time (1.4.1)
 - Missing `proxy_url` when `max_layer` is `steer` or `route` → `MissingConfigError`
 - Govern **refusals** (403 from `/admit`) → call blocked by design
 - Steer **run-budget** / **period-budget** refusals → not fail-opened
@@ -349,21 +361,25 @@ Authentication uses a short-lived JWT from `POST /api/inference-proxy/sdk-token/
 | OpenAI | `openai` ≥ 1.0 | observe → route | chat, completions, embeddings, responses (+ streaming) |
 | Anthropic | `anthropic` ≥ 0.20 | observe, govern (steer/route run as govern, 1.4.1) | messages (+ streaming) |
 | Azure OpenAI | `openai` (`AzureOpenAI`) | observe → route | same as OpenAI (`provider: openai`) |
-| AWS Bedrock | `boto3` bedrock-runtime | observe, govern only | invoke, converse (+ streaming placeholders) |
-| Google Vertex | `google-genai` (`vertexai=True`) | observe, govern only | generate_content (+ streaming) |
+| AWS Bedrock | `boto3` bedrock-runtime | observe (govern accepted, not enforced yet) | invoke, converse (+ streaming placeholders) |
+| Google Vertex | `google-genai` (`vertexai=True`) | observe (govern accepted, not enforced yet) | generate_content (+ streaming) |
 
 **Bedrock and Vertex:** signing happens inside the AWS / Google client before the proxy can intercept — **`max_layer="steer"` or `"route"` raises `MissingConfigError`**.
 
 ```python
+import os
 import boto3
 from tensorcost import wrap
 
 bedrock = wrap(
     boto3.client("bedrock-runtime", region_name="us-east-1"),
     api_key="tc_live_...",
+    tenant_id=os.environ["TENSORCOST_TENANT_ID"],
     max_layer="govern",  # steer/route not supported
 )
 ```
+
+`govern` is accepted for Bedrock and Vertex but there is no `/admit` check for them yet, so calls are observed only and stops, caps and budgets are not enforced; the SDK warns once when you set it.
 
 ## Node vs Python parity (1.1)
 

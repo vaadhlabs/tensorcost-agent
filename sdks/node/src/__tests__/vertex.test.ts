@@ -128,6 +128,7 @@ describe("wrap() + Vertex applied mode guard", () => {
     expect(() =>
       wrap(client, {
         apiKey: "k",
+        tenantId: "t-1",
         baseUrl: "http://localhost:1",
         maxLayer: "route",
         proxyUrl: "http://proxy.local",

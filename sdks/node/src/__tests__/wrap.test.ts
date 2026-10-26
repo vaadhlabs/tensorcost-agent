@@ -105,6 +105,7 @@ describe("wrap()", () => {
     expect(() =>
       wrap(c, {
         apiKey: "k",
+        tenantId: "t-1",
         baseUrl: "http://localhost:1",
         maxLayer: "route",
         proxyUrl: "http://proxy.local",
@@ -116,6 +117,7 @@ describe("wrap()", () => {
     const c = fakeBedrockClient();
     const wrapped = wrap(c, {
       apiKey: "k",
+      tenantId: "t-1",
       baseUrl: "http://localhost:1",
       maxLayer: "govern",
     });

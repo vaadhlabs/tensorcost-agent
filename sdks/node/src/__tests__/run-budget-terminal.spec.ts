@@ -30,6 +30,7 @@ import {
   TensorCostTimeoutError,
   TensorCostQuotaError,
   TensorCostRefusedError,
+  TensorCostGatewayRejectedError,
 } from "../errors.js";
 import { CircuitBreaker } from "../circuit.js";
 
@@ -155,13 +156,16 @@ describe("run-budget refusal is terminal in the SDK", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  it("treats a non-JSON 403 as a provider error", async () => {
+  it("treats a non-JSON 403 as a gateway rejection, terminal (1.4.1)", async () => {
     const fetchImpl = vi.fn(
       async () => new Response("nope", { status: 403 }),
     );
-    await expect(
-      proxyRequest(baseOpts(fetchImpl as unknown as typeof fetch)),
-    ).rejects.toBeInstanceOf(TensorCostProviderError);
+    const err = await proxyRequest(baseOpts(fetchImpl as unknown as typeof fetch)).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(TensorCostGatewayRejectedError);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });
 

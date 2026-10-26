@@ -22,8 +22,11 @@ refusal check in front of it):
 * 402 otherwise → ``TensorCostQuotaError``, status 402 (the plan's monthly
   proxy-request ceiling). Not retried.
 * 5xx → ``TensorCostProxyError`` (proxy or upstream unavailable).
-* any other 4xx → ``TensorCostProviderError``: the provider's own error,
-  relayed verbatim by the proxy.
+* any other 4xx with a JSON body → ``TensorCostProviderError``: the
+  provider's own error, relayed verbatim by the proxy. The wrappers re-raise
+  it as the provider SDK's own error type when they can.
+* any other 4xx without one (HTML, text, empty) →
+  ``TensorCostGatewayRejectedError``: turned away before TensorCost.
 """
 
 from __future__ import annotations
@@ -37,6 +40,9 @@ import httpx
 
 from ._circuit import CircuitBreaker
 from ._errors import (
+    TensorCostError,
+    TensorCostGatewayRejectedError,
+    TensorCostKeyRejectedError,
     TensorCostNetworkError,
     TensorCostProxyError,
     TensorCostProviderError,
@@ -59,7 +65,6 @@ from ._retry import (
     sleep_sync,
 )
 from ._layer import PROXY_HEADERS_TIMEOUT_S, ControlLayer, proxy_path_for_operation
-from ._transport import TenantIdMissingError
 from ._telemetry import (
     AfterResponseEvent,
     BeforeRequestEvent,
@@ -589,18 +594,11 @@ def proxy_request(
             )
             raise tc_err
 
-        # Any other status: the provider's own error, relayed by the proxy.
-        # Not retried and never a fallback; the provider would answer the
-        # same way again.
-        provider_msg = provider_message_from(error_body)
-        tc_err = TensorCostProviderError(
-            f"tensorcost: upstream provider returned {resp.status_code}"
-            + (f": {provider_msg}" if provider_msg else ""),
-            body=error_body,
-            status=resp.status_code,
-            request_id=request_id,
-            attempt=attempt + 1,
-        )
+        # Any other status: the provider's own error, relayed by the proxy
+        # (always JSON), or, when the body isn't JSON, something in front of
+        # TensorCost turning the request away. Not retried and never a
+        # fallback; the provider would answer the same way again.
+        tc_err = _non_refusal_4xx(resp, error_body, request_id, attempt + 1)
         emit_event(
             on_lifecycle_event,
             OnErrorEvent(
@@ -617,6 +615,49 @@ def proxy_request(
         raise tc_err
 
     raise last_error or TensorCostProxyError("tensorcost: max attempts reached")
+
+
+def _non_refusal_4xx(
+    resp: httpx.Response, error_body: Any, request_id: Optional[str], attempt: int
+) -> TensorCostError:
+    """A 4xx that isn't a refusal: the provider's relayed error when the body is
+    JSON, a gateway rejection when it isn't (HTML, text, or empty), and the
+    proxy's own NestJS error (``{statusCode, message}``, which providers never
+    send) as a TensorCost error."""
+    if error_body is None or isinstance(error_body, str):
+        return TensorCostGatewayRejectedError(
+            resp.status_code,
+            error_body[:500] if isinstance(error_body, str) else None,
+            request_id=request_id,
+            attempt=attempt,
+        )
+    if (
+        isinstance(error_body, dict)
+        and isinstance(error_body.get("statusCode"), int)
+        and not isinstance(error_body.get("error"), dict)
+    ):
+        if resp.status_code == 401:
+            return TensorCostKeyRejectedError(401, request_id=request_id, attempt=attempt)
+        msg = error_body.get("message")
+        return TensorCostRefusedError(
+            f"tensorcost: the proxy rejected the request ({resp.status_code}"
+            + (f": {msg}" if isinstance(msg, str) and msg else "")
+            + ")",
+            detail=error_body,
+            status=resp.status_code,
+            request_id=request_id,
+            attempt=attempt,
+        )
+    provider_msg = provider_message_from(error_body)
+    return TensorCostProviderError(
+        f"tensorcost: upstream provider returned {resp.status_code}"
+        + (f": {provider_msg}" if provider_msg else ""),
+        body=error_body,
+        headers=dict(resp.headers),
+        status=resp.status_code,
+        request_id=request_id,
+        attempt=attempt,
+    )
 
 
 def _terminal_proxy_refusal_error(
@@ -782,15 +823,7 @@ def proxy_request_stream(
                     request_id=request_id,
                     attempt=1,
                 )
-            provider_msg = provider_message_from(error_body)
-            raise TensorCostProviderError(
-                f"tensorcost: upstream provider returned {resp.status_code}"
-                + (f": {provider_msg}" if provider_msg else ""),
-                body=error_body,
-                status=resp.status_code,
-                request_id=request_id,
-                attempt=1,
-            )
+            raise _non_refusal_4xx(resp, error_body, request_id, 1)
         if circuit is not None:
             circuit.record_success()
 
@@ -829,10 +862,6 @@ def should_fall_back_to_provider(err: BaseException) -> bool:
     * ``TensorCostQuotaError``    429 (rate limit) or 402 (plan ceiling) from
                                   the proxy, with no refusal body
 
-    plus one case where TensorCost was never asked at all: no tenant id, so no
-    token (``TenantIdMissingError``, which warns once). That can't be a skipped
-    refusal, and 1.4.0 behaved the same way.
-
     This is an allow-list on purpose. 1.4.0 had the inverse, a tuple of
     refusal classes that must NOT fall back, and every refusal code missing
     from it fell back by default. That is how a money budget's hard cap
@@ -848,6 +877,5 @@ def should_fall_back_to_provider(err: BaseException) -> bool:
             TensorCostTimeoutError,
             TensorCostProxyError,
             TensorCostQuotaError,
-            TenantIdMissingError,
         ),
     )
