@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { admitRequest } from "../admit-client.js";
 import {
   TensorCostModelGovernanceDeniedError,
+  TensorCostRefusedError,
   TensorCostRunStoppedError,
 } from "../errors.js";
 import { shouldFallBackToProvider } from "../proxy-client.js";
@@ -79,7 +80,7 @@ describe("admitRequest", () => {
     expect(shouldFallBackToProvider(err)).toBe(false);
   });
 
-  it("leaves other 403s as a plain refusal with no modelled error", async () => {
+  it("types every other 403 refusal by its code (1.4.1)", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(403, { error: { code: "MODEL_GOVERNANCE_DENIED", message: "no" } }),
     );
@@ -90,7 +91,9 @@ describe("admitRequest", () => {
       metadata: META,
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
-    expect(res).toEqual({ allowed: false, decisionHeader: null });
+    expect(res.allowed).toBe(false);
+    expect(res.refusal).toBeInstanceOf(TensorCostModelGovernanceDeniedError);
+    expect(res.refusal?.code).toBe("MODEL_GOVERNANCE_DENIED");
   });
 
   it("a 403 with a body that isn't JSON is still a refusal", async () => {
@@ -103,7 +106,9 @@ describe("admitRequest", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(res.allowed).toBe(false);
-    expect(res.refusal).toBeUndefined();
+    expect(res.refusal).toBeInstanceOf(TensorCostRefusedError);
+    expect(res.refusal?.code).toBeNull();
+    expect(shouldFallBackToProvider(res.refusal)).toBe(false);
   });
 
   it("still fails open on a transport failure", async () => {

@@ -11,6 +11,19 @@ Timeout handling:
 
 * ``headers_timeout_s`` (default 2s): abort if response headers never arrive.
 * ``timeout_s`` (default 60s): wall-clock budget for the full response body.
+
+How a non-2xx response is classified (unchanged split from 1.4.0, plus the
+refusal check in front of it):
+
+* 4xx whose body carries a TensorCost refusal code, or whose x-tc-decision
+  says action=refuse → a ``TensorCostRefusedError`` subclass. Terminal,
+  never retried, not a circuit failure.
+* 429 otherwise → ``TensorCostQuotaError`` (TensorCost's rate limit).
+* 402 otherwise → ``TensorCostQuotaError``, status 402 (the plan's monthly
+  proxy-request ceiling). Not retried.
+* 5xx → ``TensorCostProxyError`` (proxy or upstream unavailable).
+* any other 4xx → ``TensorCostProviderError``: the provider's own error,
+  relayed verbatim by the proxy.
 """
 
 from __future__ import annotations
@@ -24,18 +37,19 @@ import httpx
 
 from ._circuit import CircuitBreaker
 from ._errors import (
-    TensorCostComplianceDeniedError,
-    TensorCostComplianceTeamMismatchError,
-    TensorCostGuardrailHardStopError,
-    TensorCostModelGovernanceDeniedError,
     TensorCostNetworkError,
     TensorCostProxyError,
     TensorCostProviderError,
     TensorCostQuotaError,
-    TensorCostPeriodBudgetExceededError,
-    TensorCostRunBudgetExceededError,
-    TensorCostRunStoppedError,
+    TensorCostRefusedError,
     TensorCostTimeoutError,
+)
+from ._refusal import (
+    decision_says_refuse,
+    parse_body,
+    parse_refusal_body,
+    provider_message_from,
+    refusal_error,
 )
 from ._retry import (
     DEFAULT_RETRY_CONFIG,
@@ -45,6 +59,7 @@ from ._retry import (
     sleep_sync,
 )
 from ._layer import PROXY_HEADERS_TIMEOUT_S, ControlLayer, proxy_path_for_operation
+from ._transport import TenantIdMissingError
 from ._telemetry import (
     AfterResponseEvent,
     BeforeRequestEvent,
@@ -428,6 +443,64 @@ def proxy_request(
             )
             return json.loads(resp.content), resp.headers.get("x-tc-decision")
 
+        error_body: Any = None
+        if 400 <= resp.status_code < 500:
+            # A TensorCost refusal is terminal whatever its status (a 429
+            # refusal included): checked before the quota arm, never
+            # retried, never counted against the circuit.
+            error_body = parse_body(resp.content)
+            refusal = parse_refusal_body(error_body)
+            if refusal is not None or decision_says_refuse(resp.headers.get("x-tc-decision")):
+                tc_refusal = refusal_error(
+                    refusal,
+                    status=resp.status_code,
+                    request_id=request_id,
+                    attempt=attempt + 1,
+                    retry_after_header=resp.headers.get("retry-after"),
+                )
+                emit_event(
+                    on_lifecycle_event,
+                    OnErrorEvent(
+                        kind="on_error",
+                        provider=provider,
+                        model=model,
+                        operation=operation,
+                        attempt_number=attempt + 1,
+                        elapsed_ms=(time.monotonic() - call_start) * 1000.0,
+                        error_class=tc_refusal.__class__.__name__,
+                        status=resp.status_code,
+                    ),
+                )
+                raise tc_refusal
+
+        if resp.status_code == 402:
+            # No refusal body: the plan's monthly proxy-request ceiling (Scale
+            # COGS gate). TensorCost declining to carry the call is not a
+            # refusal of the call, and the server means for it to go direct,
+            # so it counts as an outage. Not retried: it won't clear soon.
+            ra_ms = parse_retry_after_ms(resp.headers.get("retry-after"))
+            tc_err = TensorCostQuotaError(
+                "tensorcost: proxy returned 402 (plan request ceiling reached)",
+                retry_after_ms=int(ra_ms) if ra_ms is not None else None,
+                status=402,
+                request_id=request_id,
+                attempt=attempt + 1,
+            )
+            emit_event(
+                on_lifecycle_event,
+                OnErrorEvent(
+                    kind="on_error",
+                    provider=provider,
+                    model=model,
+                    operation=operation,
+                    attempt_number=attempt + 1,
+                    elapsed_ms=(time.monotonic() - call_start) * 1000.0,
+                    error_class=tc_err.__class__.__name__,
+                    status=402,
+                ),
+            )
+            raise tc_err
+
         if resp.status_code == 429:
             ra_header = resp.headers.get("retry-after")
             ra_ms = parse_retry_after_ms(ra_header)
@@ -473,28 +546,6 @@ def proxy_request(
             )
             raise tc_err
 
-        if resp.status_code == 403:
-            tc_err = _terminal_proxy_refusal_error(
-                resp.content,
-                request_id=request_id,
-                attempt=attempt + 1,
-            )
-            if tc_err is not None:
-                emit_event(
-                    on_lifecycle_event,
-                    OnErrorEvent(
-                        kind="on_error",
-                        provider=provider,
-                        model=model,
-                        operation=operation,
-                        attempt_number=attempt + 1,
-                        elapsed_ms=(time.monotonic() - call_start) * 1000.0,
-                        error_class=tc_err.__class__.__name__,
-                        status=403,
-                    ),
-                )
-                raise tc_err
-
         if resp.status_code >= 500:
             tc_err = TensorCostProxyError(
                 f"tensorcost: proxy returned {resp.status_code}",
@@ -538,8 +589,14 @@ def proxy_request(
             )
             raise tc_err
 
+        # Any other status: the provider's own error, relayed by the proxy.
+        # Not retried and never a fallback; the provider would answer the
+        # same way again.
+        provider_msg = provider_message_from(error_body)
         tc_err = TensorCostProviderError(
-            f"tensorcost: upstream provider returned {resp.status_code}",
+            f"tensorcost: upstream provider returned {resp.status_code}"
+            + (f": {provider_msg}" if provider_msg else ""),
+            body=error_body,
             status=resp.status_code,
             request_id=request_id,
             attempt=attempt + 1,
@@ -562,109 +619,21 @@ def proxy_request(
     raise last_error or TensorCostProxyError("tensorcost: max attempts reached")
 
 
-def _extract_proxy_refusal_code(content: bytes) -> tuple[Optional[str], dict[str, Any]]:
-    try:
-        parsed = json.loads(content)
-        if isinstance(parsed, dict):
-            if isinstance(parsed.get("code"), str):
-                return parsed["code"], parsed
-            err_obj = parsed.get("error")
-            if isinstance(err_obj, dict) and isinstance(err_obj.get("code"), str):
-                return err_obj["code"], err_obj
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return None, {}
-
-
 def _terminal_proxy_refusal_error(
     content: bytes,
     *,
     request_id: Optional[str],
     attempt: int,
-) -> Optional[BaseException]:
-    """Map a 403 proxy body to a terminal refusal error, or None if not ours."""
-    code, detail = _extract_proxy_refusal_code(content)
-    if code == "RUN_STOPPED":
-        return TensorCostRunStoppedError.from_proxy_detail(
-            detail, request_id=request_id, attempt=attempt
-        )
-    if code in ("RUN_BUDGET_EXCEEDED", "PERIOD_BUDGET_EXCEEDED"):
-        if code == "PERIOD_BUDGET_EXCEEDED":
-            return TensorCostPeriodBudgetExceededError(
-                str(detail.get("message") or "tensorcost: agent period spend cap reached"),
-                scope=detail.get("scope")
-                if isinstance(detail.get("scope"), str)
-                else None,
-                period=detail.get("period")
-                if isinstance(detail.get("period"), str)
-                else None,
-                cap_cents=detail.get("cap_cents")
-                if isinstance(detail.get("cap_cents"), (int, float))
-                else None,
-                spent_cents=detail.get("spent_cents")
-                if isinstance(detail.get("spent_cents"), (int, float))
-                else None,
-                status=403,
-                request_id=request_id,
-                attempt=attempt,
-            )
-        return TensorCostRunBudgetExceededError(
-            str(detail.get("message") or "tensorcost: agent run spend cap reached"),
-            workflow_id=detail.get("workflow_id")
-            if isinstance(detail.get("workflow_id"), str)
-            else None,
-            cap_cents=detail.get("cap_cents")
-            if isinstance(detail.get("cap_cents"), (int, float))
-            else None,
-            spent_cents=detail.get("spent_cents")
-            if isinstance(detail.get("spent_cents"), (int, float))
-            else None,
-            status=403,
-            request_id=request_id,
-            attempt=attempt,
-        )
-    if code == "MODEL_GOVERNANCE_DENIED":
-        return TensorCostModelGovernanceDeniedError(
-            str(detail.get("message") or "tensorcost: model denied by tenant governance"),
-            provider=detail.get("provider")
-            if isinstance(detail.get("provider"), str)
-            else None,
-            model=detail.get("model") if isinstance(detail.get("model"), str) else None,
-            governance_status=detail.get("governance_status")
-            if isinstance(detail.get("governance_status"), str)
-            else None,
-            status=403,
-            request_id=request_id,
-            attempt=attempt,
-        )
-    if code == "GUARDRAIL_HARD_STOP":
-        return TensorCostGuardrailHardStopError(
-            str(detail.get("message") or "tensorcost: guardrail hard_stop"),
-            policy_id=detail.get("policy_id")
-            if isinstance(detail.get("policy_id"), str)
-            else None,
-            status=403,
-            request_id=request_id,
-            attempt=attempt,
-        )
-    if code == "COMPLIANCE_DENIED":
-        return TensorCostComplianceDeniedError(
-            str(detail.get("message") or "tensorcost: request refused by compliance policy"),
-            status=403,
-            request_id=request_id,
-            attempt=attempt,
-        )
-    if code == "COMPLIANCE_TEAM_MISMATCH":
-        return TensorCostComplianceTeamMismatchError(
-            str(
-                detail.get("message")
-                or "tensorcost: SDK team scope does not match token binding"
-            ),
-            status=403,
-            request_id=request_id,
-            attempt=attempt,
-        )
-    return None
+) -> Optional[TensorCostRefusedError]:
+    """The typed refusal in a proxy error body, or None if it isn't one.
+
+    Kept for callers of the 1.4.0 helper; the request paths now use
+    ``_refusal`` directly, for every 4xx rather than only 403.
+    """
+    refusal = parse_refusal_body(parse_body(content))
+    if refusal is None:
+        return None
+    return refusal_error(refusal, status=403, request_id=request_id, attempt=attempt)
 
 
 def proxy_request_stream(
@@ -738,18 +707,47 @@ def proxy_request_stream(
             pool=min(headers_timeout_s, timeout_s),
         ),
     )
-    resp = stream_ctx.__enter__()
+    # Transport failures are typed here so the fail-open predicate (an
+    # allow-list since 1.4.1) recognises them as outages.
+    try:
+        resp = stream_ctx.__enter__()
+    except httpx.TimeoutException as exc:
+        if close_client:
+            client.close()
+        if circuit is not None:
+            circuit.record_failure()
+        raise TensorCostTimeoutError(
+            f"tensorcost: proxy did not respond with headers within {headers_timeout_s:.0f}s",
+            "headers",
+            root_cause=exc,
+            attempt=1,
+        ) from exc
+    except (httpx.TransportError, OSError) as exc:
+        if close_client:
+            client.close()
+        if circuit is not None:
+            circuit.record_failure()
+        raise TensorCostNetworkError(
+            f"tensorcost: network error reaching proxy: {exc}",
+            root_cause=exc,
+            attempt=1,
+        ) from exc
     request_id = resp.headers.get("x-tc-request-id")
     try:
         if resp.status_code >= 400:
-            body = resp.read()
-            if resp.status_code == 403:
-                tc_err = _terminal_proxy_refusal_error(
-                    body,
-                    request_id=request_id,
-                    attempt=1,
-                )
-                if tc_err is not None:
+            error_body = parse_body(resp.read())
+            if resp.status_code < 500:
+                refusal = parse_refusal_body(error_body)
+                if refusal is not None or decision_says_refuse(
+                    resp.headers.get("x-tc-decision")
+                ):
+                    tc_refusal = refusal_error(
+                        refusal,
+                        status=resp.status_code,
+                        request_id=request_id,
+                        attempt=1,
+                        retry_after_header=resp.headers.get("retry-after"),
+                    )
                     emit_event(
                         on_lifecycle_event,
                         OnErrorEvent(
@@ -759,14 +757,36 @@ def proxy_request_stream(
                             operation=operation,
                             attempt_number=1,
                             elapsed_ms=0.0,
-                            error_class=tc_err.__class__.__name__,
-                            status=403,
+                            error_class=tc_refusal.__class__.__name__,
+                            status=resp.status_code,
                         ),
                     )
-                    raise tc_err
-            detail = body.decode("utf-8", errors="replace")
+                    raise tc_refusal
+            if resp.status_code in (402, 429):
+                ra_ms = parse_retry_after_ms(resp.headers.get("retry-after"))
+                raise TensorCostQuotaError(
+                    "tensorcost: proxy returned 429 Too Many Requests"
+                    if resp.status_code == 429
+                    else "tensorcost: proxy returned 402 (plan request ceiling reached)",
+                    retry_after_ms=int(ra_ms) if ra_ms is not None else None,
+                    status=resp.status_code,
+                    request_id=request_id,
+                    attempt=1,
+                )
+            if resp.status_code >= 500:
+                if circuit is not None:
+                    circuit.record_failure()
+                raise TensorCostProxyError(
+                    f"tensorcost: proxy returned {resp.status_code}",
+                    status=resp.status_code,
+                    request_id=request_id,
+                    attempt=1,
+                )
+            provider_msg = provider_message_from(error_body)
             raise TensorCostProviderError(
-                f"tensorcost: upstream provider returned {resp.status_code}: {detail}",
+                f"tensorcost: upstream provider returned {resp.status_code}"
+                + (f": {provider_msg}" if provider_msg else ""),
+                body=error_body,
                 status=resp.status_code,
                 request_id=request_id,
                 attempt=1,
@@ -797,16 +817,37 @@ def proxy_request_stream(
 
 
 def should_fall_back_to_provider(err: BaseException) -> bool:
-    """Return False for terminal policy refusals that must not fail-open."""
-    return not isinstance(
+    """Should a failed proxy attempt fall back to calling the provider directly?
+
+    Only when TensorCost itself is unavailable. Fail-open exists so that
+    TensorCost being down never takes the customer's inference down with it,
+    so the answer is yes for exactly these and no for everything else:
+
+    * ``TensorCostNetworkError``  couldn't connect, DNS, connection refused
+    * ``TensorCostTimeoutError``  no headers, or no body inside the budget
+    * ``TensorCostProxyError``    5xx from the proxy, or the circuit is open
+    * ``TensorCostQuotaError``    429 (rate limit) or 402 (plan ceiling) from
+                                  the proxy, with no refusal body
+
+    plus one case where TensorCost was never asked at all: no tenant id, so no
+    token (``TenantIdMissingError``, which warns once). That can't be a skipped
+    refusal, and 1.4.0 behaved the same way.
+
+    This is an allow-list on purpose. 1.4.0 had the inverse, a tuple of
+    refusal classes that must NOT fall back, and every refusal code missing
+    from it fell back by default. That is how a money budget's hard cap
+    (BUDGET_HARD_CAP) got routed around. Now a refusal this SDK has never
+    heard of is terminal, a relayed provider 4xx surfaces as itself, and an
+    error the SDK didn't classify at all is surfaced rather than retried
+    against the provider.
+    """
+    return isinstance(
         err,
         (
-            TensorCostRunBudgetExceededError,
-            TensorCostRunStoppedError,
-            TensorCostPeriodBudgetExceededError,
-            TensorCostModelGovernanceDeniedError,
-            TensorCostGuardrailHardStopError,
-            TensorCostComplianceDeniedError,
-            TensorCostComplianceTeamMismatchError,
+            TensorCostNetworkError,
+            TensorCostTimeoutError,
+            TensorCostProxyError,
+            TensorCostQuotaError,
+            TenantIdMissingError,
         ),
     )

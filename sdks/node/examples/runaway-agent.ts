@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import {
   wrap,
   TensorCostError,
+  TensorCostBudgetHardCapError,
   TensorCostRunBudgetExceededError,
   TensorCostPeriodBudgetExceededError,
   TensorCostRunStoppedError,
@@ -244,6 +245,9 @@ function refusalOf(e: unknown): { code: string; message: string } | null {
     return { code: e.code, message: e.message };
   }
   const typed: Array<[new (...a: never[]) => Error, string]> = [
+    // Before PERIOD_BUDGET_EXCEEDED: the money budget's newer wire shape
+    // carries that code too, with budget_code BUDGET_HARD_CAP.
+    [TensorCostBudgetHardCapError, "BUDGET_HARD_CAP"],
     [TensorCostRunBudgetExceededError, "RUN_BUDGET_EXCEEDED"],
     [TensorCostPeriodBudgetExceededError, "PERIOD_BUDGET_EXCEEDED"],
     [TensorCostModelGovernanceDeniedError, "MODEL_GOVERNANCE_DENIED"],

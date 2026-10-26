@@ -47,7 +47,12 @@ import type { ObservationTransport } from "../transport.js";
 
 import { SDK_VERSION } from "../version.js";
 import { resolveModelCallLink } from "../trace-link.js";
-import { WrapOverhead, postObservation, withAwaitExcluded } from "../wrap-overhead.js";
+import {
+  WrapOverhead,
+  observationScope,
+  postObservation,
+  withAwaitExcluded,
+} from "../wrap-overhead.js";
 
 // Marker placed on the middleware to prevent double-registration when
 // wrap() is called twice on the same client.
@@ -252,6 +257,7 @@ export function install(
   workflowId: string | null = null,
   customer: string | null = null,
   feature: string | null = null,
+  scope: { application?: string | null; tags?: string[] } = {},
 ): void {
   if (!client || typeof client !== "object") return;
   const c = client as Record<string, unknown>;
@@ -313,6 +319,7 @@ export function install(
       ...(workflowId !== null ? { workflow_id: workflowId } : {}),
       ...(customer !== null ? { customer } : {}),
       ...(feature !== null ? { feature } : {}),
+      ...observationScope(scope.application, scope.tags),
       ...metaSpread,
     };
 

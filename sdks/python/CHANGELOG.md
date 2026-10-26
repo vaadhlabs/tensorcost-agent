@@ -3,6 +3,146 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 1.4.1 — 2026-10-25
+
+**1.4.0 could route around a hard spend cap when fail-open was on (the
+default); upgrade.** When a money budget's hard cap refused a call (403
+with `code: "BUDGET_HARD_CAP"`), 1.4.0 read the refusal as a provider error,
+and with `fail_open_enabled` on it called the provider directly. The cap was enforced
+by the proxy and then skipped by the SDK, and the call was billed.
+
+### Changed: an unknown refusal is now terminal
+
+1.4.0 decided whether a failed proxy call could go straight to the provider
+with a list of refusals that must not. Any refusal missing from that list,
+including ones added on the server later, fell back. 1.4.1 turns the rule
+around: a call goes around TensorCost only when TensorCost is unavailable.
+
+- Falls back (with `fail_open_enabled` on): network errors and connection
+  refused (`TensorCostNetworkError`), timeouts (`TensorCostTimeoutError`),
+  5xx from the proxy or an open circuit (`TensorCostProxyError`), and a 429
+  or 402 from the proxy with no refusal body (`TensorCostQuotaError`; the
+  429 is TensorCost's rate limit, the 402 the plan's monthly request
+  ceiling). Also the case where no tenant id is configured, so TensorCost
+  is never asked; that now logs one warning saying caps and stops are not
+  enforced.
+- Never falls back: any 4xx carrying a TensorCost refusal, whatever the
+  code. A code this version doesn't know arrives as `TensorCostRefusedError`
+  with `code`, `reason` and the server's message intact. A refusal is never
+  retried, even on a 429.
+- A provider's own 4xx relayed by the proxy (an OpenAI 400, say) throws
+  `TensorCostProviderError` with the provider's `status`, its `body`, and its
+  message in the error text. It no longer falls back.
+
+A refusal is any 4xx whose body has an upper-case code at `error.code` or a
+top-level `code` (`{"error": {"code": "SOME_CODE", ...}}` or
+`{"code": "SOME_CODE", ...}`), or whose `x-tc-decision` header says
+`action=refuse`. Lower-case codes (OpenAI's `invalid_api_key` and the like)
+are provider errors. On `/v1/admit` every 4xx except a bare 429 or 402
+refuses the call, since nothing there comes from a provider.
+
+The same rule now applies to the govern layer: `/v1/admit` fails open only on
+an outage, and only while `fail_open_enabled` is on. Before, admit failed open
+on everything except a 403, whatever `fail_open_enabled` said.
+
+### Added
+
+**`TensorCostRefusedError`**, the base class of every refusal:
+`TensorCostRunBudgetExceededError`, `TensorCostRunStoppedError`,
+`TensorCostPeriodBudgetExceededError`, `TensorCostModelGovernanceDeniedError`,
+`TensorCostGuardrailHardStopError`, `TensorCostComplianceDeniedError` and
+`TensorCostComplianceTeamMismatchError` all extend it now, and all carry
+`code`, `reason` and `detail` (the refusal object the server sent). Catch
+`TensorCostRefusedError` to handle every refusal, current and future.
+
+**`TensorCostBudgetHardCapError`** for a money budget's hard cap. It extends
+`TensorCostPeriodBudgetExceededError`, so an `except` written against 1.4.0 for
+the shape below still matches. Fields: `budget_id`, `budget_name`, `burn_pct`,
+`scope`, `period`, `cap_cents`, `spent_cents`, `reason`, `budget_code`
+(always `"BUDGET_HARD_CAP"`), `retryable` and `retry_after_seconds`.
+`retryable` is true when the budget's spend hasn't been counted yet
+(`reason: "spend_not_known_yet"` or `retryable: true` on the wire), usually
+for a few seconds after a budget is created or its scope changes, and the
+message then says "the budget's spend hasn't been counted yet; retry in 5 s".
+Otherwise it says "the budget's hard cap is reached". The SDK doesn't retry
+for you. The shapes it accepts, on the chat path and on `/v1/admit`:
+
+```json
+{ "error": { "code": "PERIOD_BUDGET_EXCEEDED", "budget_code": "BUDGET_HARD_CAP",
+             "budget_id": "b-1", "budget_name": "Prod AI", "burn_pct": 1.02,
+             "scope": "budget:b-1", "period": "monthly",
+             "cap_cents": 10000, "spent_cents": 10200, "retryable": false,
+             "message": "..." } }
+
+{ "error": { "code": "PERIOD_BUDGET_EXCEEDED", "budget_code": "BUDGET_HARD_CAP",
+             "reason": "spend_not_known_yet", "retryable": true,
+             "retry_after_seconds": 5, "budget_id": "b-2", ... } }
+  + header  Retry-After: 5
+
+{ "error": { "code": "BUDGET_HARD_CAP", "budget_id": "b1", "burn_pct": 0,
+             "reason": "spend_not_known_yet", "message": "..." } }   (older servers)
+```
+
+`retry_after_seconds` reads the `Retry-After` header (seconds or an HTTP date)
+first, then `retry_after_seconds` or `retry_after` in the body. A
+`PERIOD_BUDGET_EXCEEDED` without `budget_code` is still a plain
+`TensorCostPeriodBudgetExceededError`.
+
+**Observations carry `application` and `tags`.** The values from
+`wrap(application=..., tags=...)` were sent as `x-tc-application` / `x-tc-tags`
+on proxied calls only; observations (observe and govern traffic, and every
+Bedrock and Vertex call) went without them, so spend landed under the
+server's default `sdk:tier2` application and route matchers never saw the
+tags. They are now on every observation when set.
+
+### Fixed
+
+**Govern-layer refusals are typed by their code.** 1.4.0 threw
+`TensorCostModelGovernanceDeniedError` ("request refused at govern layer")
+for every `/v1/admit` refusal except a run stop, budget caps included. Each
+refusal now throws its own class.
+
+**Anthropic clients run in govern mode.** The proxy has no Anthropic Messages
+route yet, so steer/route for an Anthropic client could only fail open around
+TensorCost, and nothing could stop a Claude run. `max_layer="steer"` or
+`"route"` (or `applied_mode=True`) on an Anthropic client now runs as
+`"govern"`: every call is checked with `/v1/admit` before it goes to
+Anthropic, One warning per process
+says so; set `max_layer="govern"` to silence it.
+
+**Token exchange types its outages.** A network error, timeout, 5xx or 429
+from the token exchange is a `TensorCostNetworkError` / `TensorCostTimeoutError`
+/ `TensorCostProxyError` / `TensorCostQuotaError`, so fail-open still applies
+when TensorCost is down. Any other status is a plain error and doesn't.
+
+**Streaming proxy errors.** A 5xx or 429 on the streaming path was reported
+as `TensorCostProviderError`, and a connection failure as a raw `httpx`
+exception; they are `TensorCostProxyError` / `TensorCostQuotaError` /
+`TensorCostNetworkError` / `TensorCostTimeoutError` now.
+
+### Compatibility
+
+- `should_fall_back_to_provider()` returns False for `TensorCostProviderError`
+  and for errors that aren't `TensorCost*` outages (1.4.0 returned True).
+- With fail-open on, a relayed provider 4xx used to be retried directly
+  against the provider, so you saw the provider SDK's own error class (for
+  example `openai.BadRequestError`). You now get `TensorCostProviderError`
+  with the provider's `status` and `body`. With fail-open off you used to get
+  `TensorCostProxyError` for it; same change.
+- A 4xx from TensorCost that isn't an outage (a rejected token, a refusal
+  with an unknown code) now stops the call instead of going around it. If
+  you relied on a bad or revoked key failing open, it doesn't any more.
+- `fail_open_enabled=False` now also fails the call when `/v1/admit` is down.
+- `admit_request()` raises every refusal as its typed error; it used to
+  return `(False, header)` for anything but `RUN_STOPPED`, and the wrappers
+  then raised `TensorCostProviderError`. With `fail_open=False` it raises the
+  typed outage error instead of `httpx.HTTPStatusError`.
+- `TensorCostModelGovernanceDeniedError`, `TensorCostGuardrailHardStopError`,
+  `TensorCostRefusedError` and `TensorCostBudgetHardCapError` are now exported
+  from `tensorcost`.
+- Anthropic clients configured for steer/route make one `/v1/admit` call per
+  request instead of a proxy call.
+
 ## 1.4.0 — 2026-10-25
 
 ### Added

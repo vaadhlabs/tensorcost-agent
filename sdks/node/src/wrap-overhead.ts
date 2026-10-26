@@ -67,4 +67,19 @@ export function postObservation(
   }
 }
 
+/**
+ * `application` / `tags` for an observation, from the wrap config. The
+ * server reads both (ObservationDto); before 1.4.1 they only rode on
+ * proxied calls as x-tc-application / x-tc-tags.
+ */
+export function observationScope(
+  application: string | null | undefined,
+  tags: readonly string[] | undefined,
+): { application?: string; tags?: string[] } {
+  return {
+    ...(application ? { application } : {}),
+    ...(tags && tags.length > 0 ? { tags: [...tags] } : {}),
+  };
+}
+
 export const __test__ = { WrapOverhead };

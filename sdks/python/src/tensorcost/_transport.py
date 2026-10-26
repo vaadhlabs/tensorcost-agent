@@ -27,6 +27,12 @@ from typing import Optional
 
 import httpx
 
+from ._errors import (
+    TensorCostNetworkError,
+    TensorCostProxyError,
+    TensorCostQuotaError,
+    TensorCostTimeoutError,
+)
 from ._version import SDK_VERSION as _USER_AGENT
 
 logger = logging.getLogger("tensorcost")
@@ -37,6 +43,32 @@ _TOKEN_REFRESH_LEEWAY_S = 60.0
 _DEFAULT_TOKEN_LIFETIME_S = 15 * 60.0
 # Max in-flight observations before we start dropping oldest.
 _MAX_QUEUE_DEPTH = 1024
+
+
+
+class TenantIdMissingError(RuntimeError):
+    """No tenant id, so no token: TensorCost is never asked about the call.
+
+    The fail-open predicate lets this one through alongside the outages,
+    because nothing was refused (nothing was asked) and 1.4.0 behaved the
+    same way. What changes is that it is said once, out loud.
+    """
+
+
+_no_tenant_warned = False
+
+
+def _warn_no_tenant_once() -> None:
+    global _no_tenant_warned
+    if _no_tenant_warned:
+        return
+    _no_tenant_warned = True
+    logging.getLogger("tensorcost").warning(
+        "tensorcost: govern/steer/route need a tenant id (tenant_id or "
+        "TENSORCOST_TENANT_ID) for the token exchange, and none is set, so no call "
+        "can be checked: stops, caps and budgets are NOT enforced and calls go "
+        "straight to the provider. Set the tenant id to enforce them."
+    )
 
 
 class ObservationTransport:
@@ -160,21 +192,42 @@ class ObservationTransport:
 
             url = f"{self._base_url}/api/inference-proxy/sdk-token/exchange"
             if not self._tenant_id:
-                raise RuntimeError(
+                _warn_no_tenant_once()
+                raise TenantIdMissingError(
                     "tensorcost: tenant_id required for token exchange "
                     "(pass tenant_id=... to wrap() or set TENSORCOST_TENANT_ID)"
                 )
-            resp = self._client.post(
-                url,
-                json={
-                    "tenant_id": self._tenant_id,
-                    "sdk_long_lived_token": self._api_key,
-                },
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": _USER_AGENT,
-                },
-            )
+            # Outages are typed so the wrappers' fail-open predicate can tell
+            # "TensorCost is down" (network, timeout, 5xx, 429) from
+            # "TensorCost said no" (any other status), which is not a reason
+            # to go around it.
+            try:
+                resp = self._client.post(
+                    url,
+                    json={
+                        "tenant_id": self._tenant_id,
+                        "sdk_long_lived_token": self._api_key,
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": _USER_AGENT,
+                    },
+                )
+            except httpx.TimeoutException as exc:
+                raise TensorCostTimeoutError(
+                    "tensorcost: token-exchange timed out", "total", root_cause=exc
+                ) from exc
+            except (httpx.TransportError, OSError) as exc:
+                raise TensorCostNetworkError(
+                    f"tensorcost: token-exchange network error: {exc}", root_cause=exc
+                ) from exc
+            if resp.status_code >= 500:
+                raise TensorCostProxyError(
+                    f"token-exchange failed status={resp.status_code}",
+                    status=resp.status_code,
+                )
+            if resp.status_code == 429:
+                raise TensorCostQuotaError(f"token-exchange failed status={resp.status_code}")
             resp.raise_for_status()
             body = resp.json()
             token = body.get("token") or body.get("access_token")

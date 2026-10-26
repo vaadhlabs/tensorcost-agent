@@ -1,13 +1,17 @@
 /**
  * Govern-layer admit — metadata-only POST /api/inference-proxy/v1/admit.
  *
- * Fail-open on transport failure: the customer's call proceeds to the
- * provider and an error observation is emitted when transport is available.
+ * Fail-open only on an outage: network error, timeout, 5xx, or a 429 / 402
+ * with no refusal body. The customer's call then proceeds to the provider and
+ * an `admit_unavailable` observation is emitted when transport is set.
  *
- * A 403 is a refusal, never a transport failure. When its body says
- * RUN_STOPPED the result carries a TensorCostRunStoppedError, so the
- * provider wrapper can throw it with the who / when / why intact instead of
- * a generic governance denial.
+ * Every other non-2xx is an answer, and the result carries it as
+ * `refusal`, a TensorCostRefusedError subclass the wrapper throws as is:
+ * RUN_STOPPED with its who / when / why, BUDGET_HARD_CAP as the budget
+ * error, a code this SDK doesn't know as a plain TensorCostRefusedError.
+ * /admit only answers 403 when a gate refused, so a 403 with no readable
+ * code is still a refusal. A 401/400/404 means admission could not be
+ * checked for this call; that is not an outage either, so it refuses too.
  */
 
 import type { ControlLayer } from "./layer.js";
@@ -15,7 +19,16 @@ import type { Operation, Provider } from "./types.js";
 import type { ObservationTransport } from "./transport.js";
 import { ADMIT_PATH, ADMIT_TIMEOUT_MS } from "./layer.js";
 import { SDK_VERSION, sdkCapabilityHeader } from "./version.js";
-import { TensorCostRunStoppedError, type TensorCostError } from "./errors.js";
+import {
+  TensorCostNetworkError,
+  TensorCostProxyError,
+  TensorCostQuotaError,
+  TensorCostRefusedError,
+  TensorCostTimeoutError,
+} from "./errors.js";
+import { retryAfterMs } from "./retry.js";
+import { decisionSaysRefuse, parseRefusalBody, refusalError } from "./refusal.js";
+import { observationScope } from "./wrap-overhead.js";
 
 export interface AdmitMetadata {
   provider: Provider;
@@ -47,8 +60,8 @@ export interface AdmitRequestOptions {
 export interface AdmitResult {
   allowed: boolean;
   decisionHeader: string | null;
-  /** The specific refusal, when a 403 body names one the SDK models. */
-  refusal?: TensorCostError;
+  /** Set whenever `allowed` is false: the refusal, typed by its code. */
+  refusal?: TensorCostRefusedError;
 }
 
 export async function admitRequest(
@@ -89,22 +102,46 @@ export async function admitRequest(
   );
 
   try {
-    const resp = await fetchImpl(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    let resp: Response;
+    try {
+      resp = await fetchImpl(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      const e = err as Error;
+      throw e?.name === "AbortError" || e?.name === "TimeoutError"
+        ? new TensorCostTimeoutError(
+            `tensorcost: admit timed out after ${opts.timeoutMs ?? ADMIT_TIMEOUT_MS}ms`,
+            "total",
+            { cause: e },
+          )
+        : new TensorCostNetworkError(
+            `tensorcost: network error reaching admit: ${e?.message ?? String(err)}`,
+            { cause: e },
+          );
+    }
 
     const decisionHeader = resp.headers.get("x-tc-decision");
+    const requestId = resp.headers.get("x-tc-request-id");
 
-    if (resp.status === 403) {
-      const refusal = await refusalFrom403(resp);
-      return { allowed: false, decisionHeader, ...(refusal ? { refusal } : {}) };
+    if (resp.status >= 400 && resp.status < 500) {
+      const refusal = await refusalFrom4xx(resp, decisionHeader);
+      if (refusal) return { allowed: false, decisionHeader, refusal };
+      // Only a bare 429 or 402 gets here.
+      throw new TensorCostQuotaError(`admit POST failed status=${resp.status}`, retryAfterMs(resp) ?? null, {
+        status: resp.status,
+        requestId,
+      });
     }
 
     if (!resp.ok) {
-      throw new Error(`admit POST failed status=${resp.status}`);
+      throw new TensorCostProxyError(`admit POST failed status=${resp.status}`, {
+        status: resp.status,
+        requestId,
+      });
     }
 
     return { allowed: true, decisionHeader };
@@ -119,24 +156,47 @@ export async function admitRequest(
   }
 }
 
-/** The modelled refusal in a 403 body, or undefined for any other 403. */
-async function refusalFrom403(resp: Response): Promise<TensorCostError | undefined> {
-  let detail: Record<string, unknown> | undefined;
-  try {
-    const parsed = (await resp.json()) as Record<string, unknown>;
-    const errObj = parsed?.["error"];
-    detail = errObj && typeof errObj === "object" ? (errObj as Record<string, unknown>) : undefined;
-  } catch {
+/**
+ * The refusal in a 4xx from /admit, or undefined for the one 4xx that is
+ * an outage: a 429 (the tenant throttler) or 402 (plan ceiling) with no
+ * refusal body.
+ */
+async function refusalFrom4xx(
+  resp: Response,
+  decisionHeader: string | null,
+): Promise<TensorCostRefusedError | undefined> {
+  const text = await resp.text().catch(() => "");
+  const parsed = parseRefusalBody(text);
+  if (
+    parsed === null &&
+    (resp.status === 429 || resp.status === 402) &&
+    !decisionSaysRefuse(decisionHeader)
+  ) {
     return undefined;
   }
-  if (detail?.["code"] === "RUN_STOPPED") {
-    return TensorCostRunStoppedError.fromProxyBody(detail, {
-      status: 403,
-      requestId: resp.headers.get("x-tc-request-id"),
-      attempt: 1,
-    });
+  const ctx = {
+    status: resp.status,
+    requestId: resp.headers.get("x-tc-request-id"),
+    attempt: 1,
+    retryAfterHeader: resp.headers.get("retry-after"),
+  };
+  if (parsed !== null || resp.status === 403) {
+    return refusalError(parsed, ctx);
   }
-  return undefined;
+  let message: string | null = null;
+  try {
+    const body = JSON.parse(text) as Record<string, unknown>;
+    message = typeof body?.["message"] === "string" ? body["message"] : null;
+  } catch {
+    /* not JSON */
+  }
+  return new TensorCostRefusedError(
+    `tensorcost: admission check returned ${resp.status}` +
+      (message ? ` (${message})` : "") +
+      "; the call was not sent",
+    { code: null },
+    { status: resp.status, requestId: ctx.requestId, attempt: 1 },
+  );
 }
 
 function postAdmitFailureObservation(
@@ -160,6 +220,7 @@ function postAdmitFailureObservation(
       correlation_id: opts.metadata.correlation_id,
       ...(opts.metadata.environment ? { environment: opts.metadata.environment } : {}),
       ...(opts.metadata.connection_id ? { connection_id: opts.metadata.connection_id } : {}),
+      ...observationScope(opts.metadata.application, opts.metadata.tags),
       metadata: {
         decision_action: "allow",
         decision_reason: "admit_unavailable",

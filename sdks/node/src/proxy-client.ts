@@ -26,6 +26,19 @@
  *   - Respects Retry-After on 429.
  *   - Stops at maxAttempts.
  *   - Does not retry on 4xx (except 429).
+ *   - Never retries a TensorCost refusal, whatever its status.
+ *
+ * How a non-2xx response is classified (unchanged split from 1.4.0, plus
+ * the refusal check in front of it):
+ *   - 4xx whose body carries a TensorCost refusal code, or whose
+ *     x-tc-decision says action=refuse → a TensorCostRefusedError
+ *     subclass. Terminal. Not a circuit failure.
+ *   - 429 otherwise → TensorCostQuotaError (TensorCost's rate limit).
+ *   - 402 otherwise → TensorCostQuotaError, status 402 (the plan's monthly
+ *     proxy-request ceiling). Not retried.
+ *   - 5xx → TensorCostProxyError (proxy or upstream unavailable).
+ *   - any other 4xx → TensorCostProviderError: the provider's own error,
+ *     relayed verbatim by the proxy.
  *
  * Circuit breaker:
  *   - Maintained on the CircuitBreaker instance passed in.
@@ -41,14 +54,14 @@ import {
   TensorCostProxyError,
   TensorCostQuotaError,
   TensorCostProviderError,
-  TensorCostRunBudgetExceededError,
-  TensorCostRunStoppedError,
-  TensorCostPeriodBudgetExceededError,
-  TensorCostModelGovernanceDeniedError,
-  TensorCostGuardrailHardStopError,
-  TensorCostComplianceDeniedError,
-  TensorCostComplianceTeamMismatchError,
 } from "./errors.js";
+import { TenantIdMissingError } from "./transport.js";
+import {
+  decisionSaysRefuse,
+  parseRefusalBody,
+  providerMessageFrom,
+  refusalError,
+} from "./refusal.js";
 import {
   DEFAULT_RETRY_CONFIG,
   computeDelay,
@@ -388,6 +401,59 @@ export async function proxyRequest(
       };
     }
 
+    // 4xx — read the body once. A TensorCost refusal is terminal whatever
+    // its status (a 429 refusal included), so it is checked before the
+    // quota arm and is never retried or counted against the circuit: the
+    // proxy is healthy and answered. Counting it would eventually trip the
+    // breaker and route the customer straight past their own cap.
+    let errorBody: unknown = null;
+    if (resp.status >= 400 && resp.status < 500) {
+      errorBody = await readErrorBody(resp, bodyDeadline);
+      const refusal = parseRefusalBody(errorBody);
+      if (refusal !== null || decisionSaysRefuse(resp.headers.get("x-tc-decision"))) {
+        const tcErr = refusalError(refusal, {
+          status: resp.status,
+          requestId,
+          attempt: attempt + 1,
+          retryAfterHeader: resp.headers.get("retry-after"),
+        });
+        emitEvent(opts.onLifecycleEvent, {
+          kind: "on_error",
+          provider: opts.provider,
+          model: opts.model,
+          operation: opts.operation,
+          attemptNumber: attempt + 1,
+          elapsedMs: Date.now() - callStart,
+          errorClass: tcErr.constructor.name,
+          status: resp.status,
+        });
+        throw tcErr;
+      }
+    }
+
+    // 402 without a refusal body — the plan's monthly proxy-request ceiling
+    // (Scale COGS gate). TensorCost declining to carry the call is not a
+    // refusal of the call, and the server means for it to go direct, so it
+    // is an outage for fail-open purposes. Not retried: it won't clear soon.
+    if (resp.status === 402) {
+      const tcErr = new TensorCostQuotaError(
+        "tensorcost: proxy returned 402 (plan request ceiling reached)",
+        retryAfterMs(resp) ?? null,
+        { status: 402, requestId, attempt: attempt + 1 },
+      );
+      emitEvent(opts.onLifecycleEvent, {
+        kind: "on_error",
+        provider: opts.provider,
+        model: opts.model,
+        operation: opts.operation,
+        attemptNumber: attempt + 1,
+        elapsedMs: Date.now() - callStart,
+        errorClass: tcErr.constructor.name,
+        status: 402,
+      });
+      throw tcErr;
+    }
+
     // 429 — quota error, may have Retry-After.
     if (resp.status === 429) {
       const raMs = retryAfterMs(resp);
@@ -468,181 +534,14 @@ export async function proxyRequest(
       throw tcErr;
     }
 
-    // 403 with our own budget code — the run hit its spend cap.
-    //
-    // Checked before the generic 4xx arm because it is NOT a provider
-    // error and, critically, must not lead to the direct-provider
-    // fallback. The body is read defensively: a 403 that is not ours
-    // (e.g. an auth failure) falls through to the generic arm below.
-    if (resp.status === 403) {
-      let code: string | undefined;
-      let detail: Record<string, unknown> | undefined;
-      try {
-        const parsed = (await resp.clone().json()) as Record<string, unknown>;
-        const errObj = parsed?.["error"] as Record<string, unknown> | undefined;
-        if (errObj && typeof errObj["code"] === "string") {
-          code = errObj["code"];
-          detail = errObj;
-        }
-      } catch {
-        /* non-JSON 403 — fall through to the generic 4xx arm */
-      }
-
-      if (code === "RUN_BUDGET_EXCEEDED" || code === "PERIOD_BUDGET_EXCEEDED") {
-        const numOrNull = (v: unknown): number | null =>
-          typeof v === "number" ? v : null;
-        const payload = detail;
-        const tcErr =
-          code === "PERIOD_BUDGET_EXCEEDED"
-            ? new TensorCostPeriodBudgetExceededError(
-                typeof payload?.["message"] === "string"
-                  ? `tensorcost: ${payload["message"]}`
-                  : "tensorcost: agent period spend cap reached",
-                typeof payload?.["scope"] === "string" ? payload["scope"] : null,
-                typeof payload?.["period"] === "string" ? payload["period"] : null,
-                numOrNull(payload?.["cap_cents"]),
-                numOrNull(payload?.["spent_cents"]),
-                { status: 403, requestId, attempt: attempt + 1 },
-              )
-            : new TensorCostRunBudgetExceededError(
-                typeof payload?.["message"] === "string"
-                  ? `tensorcost: ${payload["message"]}`
-                  : "tensorcost: agent run spend cap reached",
-                typeof payload?.["workflow_id"] === "string"
-                  ? payload["workflow_id"]
-                  : null,
-                numOrNull(payload?.["cap_cents"]),
-                numOrNull(payload?.["spent_cents"]),
-                { status: 403, requestId, attempt: attempt + 1 },
-              );
-        // Not a circuit failure — the proxy is healthy and answered
-        // correctly. Counting this would eventually trip the breaker and
-        // route the customer straight past their own cap.
-        emitEvent(opts.onLifecycleEvent, {
-          kind: "on_error",
-          provider: opts.provider,
-          model: opts.model,
-          operation: opts.operation,
-          attemptNumber: attempt + 1,
-          elapsedMs: Date.now() - callStart,
-          errorClass: tcErr.constructor.name,
-          status: 403,
-        });
-        throw tcErr;
-      }
-
-      if (code === "RUN_STOPPED") {
-        const tcErr = runStoppedError(detail, {
-          status: 403,
-          requestId,
-          attempt: attempt + 1,
-        });
-        // Healthy proxy, correct answer — not a circuit failure.
-        emitEvent(opts.onLifecycleEvent, {
-          kind: "on_error",
-          provider: opts.provider,
-          model: opts.model,
-          operation: opts.operation,
-          attemptNumber: attempt + 1,
-          elapsedMs: Date.now() - callStart,
-          errorClass: tcErr.constructor.name,
-          status: 403,
-        });
-        throw tcErr;
-      }
-
-      if (code === "MODEL_GOVERNANCE_DENIED") {
-        const tcErr = new TensorCostModelGovernanceDeniedError(
-          typeof detail?.["message"] === "string"
-            ? `tensorcost: ${detail["message"]}`
-            : "tensorcost: model denied by tenant governance",
-          typeof detail?.["provider"] === "string" ? detail["provider"] : null,
-          typeof detail?.["model"] === "string" ? detail["model"] : null,
-          typeof detail?.["governance_status"] === "string"
-            ? detail["governance_status"]
-            : null,
-          { status: 403, requestId, attempt: attempt + 1 },
-        );
-        emitEvent(opts.onLifecycleEvent, {
-          kind: "on_error",
-          provider: opts.provider,
-          model: opts.model,
-          operation: opts.operation,
-          attemptNumber: attempt + 1,
-          elapsedMs: Date.now() - callStart,
-          errorClass: tcErr.constructor.name,
-          status: 403,
-        });
-        throw tcErr;
-      }
-
-      if (code === "GUARDRAIL_HARD_STOP") {
-        const tcErr = new TensorCostGuardrailHardStopError(
-          typeof detail?.["message"] === "string"
-            ? `tensorcost: ${detail["message"]}`
-            : "tensorcost: request blocked by hard_stop guardrail",
-          typeof detail?.["policy_id"] === "string" ? detail["policy_id"] : null,
-          { status: 403, requestId, attempt: attempt + 1 },
-        );
-        emitEvent(opts.onLifecycleEvent, {
-          kind: "on_error",
-          provider: opts.provider,
-          model: opts.model,
-          operation: opts.operation,
-          attemptNumber: attempt + 1,
-          elapsedMs: Date.now() - callStart,
-          errorClass: tcErr.constructor.name,
-          status: 403,
-        });
-        throw tcErr;
-      }
-
-      if (code === "COMPLIANCE_DENIED") {
-        const tcErr = new TensorCostComplianceDeniedError(
-          typeof detail?.["message"] === "string"
-            ? `tensorcost: ${detail["message"]}`
-            : "tensorcost: request refused by compliance policy",
-          code,
-          { status: 403, requestId, attempt: attempt + 1 },
-        );
-        emitEvent(opts.onLifecycleEvent, {
-          kind: "on_error",
-          provider: opts.provider,
-          model: opts.model,
-          operation: opts.operation,
-          attemptNumber: attempt + 1,
-          elapsedMs: Date.now() - callStart,
-          errorClass: tcErr.constructor.name,
-          status: 403,
-        });
-        throw tcErr;
-      }
-
-      if (code === "COMPLIANCE_TEAM_MISMATCH") {
-        const tcErr = new TensorCostComplianceTeamMismatchError(
-          typeof detail?.["message"] === "string"
-            ? `tensorcost: ${detail["message"]}`
-            : "tensorcost: SDK team scope does not match token binding",
-          { status: 403, requestId, attempt: attempt + 1 },
-        );
-        emitEvent(opts.onLifecycleEvent, {
-          kind: "on_error",
-          provider: opts.provider,
-          model: opts.model,
-          operation: opts.operation,
-          attemptNumber: attempt + 1,
-          elapsedMs: Date.now() - callStart,
-          errorClass: tcErr.constructor.name,
-          status: 403,
-        });
-        throw tcErr;
-      }
-    }
-
-    // 4xx (not 429) — provider error forwarded by the proxy. Non-retriable.
+    // Any other status — the provider's own error, relayed by the proxy.
+    // Non-retriable, and never a fallback: the provider would answer the
+    // same way again.
+    const providerMsg = providerMessageFrom(errorBody);
     const tcErr = new TensorCostProviderError(
-      `tensorcost: upstream provider returned ${resp.status}`,
-      { status: resp.status, requestId, attempt: attempt + 1 },
+      `tensorcost: upstream provider returned ${resp.status}` +
+        (providerMsg !== null ? `: ${providerMsg}` : ""),
+      { status: resp.status, requestId, attempt: attempt + 1, body: errorBody },
     );
     emitEvent(opts.onLifecycleEvent, {
       kind: "on_error",
@@ -661,36 +560,64 @@ export async function proxyRequest(
   throw lastError ?? new TensorCostProxyError("tensorcost: max attempts reached");
 }
 
-/** Build the terminal error for a `RUN_STOPPED` 403 from the proxy's body. */
-function runStoppedError(
-  detail: Record<string, unknown> | undefined,
-  opts: { status: number; requestId: string | null; attempt: number },
-): TensorCostRunStoppedError {
-  return TensorCostRunStoppedError.fromProxyBody(detail, opts);
+/**
+ * Read a non-2xx body as JSON when it is JSON, else as text, inside the
+ * call's body deadline. Error bodies are small; this only guards against a
+ * proxy that sends headers and then stalls.
+ */
+async function readErrorBody(resp: Response, deadlineMs: number): Promise<unknown> {
+  const remaining = Math.max(1, deadlineMs - Date.now());
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const text = await Promise.race([
+    resp.text().catch(() => ""),
+    new Promise<string>((resolve) => {
+      timer = setTimeout(() => {
+        void resp.body?.cancel().catch(() => undefined);
+        resolve("");
+      }, remaining);
+    }),
+  ]).finally(() => clearTimeout(timer));
+  if (text === "") return null;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
 }
 
 /**
  * Should a failed proxy attempt fall back to calling the provider
  * directly?
  *
- * The applied-mode fail-open contract exists so that TensorCost being
- * down never takes the customer's inference down with it. Every transport
- * failure — timeout, network error, 5xx, open circuit — is therefore a
- * "go around us" signal and returns true.
+ * Only when TensorCost itself is unavailable. Fail-open exists so that
+ * TensorCost being down never takes the customer's inference down with
+ * it, so the answer is yes for exactly these, and no for everything else:
  *
- * A policy refusal (run budget, model governance, guardrail hard_stop) is
- * when the proxy is healthy and the refusal IS the product. Falling back
- * would issue the provider call anyway and turn enforcement into a log line.
+ *   - TensorCostNetworkError   couldn't connect, DNS, connection refused
+ *   - TensorCostTimeoutError   no headers, or no body inside the budget
+ *   - TensorCostProxyError     5xx from the proxy, or the circuit is open
+ *   - TensorCostQuotaError     429 (rate limit) or 402 (plan ceiling) from
+ *                              the proxy, with no refusal body
+ *
+ * plus one case where TensorCost was never asked at all: no tenant id, so
+ * no token (TenantIdMissingError, which warns once). That can't be a
+ * skipped refusal, and 1.4.0 behaved the same way.
+ *
+ * This is an allow-list on purpose. 1.4.0 had the inverse, a list of
+ * refusal classes that must NOT fall back, and every refusal code missing
+ * from it fell back by default. That is how a money budget's hard cap
+ * (BUDGET_HARD_CAP) got routed around. Now a refusal this SDK has never
+ * heard of is terminal, a relayed provider 4xx surfaces as itself, and an
+ * error the SDK didn't classify at all is surfaced rather than retried
+ * against the provider.
  */
 export function shouldFallBackToProvider(err: unknown): boolean {
-  return !(
-    err instanceof TensorCostRunBudgetExceededError ||
-    err instanceof TensorCostRunStoppedError ||
-    err instanceof TensorCostPeriodBudgetExceededError ||
-    err instanceof TensorCostModelGovernanceDeniedError ||
-    err instanceof TensorCostGuardrailHardStopError ||
-    err instanceof TensorCostComplianceDeniedError ||
-    err instanceof TensorCostComplianceTeamMismatchError
+  return (
+    err instanceof TensorCostNetworkError ||
+    err instanceof TensorCostTimeoutError ||
+    err instanceof TensorCostProxyError ||
+    err instanceof TensorCostQuotaError ||
+    err instanceof TenantIdMissingError
   );
 }
 
@@ -883,92 +810,72 @@ export async function proxyRequestStream(
       };
     }
 
-    if (resp.status === 429 && attempt + 1 < retryConfig.maxAttempts) {
-      await sleep(computeDelay(attempt, retryConfig, retryAfterMs(resp)));
-      continue;
-    }
-    if (resp.status >= 500 && attempt + 1 < retryConfig.maxAttempts) {
-      opts.circuit.recordFailure();
-      await sleep(computeDelay(attempt, retryConfig));
-      continue;
+    // Same classification as proxyRequest: refusal first (terminal, never
+    // retried), then 429 / 5xx (outages, retried), then the provider's
+    // own relayed error.
+    let errorBody: unknown = null;
+    if (resp.status >= 400 && resp.status < 500) {
+      errorBody = await readErrorBody(resp, callStart + timeoutMs);
+      const refusal = parseRefusalBody(errorBody);
+      if (refusal !== null || decisionSaysRefuse(resp.headers.get("x-tc-decision"))) {
+        const tcErr = refusalError(refusal, {
+          status: resp.status,
+          requestId,
+          attempt: attempt + 1,
+          retryAfterHeader: resp.headers.get("retry-after"),
+        });
+        emitEvent(opts.onLifecycleEvent, {
+          kind: "on_error",
+          provider: opts.provider,
+          model: opts.model,
+          operation: opts.operation,
+          attemptNumber: attempt + 1,
+          elapsedMs: Date.now() - callStart,
+          errorClass: tcErr.constructor.name,
+          status: resp.status,
+        });
+        throw tcErr;
+      }
     }
 
-    // Policy refusals and 4xx — reuse proxyRequest error mapping via body read.
-    const errBody = await resp.text().catch(() => "");
-    let detail: Record<string, unknown> | undefined;
-    try {
-      const parsed = JSON.parse(errBody) as Record<string, unknown>;
-      const errObj = parsed?.["error"] as Record<string, unknown> | undefined;
-      detail =
-        errObj && typeof errObj["code"] === "string" ? errObj : undefined;
-    } catch {
-      detail = undefined;
+    if (resp.status === 402) {
+      throw new TensorCostQuotaError(
+        "tensorcost: proxy returned 402 (plan request ceiling reached)",
+        retryAfterMs(resp) ?? null,
+        { status: 402, requestId, attempt: attempt + 1 },
+      );
     }
-    const code = typeof detail?.["code"] === "string" ? detail["code"] : null;
-    if (code === "RUN_BUDGET_EXCEEDED" || code === "PERIOD_BUDGET_EXCEEDED") {
-      const numOrNull = (v: unknown): number | null =>
-        typeof v === "number" ? v : null;
-      if (code === "PERIOD_BUDGET_EXCEEDED") {
-        throw new TensorCostPeriodBudgetExceededError(
-          typeof detail?.["message"] === "string"
-            ? `tensorcost: ${detail["message"]}`
-            : "tensorcost: period budget exceeded",
-          typeof detail?.["scope"] === "string" ? detail["scope"] : null,
-          typeof detail?.["period"] === "string" ? detail["period"] : null,
-          numOrNull(detail?.["cap_cents"]),
-          numOrNull(detail?.["spent_cents"]),
-          { status: 403, requestId, attempt: attempt + 1 },
-        );
+    if (resp.status === 429) {
+      const raMs = retryAfterMs(resp);
+      if (attempt + 1 < retryConfig.maxAttempts) {
+        await sleep(computeDelay(attempt, retryConfig, raMs));
+        continue;
       }
-      throw new TensorCostRunBudgetExceededError(
-        typeof detail?.["message"] === "string"
-          ? `tensorcost: ${detail["message"]}`
-          : "tensorcost: run budget exceeded",
-        typeof detail?.["workflow_id"] === "string" ? detail["workflow_id"] : null,
-        numOrNull(detail?.["cap_cents"]),
-        numOrNull(detail?.["spent_cents"]),
-        { status: 403, requestId, attempt: attempt + 1 },
+      throw new TensorCostQuotaError(
+        "tensorcost: proxy returned 429 Too Many Requests",
+        raMs ?? null,
+        { status: 429, requestId, attempt: attempt + 1 },
       );
     }
-    if (code === "RUN_STOPPED") {
-      throw runStoppedError(detail, { status: 403, requestId, attempt: attempt + 1 });
+    if (resp.status >= 500) {
+      opts.circuit.recordFailure();
+      void resp.body?.cancel().catch(() => undefined);
+      if (attempt + 1 < retryConfig.maxAttempts) {
+        await sleep(computeDelay(attempt, retryConfig));
+        continue;
+      }
+      throw new TensorCostProxyError(`tensorcost: proxy returned ${resp.status}`, {
+        status: resp.status,
+        requestId,
+        attempt: attempt + 1,
+      });
     }
-    if (code === "MODEL_GOVERNANCE_DENIED") {
-      throw new TensorCostModelGovernanceDeniedError(
-        "tensorcost: model denied by tenant governance",
-        null,
-        null,
-        null,
-        { status: 403, requestId, attempt: attempt + 1 },
-      );
-    }
-    if (code === "GUARDRAIL_HARD_STOP") {
-      throw new TensorCostGuardrailHardStopError(
-        "tensorcost: request blocked by hard_stop guardrail",
-        null,
-        { status: 403, requestId, attempt: attempt + 1 },
-      );
-    }
-    if (code === "COMPLIANCE_DENIED") {
-      throw new TensorCostComplianceDeniedError(
-        typeof detail?.["message"] === "string"
-          ? `tensorcost: ${detail["message"]}`
-          : "tensorcost: request refused by compliance policy",
-        code,
-        { status: 403, requestId, attempt: attempt + 1 },
-      );
-    }
-    if (code === "COMPLIANCE_TEAM_MISMATCH") {
-      throw new TensorCostComplianceTeamMismatchError(
-        typeof detail?.["message"] === "string"
-          ? `tensorcost: ${detail["message"]}`
-          : "tensorcost: SDK team scope does not match token binding",
-        { status: 403, requestId, attempt: attempt + 1 },
-      );
-    }
+
+    const providerMsg = providerMessageFrom(errorBody);
     throw new TensorCostProviderError(
-      `tensorcost: upstream provider returned ${resp.status}`,
-      { status: resp.status, requestId, attempt: attempt + 1 },
+      `tensorcost: upstream provider returned ${resp.status}` +
+        (providerMsg !== null ? `: ${providerMsg}` : ""),
+      { status: resp.status, requestId, attempt: attempt + 1, body: errorBody },
     );
   }
 

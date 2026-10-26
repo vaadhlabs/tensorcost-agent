@@ -34,7 +34,7 @@ def test_invoke_model_anthropic_shape_observation(bedrock_client, recording_tran
     assert obs["input_tokens"] == 15
     assert obs["output_tokens"] == 30
     assert "tenant_id" not in obs
-    assert obs["sdk_version"] == "tensorcost-python/1.4.0"
+    assert obs["sdk_version"] == "tensorcost-python/1.4.1"
     assert obs["correlation_id"]
     assert "connection_id" not in obs
 

@@ -26,8 +26,8 @@ from .._dlp import extract_anthropic_messages_text
 from .._errors import (
     TensorCostComplianceDeniedError,
     TensorCostComplianceTeamMismatchError,
-    TensorCostProviderError,
     TensorCostProxyError,
+    TensorCostRefusedError,
 )
 from .._attribution import resolve_scope_field
 from .._applied_mode import (
@@ -86,6 +86,8 @@ def _post_obs(
     feature: str | None = None,
     agent_id: str | None = None,
     workflow_id: str | None = None,
+    application: Optional[str] = None,
+    tags: Optional[list] = None,
 ) -> None:
     obs: dict = {
         "sdk_version": _SDK_VERSION,
@@ -108,6 +110,11 @@ def _post_obs(
         **({"feature": feature} if feature is not None else {}),
         **({"agent_id": agent_id} if agent_id is not None else {}),
         **({"workflow_id": workflow_id} if workflow_id is not None else {}),
+        # Routing-policy scope from wrap(application=, tags=). The server reads
+        # both off the observation (ObservationDto); before 1.4.1 they only rode
+        # on proxied calls as x-tc-application / x-tc-tags.
+        **({"application": application} if application else {}),
+        **({"tags": list(tags)} if tags else {}),
     }
     try:
         transport.post(obs)
@@ -173,9 +180,15 @@ def _wrap_method(
             pass
 
         if effective_layer == "govern":
+            from .._proxy_client import should_fall_back_to_provider
+
             try:
                 bearer_token = transport.get_token()
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                # Same rule as the proxy path: go around TensorCost only when
+                # it is unavailable, and only with fail_open_enabled.
+                if not (fail_open_enabled and should_fall_back_to_provider(exc)):
+                    raise
                 bearer_token = None
             if bearer_token is None:
                 allowed, decision_header = True, None
@@ -200,10 +213,12 @@ def _wrap_method(
                         **({"team_id": team_id} if team_id else {}),
                     },
                     transport=transport,
-                    fail_open=True,
+                    fail_open=fail_open_enabled,
                 )
             if not allowed:
-                raise TensorCostProviderError(
+                # admit_request raises every refusal typed by its code; this
+                # is only a guard. It used to be a TensorCostProviderError.
+                raise TensorCostRefusedError(
                     "tensorcost: request refused at govern layer",
                     status=403,
                     attempt=1,
@@ -315,6 +330,7 @@ def _wrap_method(
                         "error", f"{type(tc_err).__name__}: {tc_err}",
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                        application=application, tags=tags,
                     )
                     raise tc_err
 
@@ -339,6 +355,7 @@ def _wrap_method(
                         output_tokens, "success", None,
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                        application=application, tags=tags,
                     )
                     return direct_response
                 except Exception as exc:
@@ -348,6 +365,7 @@ def _wrap_method(
                         "error", f"{type(exc).__name__}: {exc}",
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                        application=application, tags=tags,
                     )
                     raise
 
@@ -362,6 +380,7 @@ def _wrap_method(
                 output_tokens, "success", None,
                 customer=eff_customer, feature=eff_feature,
                 agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                application=application, tags=tags,
             )
             return proxy_result
 
@@ -375,6 +394,7 @@ def _wrap_method(
                 "error", f"{type(exc).__name__}: {exc}",
                 customer=eff_customer, feature=eff_feature,
                 agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                application=application, tags=tags,
             )
             raise
 
@@ -385,11 +405,46 @@ def _wrap_method(
             output_tokens, "success", None,
             customer=eff_customer, feature=eff_feature,
             agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+            application=application, tags=tags,
         )
         return response
 
     setattr(wrapper, "__tensorcost_wrapped__", True)
     return wrapper
+
+
+_pin_warned = False
+
+
+def anthropic_layer(requested: ControlLayer) -> ControlLayer:
+    """The layer an Anthropic client actually runs at.
+
+    The proxy has no Anthropic Messages route yet, so steer/route can't put
+    the proxy in the request path for Claude. Before 1.4.1 that proxy call
+    failed and fail-open sent the call straight to Anthropic, which meant
+    nothing could stop a Claude run. Govern runs the pre-call /admit check
+    instead, so stops, caps and budgets still apply. One warning per process
+    says so.
+    """
+    global _pin_warned
+    if not needs_proxy_url(requested):
+        return requested
+    if not _pin_warned:
+        _pin_warned = True
+        _log.warning(
+            "tensorcost: max_layer '%s' isn't available for Anthropic clients yet "
+            "(the TensorCost proxy has no Anthropic Messages route), so this client "
+            "runs in 'govern': every call is checked with /admit before it goes to "
+            "Anthropic, which is what lets a run be stopped or capped. Set "
+            "max_layer='govern' to silence this warning.",
+            requested,
+        )
+    return "govern"
+
+
+def _reset_pin_warning() -> None:
+    global _pin_warned
+    _pin_warned = False
 
 
 def install(
@@ -418,7 +473,9 @@ def install(
     team_id: Optional[str] = None,
 ) -> None:
     """Monkey-patch ``client.messages.create`` in place."""
-    code_layer = code_layer_for_install(max_layer, applied_mode)
+    code_layer = anthropic_layer(code_layer_for_install(max_layer, applied_mode))
+    if code_layer != max_layer:
+        applied_mode = False
     messages = getattr(client, "messages", None)
     if messages is None or not callable(getattr(messages, "create", None)):
         return

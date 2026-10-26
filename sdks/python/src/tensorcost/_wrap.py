@@ -16,7 +16,6 @@ from ._telemetry import LifecycleEventCallback
 
 T = TypeVar("T")
 
-
 def _steer_route_error(provider: str, max_layer: str) -> MissingConfigError:
     return MissingConfigError(
         f"TensorCost max_layer '{max_layer}' is not supported for {provider} clients. "
@@ -93,6 +92,13 @@ def wrap(
 
     circuit = CircuitBreaker()
 
+    # Anthropic runs at govern at most until the proxy has a Messages route
+    # (warns once; see _anthropic.anthropic_layer).
+    call_layer: ControlLayer = (
+        _anthropic.anthropic_layer(config.max_layer)
+        if provider == "anthropic"
+        else config.max_layer
+    )
     common = dict(
         transport=transport,
         tenant_id=config.tenant_id,
@@ -100,7 +106,7 @@ def wrap(
         connection_id=config.connection_id,
         application=config.application,
         tags=list(config.tags),
-        max_layer=config.max_layer,
+        max_layer=call_layer,
         base_url=config.base_url,
         sdk_layer=sdk_layer,
         proxy_url=config.proxy_url,
@@ -135,6 +141,8 @@ def wrap(
             feature=config.feature,
             agent_id=config.agent_id,
             workflow_id=config.workflow_id,
+            application=config.application,
+            tags=list(config.tags),
         )
     elif provider == "vertex":
         _vertex.install(
@@ -148,6 +156,8 @@ def wrap(
             feature=config.feature,
             agent_id=config.agent_id,
             workflow_id=config.workflow_id,
+            application=config.application,
+            tags=list(config.tags),
         )
 
     setattr(client, "_tensorcost_transport", transport)

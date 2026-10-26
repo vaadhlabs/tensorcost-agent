@@ -26,6 +26,10 @@ import {
   TensorCostGuardrailHardStopError,
   TensorCostProviderError,
   TensorCostProxyError,
+  TensorCostNetworkError,
+  TensorCostTimeoutError,
+  TensorCostQuotaError,
+  TensorCostRefusedError,
 } from "../errors.js";
 import { CircuitBreaker } from "../circuit.js";
 
@@ -125,23 +129,30 @@ describe("run-budget refusal is terminal in the SDK", () => {
     ).toBe(false);
   });
 
-  it("still permits the fallback for genuine proxy failures", () => {
-    // The fail-open contract must survive intact for everything that is
-    // actually TensorCost being unhealthy.
+  it("permits the fallback only for genuine TensorCost outages (1.4.1 allow-list)", () => {
+    // The fail-open contract survives intact for everything that is
+    // actually TensorCost being unhealthy...
     expect(shouldFallBackToProvider(new TensorCostProxyError("proxy 503"))).toBe(true);
-    expect(shouldFallBackToProvider(new TensorCostProviderError("provider 400"))).toBe(true);
-    expect(shouldFallBackToProvider(new Error("socket hang up"))).toBe(true);
+    expect(shouldFallBackToProvider(new TensorCostNetworkError("ECONNREFUSED"))).toBe(true);
+    expect(shouldFallBackToProvider(new TensorCostTimeoutError("slow", "headers"))).toBe(true);
+    expect(shouldFallBackToProvider(new TensorCostQuotaError("429", null))).toBe(true);
+    // ...and nothing else. 1.4.0 returned true for these two.
+    expect(shouldFallBackToProvider(new TensorCostProviderError("provider 400"))).toBe(false);
+    expect(shouldFallBackToProvider(new Error("socket hang up"))).toBe(false);
   });
 
-  it("treats an unrelated 403 as a provider error, not a budget refusal", async () => {
-    // An auth 403 from the proxy is a real failure and must keep its
-    // existing fail-open behaviour.
+  it("treats an unknown uppercase 403 code as a terminal refusal, not a provider error", async () => {
+    // 1.4.0 read this as a provider error and fell back. An uppercase code
+    // in error.code is a TensorCost refusal shape; unknown means terminal.
     const fetchImpl = vi.fn(async () =>
       jsonResponse(403, { error: { code: "FORBIDDEN", message: "bad token" } }),
     );
-    await expect(
-      proxyRequest(baseOpts(fetchImpl as unknown as typeof fetch)),
-    ).rejects.toBeInstanceOf(TensorCostProviderError);
+    const err = await proxyRequest(baseOpts(fetchImpl as unknown as typeof fetch)).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(TensorCostRefusedError);
+    expect((err as TensorCostRefusedError).code).toBe("FORBIDDEN");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("treats a non-JSON 403 as a provider error", async () => {

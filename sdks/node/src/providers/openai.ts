@@ -32,10 +32,9 @@ import {
 import { extractOpenAiMessagesText } from "../dlp.js";
 import {
   TensorCostProxyError,
-  TensorCostModelGovernanceDeniedError,
   TensorCostComplianceDeniedError,
   TensorCostComplianceTeamMismatchError,
-  TensorCostRunStoppedError,
+  TensorCostRefusedError,
 } from "../errors.js";
 import { TensorCostConfigError } from "../config.js";
 import type { CircuitBreaker } from "../circuit.js";
@@ -47,7 +46,12 @@ import { needsProxyUrl } from "../layer.js";
 import type { SdkLayerClient } from "../sdk-layer.js";
 import { decisionMetadata } from "../decision.js";
 import { SDK_VERSION } from "../version.js";
-import { WrapOverhead, postObservation, withAwaitExcluded } from "../wrap-overhead.js";
+import {
+  WrapOverhead,
+  observationScope,
+  postObservation,
+  withAwaitExcluded,
+} from "../wrap-overhead.js";
 import { resolveModelCallLink } from "../trace-link.js";
 const MARKER = "__tensorcost_wrapped__";
 const WITH_META_MARKER = "__tensorcost_with_meta__";
@@ -261,30 +265,27 @@ function wrapMethod(
               team_id: opts.hardening.teamId ?? null,
             },
             transport: opts.transport,
-            failOpen: true,
+            failOpen: opts.hardening.failOpenEnabled,
           });
         });
         if (!admit.allowed) {
-          if (admit.refusal) throw admit.refusal;
-          throw new TensorCostModelGovernanceDeniedError(
-            "tensorcost: request refused at govern layer",
-            "openai",
-            String(model),
-            null,
-            { attempt: 1 },
+          // The admit client types every refusal by its code. The generic
+          // error is only a guard; it used to say "model governance" for
+          // every refusal, budget caps included.
+          throw (
+            admit.refusal ??
+            new TensorCostRefusedError("tensorcost: request refused at govern layer", {}, {
+              status: 403,
+              attempt: 1,
+            })
           );
         }
         decisionMeta = decisionMetadata(admit.decisionHeader);
       } catch (err) {
-        if (
-          err instanceof TensorCostModelGovernanceDeniedError ||
-          err instanceof TensorCostRunStoppedError ||
-          err instanceof TensorCostComplianceDeniedError ||
-          err instanceof TensorCostComplianceTeamMismatchError
-        ) {
-          throw err;
-        }
-        // Fail-open: token/admit unavailable — proceed to direct provider.
+        // Same rule as the proxy path: go around TensorCost only when it
+        // is unavailable (token exchange or admit unreachable), and only
+        // with failOpenEnabled. A refusal, known code or not, stops the call.
+        if (!shouldFallBackToProvider(err) || !opts.hardening.failOpenEnabled) throw err;
       }
     }
 
@@ -304,6 +305,7 @@ function wrapMethod(
         ? { compliance_frameworks: complianceStamp.compliance_frameworks }
         : {}),
       ...(complianceStamp.dlp_action ? { dlp_action: complianceStamp.dlp_action } : {}),
+      ...observationScope(opts.hardening.application, opts.hardening.tags),
     });
 
     // steer/route path: route through proxy-client with full hardening.

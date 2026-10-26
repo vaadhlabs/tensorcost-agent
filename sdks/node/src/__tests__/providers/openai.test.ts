@@ -67,7 +67,7 @@ describe("openai provider wrapper", () => {
     expect(obs.error_message).toBeNull();
     expect(obs.tenant_id).toBeUndefined();
     expect(typeof obs.correlation_id).toBe("string");
-    expect(obs.sdk_version).toBe("tensorcost-node/1.4.0");
+    expect(obs.sdk_version).toBe("tensorcost-node/1.4.1");
     // Phase A4 batch 4 — connection_id absent when wrap() got no
     // connectionId. Backend then resolves env via the SDK envelope's
     // `environment` field or falls back to 'production'.

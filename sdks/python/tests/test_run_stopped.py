@@ -17,7 +17,12 @@ import pytest
 
 from tensorcost import TensorCostRunStoppedError
 from tensorcost._admit_client import admit_request
-from tensorcost._errors import TensorCostProviderError
+from tensorcost._errors import (
+    TensorCostModelGovernanceDeniedError,
+    TensorCostProviderError,
+    TensorCostProxyError,
+    TensorCostRefusedError,
+)
 from tensorcost._proxy_client import (
     _terminal_proxy_refusal_error,
     proxy_request,
@@ -116,21 +121,24 @@ def test_admit_raises_run_stopped_even_with_fail_open():
     assert info.value.request_id == "req-9"
 
 
-def test_admit_other_403_is_still_a_plain_refusal():
-    allowed, header = _admit(
-        lambda _r: _resp(
-            403,
-            {"error": {"code": "MODEL_GOVERNANCE_DENIED"}},
-            {"x-tc-decision": "layer=govern; action=refuse"},
+def test_admit_other_403_is_typed_by_its_code():
+    # 1.4.0 returned (False, header) and the wrapper raised a generic error.
+    with pytest.raises(TensorCostModelGovernanceDeniedError) as info:
+        _admit(
+            lambda _r: _resp(
+                403,
+                {"error": {"code": "MODEL_GOVERNANCE_DENIED"}},
+                {"x-tc-decision": "layer=govern; action=refuse"},
+            )
         )
-    )
-    assert allowed is False
-    assert header == "layer=govern; action=refuse"
+    assert info.value.code == "MODEL_GOVERNANCE_DENIED"
 
 
-def test_admit_403_with_non_json_body_is_a_plain_refusal():
-    allowed, _ = _admit(lambda _r: _resp(403, b"<html>403</html>"))
-    assert allowed is False
+def test_admit_403_with_non_json_body_is_still_a_refusal():
+    with pytest.raises(TensorCostRefusedError) as info:
+        _admit(lambda _r: _resp(403, b"<html>403</html>"))
+    assert info.value.code is None
+    assert should_fall_back_to_provider(info.value) is False
 
 
 def test_admit_still_fails_open_on_transport_error_and_5xx():
@@ -143,15 +151,19 @@ def test_admit_still_fails_open_on_transport_error_and_5xx():
 
 
 def test_admit_5xx_raises_when_fail_open_is_off():
-    with pytest.raises(httpx.HTTPStatusError):
+    # Typed since 1.4.1 (was httpx.HTTPStatusError).
+    with pytest.raises(TensorCostProxyError):
         _admit(lambda _r: _resp(503, {}), fail_open=False)
 
 
-def test_unrelated_403_on_the_chat_path_stays_a_provider_error():
-    assert (
-        _terminal_proxy_refusal_error(
-            json.dumps({"error": {"code": "FORBIDDEN"}}).encode(), request_id=None, attempt=1
-        )
-        is None
+def test_uppercase_403_code_on_the_chat_path_is_a_terminal_refusal():
+    # 1.4.0: None here, and ProviderError fell back. Now an uppercase code is
+    # a TensorCost refusal shape, and unknown means terminal.
+    err = _terminal_proxy_refusal_error(
+        json.dumps({"error": {"code": "FORBIDDEN"}}).encode(), request_id=None, attempt=1
     )
-    assert should_fall_back_to_provider(TensorCostProviderError("403")) is True
+    assert isinstance(err, TensorCostRefusedError)
+    assert err.code == "FORBIDDEN"
+    assert should_fall_back_to_provider(err) is False
+    # A relayed provider error never falls back either (1.4.0: it did).
+    assert should_fall_back_to_provider(TensorCostProviderError("403")) is False

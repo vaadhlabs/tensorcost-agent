@@ -2,7 +2,7 @@
 
 One-line wrapper for [TensorCost](https://tensorcost.com). Adds fire-and-forget cost observability and optional inference control to OpenAI, Anthropic, AWS Bedrock, and Google Vertex AI clients without changing how your code calls the underlying provider.
 
-**Current version:** 1.3.0 — period budgets + agent-run span linking (upgrade from 1.2.x if you use daily/monthly caps or Router · Agent runs). See [CHANGELOG](./CHANGELOG.md), [SDK compliance](https://github.com/vaadhlabs/tensorcost/blob/main/docs/features/sdk-compliance.md), and [Migrating from 0.x](#migrating-from-0x).
+**Current version:** 1.4.1 — fixes 1.4.0 routing around a money budget's hard cap when fail-open was on (the default); upgrade. See [CHANGELOG](./CHANGELOG.md), [SDK compliance](https://github.com/vaadhlabs/tensorcost/blob/main/docs/features/sdk-compliance.md), and [Migrating from 0.x](#migrating-from-0x).
 
 ## Install
 
@@ -104,7 +104,7 @@ At `govern` and above, the SDK calls `POST /api/inference-proxy/v1/admit` with m
 - **204** + `x-tc-decision: layer=govern; action=allow` → proceed to the provider
 - **403** + `x-tc-decision: layer=govern; action=refuse; reason=…` → call blocked
 
-Admit is **fail-open** on transport errors: the provider call proceeds and an `admit_unavailable` observation is emitted when transport recovers. The admit HTTP call is capped at **500ms**.
+Admit is **fail-open** on outages only (network error, timeout, 5xx, or a 429 with no refusal body), and only while `fail_open_enabled` is on: the provider call proceeds and an `admit_unavailable` observation is emitted. Any other non-2xx refuses the call with a typed `TensorCostRefusedError`. The admit HTTP call is capped at **500ms**.
 
 ### Compliance profiles (1.2.0+)
 
@@ -246,9 +246,17 @@ Non-streaming steer/route waits up to **`timeout_s` for headers** (proxy may buf
 The headers deadline targets wedged proxy connections, not slow upstream models — body read uses `timeout_s` independently once headers arrive.
 
 Typed errors: `TensorCostError`, `TensorCostNetworkError`, `TensorCostTimeoutError`,
-`TensorCostProxyError`, `TensorCostQuotaError`, `TensorCostProviderError`,
-`TensorCostRunBudgetExceededError`, `TensorCostPeriodBudgetExceededError`,
-`TensorCostComplianceDeniedError`, `TensorCostComplianceTeamMismatchError`.
+`TensorCostProxyError`, `TensorCostQuotaError`, `TensorCostProviderError`, and
+`TensorCostRefusedError`, the base of every refusal: `TensorCostBudgetHardCapError`,
+`TensorCostRunBudgetExceededError`, `TensorCostRunStoppedError`,
+`TensorCostPeriodBudgetExceededError`, `TensorCostModelGovernanceDeniedError`,
+`TensorCostGuardrailHardStopError`, `TensorCostComplianceDeniedError`,
+`TensorCostComplianceTeamMismatchError`. A refusal code this SDK version doesn't know
+arrives as a plain `TensorCostRefusedError` with `code`, `reason` and the message intact.
+
+`TensorCostBudgetHardCapError` carries `budget_id`, `reason`, `retryable` (true for
+`reason="spend_not_known_yet"`, a budget whose spend hasn't been counted yet) and
+`retry_after_seconds`. The SDK doesn't retry it for you.
 
 ### Period budgets (1.3.0+)
 
@@ -300,7 +308,9 @@ Plain `wrap()` without a link still attributes by `agent_id` / `workflow_id`.
 
 ## Fail-open guarantee
 
-If TensorCost is unreachable, slow, or returns an error, your underlying provider call still completes normally. The SDK logs a warning via `logging.getLogger("tensorcost")`.
+If TensorCost is unreachable or slow, your underlying provider call still completes normally. The SDK logs a warning via `logging.getLogger("tensorcost")`.
+
+Since 1.4.1 "unreachable" is an allow-list: a call goes around TensorCost only on a network error, a timeout, a 5xx, or a 429 without a refusal body, and only with `fail_open_enabled` on. A TensorCost refusal (any code, known or not) raises a `TensorCostRefusedError` subclass, and a provider's own 4xx relayed by the proxy raises `TensorCostProviderError`; neither falls back.
 
 **Duplicate spend:** fail-open after a failed proxy may double-bill if the proxy already reached the provider. Use `fail_open_enabled=False` for in-VPC sidecar-only steer.
 
@@ -337,7 +347,7 @@ Authentication uses a short-lived JWT from `POST /api/inference-proxy/sdk-token/
 | Provider | Package | Layers | Operations |
 |---|---|---|---|
 | OpenAI | `openai` ≥ 1.0 | observe → route | chat, completions, embeddings, responses (+ streaming) |
-| Anthropic | `anthropic` ≥ 0.20 | observe → route | messages (+ streaming) |
+| Anthropic | `anthropic` ≥ 0.20 | observe, govern (steer/route run as govern, 1.4.1) | messages (+ streaming) |
 | Azure OpenAI | `openai` (`AzureOpenAI`) | observe → route | same as OpenAI (`provider: openai`) |
 | AWS Bedrock | `boto3` bedrock-runtime | observe, govern only | invoke, converse (+ streaming placeholders) |
 | Google Vertex | `google-genai` (`vertexai=True`) | observe, govern only | generate_content (+ streaming) |

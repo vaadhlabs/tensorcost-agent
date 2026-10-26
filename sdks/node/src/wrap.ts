@@ -55,11 +55,17 @@ export function wrap<T>(client: T, options: WrapOptions = {}): T {
     throw steerRouteUnsupportedError(provider, config.maxLayer);
   }
 
+  // Anthropic runs at govern at most until the proxy has a Messages route
+  // (warns once). Decided here, before installAppliedMode, so the client's
+  // baseURL is never pointed at a proxy route that doesn't exist.
+  const maxLayer =
+    provider === "anthropic" ? anthropicProvider.anthropicLayer(config.maxLayer) : config.maxLayer;
+
   const { transport, sdkLayer } = getSharedRuntime(config);
   warmupSharedRuntime(config);
 
   if (
-    needsProxyUrl(config.maxLayer) &&
+    needsProxyUrl(maxLayer) &&
     config.proxyUrl !== null &&
     (provider === "openai" || provider === "anthropic")
   ) {
@@ -82,8 +88,8 @@ export function wrap<T>(client: T, options: WrapOptions = {}): T {
   );
 
   const hardening = {
-    maxLayer: config.maxLayer,
-    appliedMode: config.appliedMode,
+    maxLayer,
+    appliedMode: needsProxyUrl(maxLayer) && config.appliedMode,
     proxyUrl: config.proxyUrl,
     baseUrl: config.baseUrl,
     sdkLayer,
@@ -140,6 +146,7 @@ export function wrap<T>(client: T, options: WrapOptions = {}): T {
       config.workflowId,
       config.customer,
       config.feature,
+      { application: config.application, tags: config.tags },
     );
   } else {
     vertexProvider.install(
@@ -154,9 +161,13 @@ export function wrap<T>(client: T, options: WrapOptions = {}): T {
       config.workflowId,
       config.customer,
       config.feature,
+      { application: config.application, tags: config.tags },
     );
   }
   return client;
 }
 
-export const __test__ = { layerRank, steerRouteUnsupportedError };
+export const __test__ = {
+  layerRank,
+  steerRouteUnsupportedError,
+};

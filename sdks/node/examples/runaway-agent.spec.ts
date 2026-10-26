@@ -171,6 +171,31 @@ describe("runRunaway", () => {
     expect(text).toMatch(/inference-proxy\.sandbox\.enabled/);
   });
 
+  it("a money budget's hard cap prints 403 BUDGET_HARD_CAP and exits 3", async () => {
+    // The proxy's wire shape (money-budget-wire-contract.spec.ts).
+    const stub = stubBackend([
+      () =>
+        json(403, {
+          error: {
+            code: "PERIOD_BUDGET_EXCEEDED",
+            budget_code: "BUDGET_HARD_CAP",
+            message: 'Budget hard cap reached for budget "Prod AI" (b-1)',
+            scope: "budget:b-1",
+            period: "monthly",
+            cap_cents: 10_000,
+            spent_cents: 10_200,
+            budget_id: "b-1",
+            budget_name: "Prod AI",
+            burn_pct: 1.02,
+            retryable: false,
+          },
+        }),
+    ]);
+    const { deps, out } = makeDeps(stub.fetchImpl);
+    expect(await runRunaway(opts(), deps)).toBe(3);
+    expect(out).toContain('403 BUDGET_HARD_CAP: the budget\'s hard cap is reached (budget "Prod AI", b-1)');
+  });
+
   it("a 403 that isn't a TensorCost refusal prints 403 UNKNOWN and exits 1, not 3", async () => {
     // What a WAF or load balancer sends: no TensorCost error body at all.
     for (const reply of [

@@ -12,7 +12,12 @@ import type { ObservationTransport } from "../transport.js";
 
 import { SDK_VERSION } from "../version.js";
 import { resolveModelCallLink } from "../trace-link.js";
-import { WrapOverhead, postObservation, withAwaitExcluded } from "../wrap-overhead.js";
+import {
+  WrapOverhead,
+  observationScope,
+  postObservation,
+  withAwaitExcluded,
+} from "../wrap-overhead.js";
 const MARKER = "__tensorcost_wrapped__";
 
 function nowIso(): string {
@@ -79,6 +84,8 @@ function wrapMethod(
     workflowId: string | null;
     customer: string | null;
     feature: string | null;
+    application?: string | null;
+    tags?: string[];
   },
 ): (...args: unknown[]) => unknown {
   const wrapped = async (...args: unknown[]) => {
@@ -108,6 +115,7 @@ function wrapMethod(
       ...(opts.workflowId !== null ? { workflow_id: opts.workflowId } : {}),
       ...(opts.customer !== null ? { customer: opts.customer } : {}),
       ...(opts.feature !== null ? { feature: opts.feature } : {}),
+      ...observationScope(opts.application, opts.tags),
       ...metaSpread,
     };
 
@@ -172,6 +180,7 @@ export function install(
   workflowId: string | null = null,
   customer: string | null = null,
   feature: string | null = null,
+  scope: { application?: string | null; tags?: string[] } = {},
 ): void {
   void tenantId;
   if (!client || typeof client !== "object") return;
@@ -198,6 +207,8 @@ export function install(
       workflowId,
       customer,
       feature,
+      application: scope.application ?? null,
+      tags: scope.tags ?? [],
     });
   }
 }

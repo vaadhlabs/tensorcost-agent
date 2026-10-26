@@ -88,6 +88,8 @@ def _post_obs(
     feature: Optional[str] = None,
     agent_id: Optional[str] = None,
     workflow_id: Optional[str] = None,
+    application: Optional[str] = None,
+    tags: Optional[list] = None,
 ) -> None:
     obs: Observation = {
         "sdk_version": _SDK_VERSION,
@@ -108,6 +110,11 @@ def _post_obs(
         **({"feature": feature} if feature is not None else {}),
         **({"agent_id": agent_id} if agent_id is not None else {}),
         **({"workflow_id": workflow_id} if workflow_id is not None else {}),
+        # Routing-policy scope from wrap(application=, tags=). The server reads
+        # both off the observation (ObservationDto); before 1.4.1 they only rode
+        # on proxied calls as x-tc-application / x-tc-tags.
+        **({"application": application} if application else {}),
+        **({"tags": list(tags)} if tags else {}),
     }
     try:
         transport.post(obs)
@@ -129,6 +136,8 @@ def _wrap_method(
     feature: Optional[str] = None,
     agent_id: Optional[str] = None,
     workflow_id: Optional[str] = None,
+    application: Optional[str] = None,
+    tags: Optional[list] = None,
 ) -> Any:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         request_at = _now_iso()
@@ -144,6 +153,7 @@ def _wrap_method(
                 "error", f"{type(exc).__name__}: {exc}",
                 customer=customer, feature=feature,
                 agent_id=agent_id, workflow_id=workflow_id,
+                application=application, tags=tags,
             )
             raise
 
@@ -155,6 +165,7 @@ def _wrap_method(
                 "streaming: per-chunk token accounting not yet implemented",
                 customer=customer, feature=feature,
                 agent_id=agent_id, workflow_id=workflow_id,
+                application=application, tags=tags,
             )
             return response
 
@@ -167,6 +178,7 @@ def _wrap_method(
             output_tokens, "success", None,
             customer=customer, feature=feature,
             agent_id=agent_id, workflow_id=workflow_id,
+            application=application, tags=tags,
         )
         return response
 
@@ -191,6 +203,8 @@ def install(
     feature: Optional[str] = None,
     agent_id: Optional[str] = None,
     workflow_id: Optional[str] = None,
+    application: Optional[str] = None,
+    tags: Optional[list] = None,
 ) -> None:
     """Monkey-patch a ``google.genai.Client`` (Vertex mode) ``models`` namespace.
 
@@ -228,5 +242,7 @@ def install(
                 feature=feature,
                 agent_id=agent_id,
                 workflow_id=workflow_id,
+                application=application,
+                tags=tags,
             ),
         )

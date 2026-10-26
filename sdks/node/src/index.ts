@@ -9,6 +9,8 @@ export {
   TensorCostProxyError,
   TensorCostQuotaError,
   TensorCostProviderError,
+  TensorCostRefusedError,
+  TensorCostBudgetHardCapError,
   TensorCostRunBudgetExceededError,
   TensorCostRunStoppedError,
   TensorCostPeriodBudgetExceededError,
@@ -41,4 +43,4 @@ export { wrapCrewAI } from "./adapters/crewai.js";
 export { wrapVercelAi } from "./adapters/vercel-ai.js";
 export { intersectGrants } from "./layer.js";
 
-export const version = "1.4.0";
+export const version = "1.4.1";

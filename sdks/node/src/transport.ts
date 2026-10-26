@@ -20,6 +20,12 @@
  *   site never sees an exception.
  */
 
+import {
+  TensorCostNetworkError,
+  TensorCostProxyError,
+  TensorCostQuotaError,
+  TensorCostTimeoutError,
+} from "./errors.js";
 import type { Observation } from "./types.js";
 import { SDK_VERSION } from "./version.js";
 const TOKEN_REFRESH_LEEWAY_MS = 60_000;
@@ -168,7 +174,8 @@ export class ObservationTransport {
 
   private async exchangeToken(): Promise<string> {
     if (!this.tenantId) {
-      throw new Error(
+      warnNoTenantOnce();
+      throw new TenantIdMissingError(
         "tensorcost: tenant_id required for token exchange (pass tenantId to wrap() or set TENSORCOST_TENANT_ID)",
       );
     }
@@ -176,18 +183,45 @@ export class ObservationTransport {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const resp = await this.fetchImpl(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": SDK_VERSION,
-        },
-        body: JSON.stringify({
-          tenant_id: this.tenantId,
-          sdk_long_lived_token: this.apiKey,
-        }),
-        signal: controller.signal,
-      });
+      // Outages are typed so the wrappers' fail-open predicate can tell
+      // "TensorCost is down" (network, timeout, 5xx, 429) from "TensorCost
+      // said no" (any other status), which is not a reason to go around it.
+      let resp: Response;
+      try {
+        resp = await this.fetchImpl(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": SDK_VERSION,
+          },
+          body: JSON.stringify({
+            tenant_id: this.tenantId,
+            sdk_long_lived_token: this.apiKey,
+          }),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        const e = err as Error;
+        if (e?.name === "AbortError" || e?.name === "TimeoutError") {
+          throw new TensorCostTimeoutError(
+            `tensorcost: token-exchange timed out after ${this.timeoutMs}ms`,
+            "total",
+            { cause: e },
+          );
+        }
+        throw new TensorCostNetworkError(
+          `tensorcost: token-exchange network error: ${e?.message ?? String(err)}`,
+          { cause: e },
+        );
+      }
+      if (resp.status >= 500) {
+        throw new TensorCostProxyError(`token-exchange failed status=${resp.status}`, {
+          status: resp.status,
+        });
+      }
+      if (resp.status === 429) {
+        throw new TensorCostQuotaError(`token-exchange failed status=${resp.status}`, null);
+      }
       if (!resp.ok) {
         throw new Error(`token-exchange failed status=${resp.status}`);
       }
@@ -215,7 +249,38 @@ export class ObservationTransport {
   }
 }
 
+/**
+ * No tenant id, so no token: TensorCost is never asked about the call.
+ *
+ * The fail-open predicate lets this one through alongside the outages,
+ * because nothing was refused (nothing was asked) and 1.4.0 behaved the
+ * same way. What changes is that it is said once, out loud.
+ */
+export class TenantIdMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TenantIdMissingError";
+  }
+}
+
+let noTenantWarned = false;
+
+function warnNoTenantOnce(): void {
+  if (noTenantWarned) return;
+  noTenantWarned = true;
+  // eslint-disable-next-line no-console
+  console.warn(
+    "tensorcost: govern/steer/route need a tenant id (tenantId or TENSORCOST_TENANT_ID) " +
+      "for the token exchange, and none is set, so no call can be checked: stops, caps " +
+      "and budgets are NOT enforced and calls go straight to the provider. Set the " +
+      "tenant id to enforce them.",
+  );
+}
+
 export const __test__ = {
+  resetNoTenantWarning(): void {
+    noTenantWarned = false;
+  },
   SDK_VERSION,
   MAX_QUEUE_DEPTH,
 };

@@ -27,10 +27,9 @@ import {
 import { extractAnthropicMessagesText } from "../dlp.js";
 import {
   TensorCostProxyError,
-  TensorCostModelGovernanceDeniedError,
   TensorCostComplianceDeniedError,
   TensorCostComplianceTeamMismatchError,
-  TensorCostRunStoppedError,
+  TensorCostRefusedError,
 } from "../errors.js";
 import { TensorCostConfigError } from "../config.js";
 import type { CircuitBreaker } from "../circuit.js";
@@ -43,7 +42,12 @@ import type { SdkLayerClient } from "../sdk-layer.js";
 import { decisionMetadata } from "../decision.js";
 import { SDK_VERSION } from "../version.js";
 import { resolveModelCallLink } from "../trace-link.js";
-import { WrapOverhead, postObservation, withAwaitExcluded } from "../wrap-overhead.js";
+import {
+  WrapOverhead,
+  observationScope,
+  postObservation,
+  withAwaitExcluded,
+} from "../wrap-overhead.js";
 const MARKER = "__tensorcost_wrapped__";
 const WITH_META_MARKER = "__tensorcost_with_meta__";
 
@@ -214,27 +218,27 @@ function wrapMethod(
               team_id: opts.hardening.teamId ?? null,
             },
             transport: opts.transport,
-            failOpen: true,
+            failOpen: opts.hardening.failOpenEnabled,
           });
         });
         if (!admit.allowed) {
-          if (admit.refusal) throw admit.refusal;
-          throw new TensorCostModelGovernanceDeniedError(
-            "tensorcost: request refused at govern layer",
-            "anthropic",
-            String(model),
-            null,
-            { attempt: 1 },
+          // The admit client types every refusal by its code. The generic
+          // error is only a guard; it used to say "model governance" for
+          // every refusal, budget caps included.
+          throw (
+            admit.refusal ??
+            new TensorCostRefusedError("tensorcost: request refused at govern layer", {}, {
+              status: 403,
+              attempt: 1,
+            })
           );
         }
         decisionMeta = decisionMetadata(admit.decisionHeader);
       } catch (err) {
-        if (
-          err instanceof TensorCostModelGovernanceDeniedError ||
-          err instanceof TensorCostRunStoppedError
-        ) {
-          throw err;
-        }
+        // Same rule as the proxy path: go around TensorCost only when it
+        // is unavailable (token exchange or admit unreachable), and only
+        // with failOpenEnabled. A refusal, known code or not, stops the call.
+        if (!shouldFallBackToProvider(err) || !opts.hardening.failOpenEnabled) throw err;
       }
     }
 
@@ -254,6 +258,7 @@ function wrapMethod(
         ? { compliance_frameworks: complianceStamp.compliance_frameworks }
         : {}),
       ...(complianceStamp.dlp_action ? { dlp_action: complianceStamp.dlp_action } : {}),
+      ...observationScope(opts.hardening.application, opts.hardening.tags),
     });
 
     const proxyUrl = opts.hardening.proxyUrl;
@@ -568,19 +573,52 @@ function wrapMethod(
   return wrapped;
 }
 
+let pinWarned = false;
+
+/**
+ * The layer an Anthropic client actually runs at.
+ *
+ * The proxy has no Anthropic Messages route yet, so steer/route can't put
+ * the proxy in the request path for Claude. Before 1.4.1 that proxy call
+ * failed and fail-open sent the call straight to Anthropic, which meant
+ * nothing could stop a Claude run. Govern runs the pre-call /admit check
+ * instead, so stops, caps and budgets still apply. One warning per
+ * process says so.
+ */
+export function anthropicLayer(requested: ControlLayer): ControlLayer {
+  if (!needsProxyUrl(requested)) return requested;
+  if (!pinWarned) {
+    pinWarned = true;
+    // eslint-disable-next-line no-console
+    console.warn(
+      `tensorcost: maxLayer '${requested}' isn't available for Anthropic clients yet ` +
+        "(the TensorCost proxy has no Anthropic Messages route), so this client runs " +
+        "in 'govern': every call is checked with /admit before it goes to Anthropic, " +
+        "which is what lets a run be stopped or capped. Set maxLayer: 'govern' to " +
+        "silence this warning.",
+    );
+  }
+  return "govern";
+}
+
 export function install(
   client: unknown,
   transport: ObservationTransport,
   tenantId: string | null,
   environment: string | null,
   connectionId: string | null,
-  hardening: AppliedModeHardeningOpts,
+  hardeningIn: AppliedModeHardeningOpts,
   deployment: string | null = null,
   promptTemplateId: string | null = null,
   agentId: string | null = null,
   workflowId: string | null = null,
 ): void {
   if (!client || typeof client !== "object") return;
+  const pinned = anthropicLayer(hardeningIn.maxLayer);
+  const hardening: AppliedModeHardeningOpts =
+    pinned === hardeningIn.maxLayer
+      ? hardeningIn
+      : { ...hardeningIn, maxLayer: pinned, appliedMode: false };
   const c = client as Record<string, any>;
   const messages = c.messages;
 
@@ -686,4 +724,10 @@ export function install(
   }
 }
 
-export const __test__ = { MARKER, WITH_META_MARKER };
+export const __test__ = {
+  MARKER,
+  WITH_META_MARKER,
+  resetPinWarning(): void {
+    pinWarned = false;
+  },
+};

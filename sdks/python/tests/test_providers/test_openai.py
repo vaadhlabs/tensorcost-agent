@@ -33,7 +33,7 @@ def test_chat_completions_observation_shape(openai_client, recording_transport):
     assert obs["input_tokens"] == 12
     assert obs["output_tokens"] == 34
     assert "tenant_id" not in obs
-    assert obs["sdk_version"] == "tensorcost-python/1.4.0"
+    assert obs["sdk_version"] == "tensorcost-python/1.4.1"
     # Phase A4 batch 4 — connection_id absent when wrap() got no
     # connection_id; backend then resolves env via the SDK envelope's
     # `environment` field or falls back to 'production'.

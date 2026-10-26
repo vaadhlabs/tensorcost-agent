@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from tensorcost import MissingConfigError, wrap
@@ -31,6 +32,7 @@ from tensorcost._applied_mode import (
     openai_provider_base_url,
 )
 from tensorcost._config import resolve_config
+from tensorcost._errors import TensorCostProxyError
 from tensorcost._providers import _anthropic, _openai
 
 
@@ -323,7 +325,9 @@ class TestOpenAIAppliedMode:
         )
 
         with patch("tensorcost._providers._openai.proxy_request") as mock_proxy:
-            mock_proxy.side_effect = RuntimeError("proxy down")
+            # proxy_request only ever raises typed errors; an outage is
+            # TensorCostProxyError (1.4.1: raw exceptions don't fall back).
+            mock_proxy.side_effect = TensorCostProxyError("proxy down")
             result = client.chat.completions.create(
                 model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}]
             )
@@ -411,152 +415,81 @@ class TestAnthropicAppliedMode:
         assert result is sentinel
         assert len(recording_transport.observations) == 1
 
-    def test_applied_mode_auth_is_x_api_key_shape(self, recording_transport):
-        """Anthropic auth in provider_auth uses 'x-api-key <key>' not Bearer."""
-        client = self._make_client(api_key="sk-ant-realkey")
+    # 1.4.1: the proxy has no Anthropic Messages route, so applied mode /
+    # steer / route for an Anthropic client runs as govern. The old
+    # proxy-path tests here asserted header shapes on a call that, against a
+    # real proxy, could only fail open around TensorCost.
 
-        _anthropic.install(
-            client, recording_transport,
-            tenant_id=None, environment=None, connection_id=None,
-            applied_mode=True, proxy_url="https://proxy.example.com",
-        )
-
-        with patch("tensorcost._providers._anthropic.proxy_request") as mock_proxy:
-            mock_proxy.return_value = (_anthropic_proxy_success_response(), None)
-            client.messages.create(
-                model="claude-3-5-sonnet-20241022", max_tokens=10,
-                messages=[{"role": "user", "content": "hi"}],
-            )
-
-        call_kwargs = mock_proxy.call_args[1]
-        assert call_kwargs["provider_auth"] == "x-api-key sk-ant-realkey"
-        assert call_kwargs["provider_url"] == "https://api.anthropic.com"
-
-    def test_applied_mode_provider_url_is_base_url_not_path(self, recording_transport):
-        """provider_url must be the base URL only — no /v1/messages suffix."""
-        client = self._make_client(api_key="sk-ant-realkey")
-        client.base_url = "https://api.anthropic.com"
-
-        _anthropic.install(
-            client, recording_transport,
-            tenant_id=None, environment=None, connection_id=None,
-            applied_mode=True, proxy_url="https://proxy.example.com",
-        )
-
-        with patch("tensorcost._providers._anthropic.proxy_request") as mock_proxy:
-            mock_proxy.return_value = (_anthropic_proxy_success_response(), None)
-            client.messages.create(
-                model="claude-3-5-sonnet-20241022", max_tokens=10,
-                messages=[{"role": "user", "content": "hi"}],
-            )
-
-        call_kwargs = mock_proxy.call_args[1]
-        assert call_kwargs["provider_url"] == "https://api.anthropic.com"
-        assert "/v1" not in call_kwargs["provider_url"]
-        assert "/messages" not in call_kwargs["provider_url"]
-
-    def test_applied_mode_body_sent_verbatim_anthropic_shape(self, recording_transport):
-        """The body forwarded to the proxy is the native Anthropic shape, not translated.
-
-        system prompt stays as 'system' key, not prepended as a chat message.
-        max_tokens is preserved as-is.
-        """
-        client = self._make_client(api_key="sk-ant-realkey")
-
-        _anthropic.install(
-            client, recording_transport,
-            tenant_id=None, environment=None, connection_id=None,
-            applied_mode=True, proxy_url="https://proxy.example.com",
-        )
-
-        with patch("tensorcost._providers._anthropic.proxy_request") as mock_proxy:
-            mock_proxy.return_value = (_anthropic_proxy_success_response(), None)
-            client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=128,
-                system="You are a helpful assistant.",
-                messages=[{"role": "user", "content": "hello"}],
-            )
-
-        call_kwargs = mock_proxy.call_args[1]
-        body = call_kwargs["body"]
-        # Native Anthropic shape: system is a top-level key, not a role message.
-        assert body.get("system") == "You are a helpful assistant."
-        assert body.get("max_tokens") == 128
-        # Not translated: no OpenAI "choices" structure in the request body.
-        messages = body.get("messages", [])
-        assert len(messages) == 1
-        assert messages[0]["role"] == "user"
-
-    def test_applied_mode_telemetry_fires(self, recording_transport):
-        client = self._make_client()
-
-        _anthropic.install(
-            client, recording_transport,
-            tenant_id="t-3", environment=None, connection_id=None,
-            applied_mode=True, proxy_url="https://proxy.example.com",
-        )
-
-        with patch("tensorcost._providers._anthropic.proxy_request") as mock_proxy:
-            mock_proxy.return_value = (_anthropic_proxy_success_response(), None)
-            client.messages.create(
-                model="claude-3-opus", max_tokens=10,
-                messages=[{"role": "user", "content": "hi"}],
-            )
-
-        assert len(recording_transport.observations) == 1
-        obs = recording_transport.observations[0]
-        assert obs["status"] == "success"
-        assert "tenant_id" not in obs
-        assert obs["provider"] == "anthropic"
-        # Usage extracted from Anthropic-shaped proxy response.
-        assert obs["input_tokens"] == 10
-        assert obs["output_tokens"] == 20
-
-    def test_applied_mode_proxy_failure_falls_back_to_direct(self, recording_transport):
+    def test_applied_mode_is_pinned_to_govern(self, recording_transport, caplog):
         client = self._make_client()
         sentinel = client.messages.create.return_value
+        _anthropic._reset_pin_warning()
+        with caplog.at_level("WARNING", logger="tensorcost"):
+            _anthropic.install(
+                client, recording_transport,
+                tenant_id=None, environment=None, connection_id=None,
+                applied_mode=True, proxy_url="https://proxy.example.com",
+            )
+            _anthropic.install(
+                self._make_client(), recording_transport,
+                tenant_id=None, environment=None, connection_id=None,
+                max_layer="route", proxy_url="https://proxy.example.com",
+            )
 
-        _anthropic.install(
-            client, recording_transport,
-            tenant_id=None, environment=None, connection_id=None,
-            applied_mode=True, proxy_url="https://proxy.example.com",
-        )
-
-        with patch("tensorcost._providers._anthropic.proxy_request") as mock_proxy:
-            mock_proxy.side_effect = RuntimeError("proxy down")
+        with patch("tensorcost._providers._anthropic.proxy_request") as mock_proxy, patch(
+            "tensorcost._providers._anthropic.admit_request",
+            return_value=(True, "layer=govern; action=allow"),
+        ) as mock_admit:
             result = client.messages.create(
-                model="claude-3-opus", max_tokens=10,
+                model="claude-3-5-sonnet-20241022", max_tokens=10,
                 messages=[{"role": "user", "content": "hi"}],
             )
 
         assert result is sentinel
+        mock_proxy.assert_not_called()
+        assert mock_admit.call_count == 1
+        assert mock_admit.call_args.kwargs["metadata"]["provider"] == "anthropic"
+        pin = [r for r in caplog.records if "Anthropic" in r.getMessage()]
+        assert len(pin) == 1
+        assert "runs in 'govern'" in pin[0].getMessage()
         assert len(recording_transport.observations) == 1
 
-    def test_applied_mode_response_forwarded_verbatim(self, recording_transport):
-        """Proxy response dict returned as-is (Anthropic-shaped); no rewriting."""
-        client = self._make_client()
-        expected = _anthropic_proxy_success_response()
+    def test_pinned_govern_budget_refusal_is_terminal(self, recording_transport):
+        from tensorcost import TensorCostBudgetHardCapError, TensorCostModelGovernanceDeniedError
 
+        client = self._make_client()
+        direct = client.messages.create
         _anthropic.install(
             client, recording_transport,
             tenant_id=None, environment=None, connection_id=None,
-            applied_mode=True, proxy_url="https://proxy.example.com",
+            max_layer="route", proxy_url="https://proxy.example.com",
         )
+        calls = []
 
-        with patch("tensorcost._providers._anthropic.proxy_request") as mock_proxy:
-            mock_proxy.return_value = (expected, None)
-            result = client.messages.create(
-                model="claude-3-opus", max_tokens=10,
-                messages=[{"role": "user", "content": "hi"}],
+        def handler(request):
+            calls.append(str(request.url))
+            return httpx.Response(
+                403,
+                json={"error": {"code": "BUDGET_HARD_CAP", "budget_id": "b1", "burn_pct": 101}},
             )
 
-        assert result == expected
+        import tensorcost._admit_client as admit_mod
 
+        real = admit_mod.admit_request
 
-# ---------------------------------------------------------------------------
-# wrap() integration tests for applied-mode
-# ---------------------------------------------------------------------------
+        def via_mock_transport(**kw):
+            return real(**kw, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+        with patch("tensorcost._providers._anthropic.admit_request", side_effect=via_mock_transport):
+            with pytest.raises(TensorCostBudgetHardCapError) as info:
+                client.messages.create(model="claude-3-5-sonnet-20241022", max_tokens=10, messages=[])
+
+        assert not isinstance(info.value, TensorCostModelGovernanceDeniedError)
+        assert info.value.code == "BUDGET_HARD_CAP"
+        assert info.value.budget_id == "b1"
+        assert "hard cap is reached" in str(info.value)
+        assert len(calls) == 1
+        direct.assert_not_called()
 
 
 class TestWrapAppliedMode:

@@ -1,19 +1,34 @@
 """Govern-layer admit — metadata-only POST /api/inference-proxy/v1/admit.
 
-Fail-open on transport errors. A 403 is a refusal, never a transport error;
-when its body says RUN_STOPPED this raises TensorCostRunStoppedError so the
-caller gets who stopped the run and why instead of a generic govern refusal.
+Fail-open only on an outage: network error, timeout, 5xx, or a 429 / 402
+with no refusal body. The customer's call then proceeds and an ``admit_unavailable``
+observation is posted when transport is set.
+
+Every other non-2xx is an answer and raises a ``TensorCostRefusedError``
+subclass, fail-open or not: RUN_STOPPED with its who / when / why,
+BUDGET_HARD_CAP as the budget error, a code this SDK doesn't know as a plain
+``TensorCostRefusedError``. /admit only answers 403 when a gate refused, so a
+403 with no readable code is still a refusal. A 401/400/404 means admission
+could not be checked for this call; that is not an outage either.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import httpx
 
-from ._errors import TensorCostRunStoppedError
+from ._errors import (
+    TensorCostNetworkError,
+    TensorCostProxyError,
+    TensorCostQuotaError,
+    TensorCostRefusedError,
+    TensorCostTimeoutError,
+)
 from ._layer import ADMIT_PATH, ADMIT_TIMEOUT_S, ControlLayer
+from ._refusal import decision_says_refuse, parse_body, parse_refusal_body, refusal_error
+from ._retry import parse_retry_after_ms
 from ._transport import ObservationTransport
 from ._version import SDK_VERSION, sdk_capability_header
 
@@ -33,9 +48,11 @@ def admit_request(
     timeout_s: float = ADMIT_TIMEOUT_S,
     http_client: Optional[httpx.Client] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Returns (allowed, decision_header). Fail-open on transport errors.
+    """Returns ``(True, decision_header)`` when the call may proceed.
 
-    Raises TensorCostRunStoppedError for a RUN_STOPPED 403.
+    Raises a ``TensorCostRefusedError`` subclass for any refusal. Raises the
+    typed outage error (network / timeout / proxy / quota) when
+    ``fail_open`` is False; otherwise an outage returns ``(True, None)``.
     """
     url = base_url.rstrip("/") + ADMIT_PATH
     headers = {
@@ -49,25 +66,45 @@ def admit_request(
     own_client = http_client is None
     client = http_client or httpx.Client(timeout=timeout_s)
     # Raised after the try below: inside it, fail-open would swallow it.
-    stopped: Optional[TensorCostRunStoppedError] = None
+    refusal: Optional[TensorCostRefusedError] = None
     try:
-        resp = client.post(url, headers=headers, json=metadata)
+        try:
+            resp = client.post(url, headers=headers, json=metadata)
+        except httpx.TimeoutException as exc:
+            raise TensorCostTimeoutError(
+                f"tensorcost: admit timed out after {timeout_s}s", "total", root_cause=exc
+            ) from exc
+        except (httpx.TransportError, OSError) as exc:
+            raise TensorCostNetworkError(
+                f"tensorcost: network error reaching admit: {exc}", root_cause=exc
+            ) from exc
         decision_header = resp.headers.get("x-tc-decision")
-        if resp.status_code == 403:
-            stopped = _run_stopped_from(resp)
-            if stopped is None:
-                return False, decision_header
+        request_id = resp.headers.get("x-tc-request-id")
+        if 400 <= resp.status_code < 500:
+            refusal = _refusal_from_4xx(resp, decision_header)
+            if refusal is None:  # a bare 429 (throttler) or 402 (plan ceiling)
+                ra_ms = parse_retry_after_ms(resp.headers.get("retry-after"))
+                raise TensorCostQuotaError(
+                    f"admit POST failed status={resp.status_code}",
+                    retry_after_ms=int(ra_ms) if ra_ms is not None else None,
+                    status=resp.status_code,
+                    request_id=request_id,
+                )
         elif resp.status_code >= 400:
-            raise httpx.HTTPStatusError(
+            raise TensorCostProxyError(
                 f"admit POST failed status={resp.status_code}",
-                request=resp.request,
-                response=resp,
+                status=resp.status_code,
+                request_id=request_id,
             )
         else:
             return True, decision_header
-    except Exception as exc:
+    except Exception:
         if fail_open:
             if transport is not None:
+                tags = metadata.get("tags")
+                tag_list = (
+                    [t for t in tags.split(",") if t] if isinstance(tags, str) else tags
+                )
                 try:
                     transport.post(
                         {
@@ -83,6 +120,12 @@ def admit_request(
                             "status": "success",
                             "error_message": None,
                             "correlation_id": metadata.get("correlation_id", ""),
+                            **(
+                                {"application": metadata["application"]}
+                                if metadata.get("application")
+                                else {}
+                            ),
+                            **({"tags": list(tag_list)} if tag_list else {}),
                             "metadata": {
                                 "decision_action": "allow",
                                 "decision_reason": "admit_unavailable",
@@ -96,18 +139,35 @@ def admit_request(
     finally:
         if own_client:
             client.close()
-    assert stopped is not None
-    raise stopped
+    assert refusal is not None
+    raise refusal
 
 
-def _run_stopped_from(resp: httpx.Response) -> Optional[TensorCostRunStoppedError]:
-    try:
-        body = resp.json()
-    except Exception:
+def _refusal_from_4xx(
+    resp: httpx.Response, decision_header: Optional[str]
+) -> Optional[TensorCostRefusedError]:
+    """The refusal in a 4xx from /admit, or None for a bare 429 / 402."""
+    body = parse_body(resp.content)
+    parsed = parse_refusal_body(body)
+    if (
+        parsed is None
+        and resp.status_code in (402, 429)
+        and not decision_says_refuse(decision_header)
+    ):
         return None
-    err = body.get("error") if isinstance(body, dict) else None
-    if isinstance(err, dict) and err.get("code") == "RUN_STOPPED":
-        return TensorCostRunStoppedError.from_proxy_detail(
-            err, request_id=resp.headers.get("x-tc-request-id")
+    request_id = resp.headers.get("x-tc-request-id")
+    if parsed is not None or resp.status_code == 403:
+        return refusal_error(
+            parsed,
+            status=resp.status_code,
+            request_id=request_id,
+            retry_after_header=resp.headers.get("retry-after"),
         )
-    return None
+    message = body.get("message") if isinstance(body, dict) else None
+    return TensorCostRefusedError(
+        f"tensorcost: admission check returned {resp.status_code}"
+        + (f" ({message})" if isinstance(message, str) and message else "")
+        + "; the call was not sent",
+        status=resp.status_code,
+        request_id=request_id,
+    )

@@ -139,6 +139,15 @@ export interface Observation {
    * landing in `ai.ai_spend_events.feature`.
    */
   feature?: string;
+  /**
+   * Routing-policy application scope from `wrap({ application })`. Lands in
+   * `ai.ai_spend_events.application` (the server buckets unset ones under
+   * `sdk:tier2`) and lets an application-scoped route collect evidence
+   * from observe/govern traffic, not only proxied calls.
+   */
+  application?: string;
+  /** Routing-policy request tags from `wrap({ tags })`, same use as `application`. */
+  tags?: string[];
   /** Compliance frameworks applied on this call (audit stamp). */
   compliance_frameworks?: string[];
   /** In-process DLP outcome: none | redacted | refused. */
@@ -280,7 +289,12 @@ export interface WrapOptions {
    * sidecar proxy where direct-provider access is not available.
    *
    * When false, proxy 5xx errors surface as `TensorCostProxyError` with
-   * no automatic fallback.
+   * no automatic fallback, and (since 1.4.1) a govern-layer /admit outage
+   * refuses the call instead of letting it through.
+   *
+   * Whatever this is set to, only outages fall back: network errors,
+   * timeouts, 5xx, and a 429 with no refusal body. A TensorCost refusal or
+   * a provider's relayed 4xx never does.
    *
    * The fallback requires that the customer's provider SDK client has its
    * original credentials intact (pre-wrap). If the client credentials are

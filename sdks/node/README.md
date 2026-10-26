@@ -2,7 +2,7 @@
 
 One-line wrapper for TensorCost — fire-and-forget LLM observability and optional inference control for OpenAI, Anthropic, AWS Bedrock, and Google Vertex AI clients in Node.js.
 
-**Current version:** 1.3.0 — period budgets + agent-run span linking (upgrade from 1.2.x if you use daily/monthly caps or Router · Agent runs). See [CHANGELOG](./CHANGELOG.md), [SDK compliance](https://github.com/vaadhlabs/tensorcost/blob/main/docs/features/sdk-compliance.md), and [Migrating from 0.x](#migrating-from-0x).
+**Current version:** 1.4.1 — fixes 1.4.0 routing around a money budget's hard cap when fail-open was on (the default); upgrade. See [CHANGELOG](./CHANGELOG.md), [SDK compliance](https://github.com/vaadhlabs/tensorcost/blob/main/docs/features/sdk-compliance.md), and [Migrating from 0.x](#migrating-from-0x).
 
 ## Install
 
@@ -109,7 +109,7 @@ At `govern` and above, the SDK calls `POST /api/inference-proxy/v1/admit` with m
 - **204** + `x-tc-decision: layer=govern; action=allow` → proceed to the provider
 - **403** + `x-tc-decision: layer=govern; action=refuse; reason=…` → call blocked (budget, model governance, etc.)
 
-Admit is **fail-open** on transport errors: the provider call proceeds and an `admit_unavailable` observation is emitted when transport recovers. The admit HTTP call is capped at **500ms**.
+Admit is **fail-open** on outages only (network error, timeout, 5xx, or a 429 with no refusal body), and only while `failOpenEnabled` is on: the provider call proceeds and an `admit_unavailable` observation is emitted. Any other non-2xx refuses the call with a typed `TensorCostRefusedError`. The admit HTTP call is capped at **500ms**.
 
 ### Compliance profiles (1.2.0+)
 
@@ -283,12 +283,18 @@ import {
   TensorCostProxyError,
   TensorCostQuotaError,
   TensorCostProviderError,
+  TensorCostRefusedError, // base of every refusal below; unknown codes arrive as this
+  TensorCostBudgetHardCapError,
   TensorCostRunBudgetExceededError,
   TensorCostPeriodBudgetExceededError,
   TensorCostModelGovernanceDeniedError,
   TensorCostGuardrailHardStopError,
 } from "@tensorcost/sdk";
 ```
+
+`TensorCostBudgetHardCapError` carries `budgetId`, `reason`, `retryable` (true for
+`reason: "spend_not_known_yet"`, a budget whose spend hasn't been counted yet) and
+`retryAfterSeconds`. The SDK doesn't retry it for you.
 
 Govern refusals and proxy decisions are also reflected in the `x-tc-decision` header and attached to observations as `decision_action` / `decision_reason` metadata when present.
 
@@ -373,13 +379,14 @@ an agent link still attributes by `agentId` / `workflowId` alone.
 
 ## Fail-open guarantee
 
-If TensorCost is slow, down, or misconfigured, your customer call still succeeds. Internal errors are swallowed and logged via `console.warn` (or your lifecycle hook). Exceptions:
+If TensorCost is slow or down, your customer call still succeeds. Internal errors are swallowed and logged via `console.warn` (or your lifecycle hook).
+
+Since 1.4.1 "down" is an allow-list: a call goes around TensorCost only on a network error, a timeout, a 5xx, or a 429 without a refusal body, and only with `failOpenEnabled` on. Everything else is an answer and reaches your code:
 
 - Missing `TENSORCOST_API_KEY` → `MissingConfigError` at `wrap()` time
 - Missing `proxyUrl` when `maxLayer` is `steer` or `route` → `TensorCostConfigError` at `wrap()` time
-- Govern **refusals** (403 from `/admit`) → call blocked by design
-- Steer **run-budget** refusals → not fail-opened
-- Steer **period-budget** refusals (`PERIOD_BUDGET_EXCEEDED`) → not fail-opened
+- Any TensorCost refusal (budget, hard cap, run stop, governance, guardrail, compliance, or a code this SDK version doesn't know) → a `TensorCostRefusedError` subclass, never retried, never fail-opened
+- A provider's own 4xx relayed by the proxy → `TensorCostProviderError` with the provider's `status` and `body`
 
 ### Duplicate spend (honest)
 
@@ -432,7 +439,7 @@ Proxied requests include `x-tc-sdk-version`, `x-tc-sdk-capabilities`, and `x-tc-
 | Provider | Package | Layers | Operations |
 |---|---|---|---|
 | OpenAI | `openai` ≥ 4.x | observe → route | chat, completions, embeddings, responses |
-| Anthropic | `@anthropic-ai/sdk` | observe → route | messages |
+| Anthropic | `@anthropic-ai/sdk` | observe, govern (steer/route run as govern, 1.4.1) | messages |
 | Azure OpenAI | `openai` (`AzureOpenAI`) | observe → route | same as OpenAI (`provider: "openai"`) |
 | AWS Bedrock | `@aws-sdk/client-bedrock-runtime` | observe, govern only | InvokeModel, Converse (token placeholders) |
 | Google Vertex | `@google/genai` (`vertexai: true`) | observe, govern only | generateContent (token placeholders) |

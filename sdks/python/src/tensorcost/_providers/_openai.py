@@ -38,7 +38,7 @@ from .._applied_mode import (
 )
 from .._circuit import CircuitBreaker
 from .._decision import decision_metadata
-from .._errors import TensorCostProviderError, TensorCostProxyError
+from .._errors import TensorCostProxyError, TensorCostRefusedError
 from .._layer import (
     PROXY_HEADERS_TIMEOUT_S,
     ControlLayer,
@@ -90,6 +90,8 @@ def _post_obs(
     feature: str | None = None,
     agent_id: str | None = None,
     workflow_id: str | None = None,
+    application: Optional[str] = None,
+    tags: Optional[list] = None,
 ) -> None:
     obs: dict = {
         "sdk_version": _SDK_VERSION,
@@ -112,6 +114,11 @@ def _post_obs(
         **({"feature": feature} if feature is not None else {}),
         **({"agent_id": agent_id} if agent_id is not None else {}),
         **({"workflow_id": workflow_id} if workflow_id is not None else {}),
+        # Routing-policy scope from wrap(application=, tags=). The server reads
+        # both off the observation (ObservationDto); before 1.4.1 they only rode
+        # on proxied calls as x-tc-application / x-tc-tags.
+        **({"application": application} if application else {}),
+        **({"tags": list(tags)} if tags else {}),
     }
     try:
         transport.post(obs)
@@ -180,9 +187,15 @@ def _wrap_method(
 
         decision_meta: Optional[dict[str, Any]] = None
         if effective_layer == "govern" and operation == "chat.completions":
+            from .._proxy_client import should_fall_back_to_provider
+
             try:
                 bearer_token = transport.get_token()
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                # Same rule as the proxy path: go around TensorCost only when
+                # it is unavailable, and only with fail_open_enabled.
+                if not (fail_open_enabled and should_fall_back_to_provider(exc)):
+                    raise
                 bearer_token = None
             if bearer_token is None:
                 allowed, decision_header = True, None
@@ -207,10 +220,12 @@ def _wrap_method(
                         **({"team_id": team_id} if team_id else {}),
                     },
                     transport=transport,
-                    fail_open=True,
+                    fail_open=fail_open_enabled,
                 )
             if not allowed:
-                raise TensorCostProviderError(
+                # admit_request raises every refusal typed by its code; this
+                # is only a guard. It used to be a TensorCostProviderError.
+                raise TensorCostRefusedError(
                     "tensorcost: request refused at govern layer",
                     status=403,
                     attempt=1,
@@ -347,6 +362,7 @@ def _wrap_method(
                         "error", f"{type(tc_err).__name__}: {tc_err}",
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                        application=application, tags=tags,
                     )
                     raise tc_err
 
@@ -372,6 +388,7 @@ def _wrap_method(
                         output_tokens, "success", None,
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                        application=application, tags=tags,
                     )
                     return direct_response
                 except Exception as exc:
@@ -381,6 +398,7 @@ def _wrap_method(
                         "error", f"{type(exc).__name__}: {exc}",
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                        application=application, tags=tags,
                     )
                     raise
 
@@ -395,6 +413,7 @@ def _wrap_method(
                 output_tokens, "success", None,
                 customer=eff_customer, feature=eff_feature,
                 agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                application=application, tags=tags,
             )
             return proxy_result
 
@@ -408,6 +427,7 @@ def _wrap_method(
                 "error", f"{type(exc).__name__}: {exc}",
                 customer=eff_customer, feature=eff_feature,
                 agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                application=application, tags=tags,
             )
             raise
 
@@ -418,6 +438,7 @@ def _wrap_method(
             output_tokens, "success", None,
             customer=eff_customer, feature=eff_feature,
             agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+            application=application, tags=tags,
         )
         return response
 

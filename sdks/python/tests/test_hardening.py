@@ -256,36 +256,61 @@ class TestOpenAIHardeningViaWrap:
 # ---------------------------------------------------------------------------
 
 
+def _admit_answering(status: int, body: Any = None):
+    """side_effect for admit_request: the real client against a canned answer."""
+    import httpx
+
+    import tensorcost._admit_client as admit_mod
+
+    real = admit_mod.admit_request
+
+    def handler(_request: Any) -> Any:
+        return httpx.Response(status, json=body) if body is not None else httpx.Response(status)
+
+    def call(**kw: Any) -> Any:
+        return real(**kw, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    return call
+
+
 class TestAnthropicHardeningViaWrap:
-    def test_proxy_success_returns_response(self):
-        client = _make_anthropic_client()
-        expected = _anthropic_proxy_response()
+    """1.4.1: Anthropic is pinned to govern, so 'hardening' here is the
+    /admit path: allow → direct call, outage → fail-open per the flag."""
 
-        wrap(
-            client,
-            api_key="k",
-            base_url="https://api.tensorcost.com",
-            applied_mode=True,
-            proxy_url="https://proxy.example.com",
-        )
-        _stub_token(client)
-        try:
-            with patch("tensorcost._providers._anthropic.proxy_request") as mock:
-                mock.return_value = (expected, None)
-                result = client.messages.create(
-                    model="claude-3-5-sonnet-20241022", max_tokens=10, messages=[]
-                )
-            assert result == expected
-        finally:
-            client._tensorcost_transport.close()
-
-    def test_fail_open_routes_direct_when_proxy_fails(self):
+    def test_pinned_admit_allow_calls_anthropic_not_the_proxy(self):
         client = _make_anthropic_client()
         direct_sentinel = client.messages.create.return_value
 
         wrap(
             client,
             api_key="k",
+            tenant_id="t-1",
+            base_url="https://api.tensorcost.com",
+            applied_mode=True,
+            proxy_url="https://proxy.example.com",
+        )
+        _stub_token(client)
+        try:
+            with patch("tensorcost._providers._anthropic.proxy_request") as proxy, patch(
+                "tensorcost._providers._anthropic.admit_request",
+                side_effect=_admit_answering(204),
+            ):
+                result = client.messages.create(
+                    model="claude-3-5-sonnet-20241022", max_tokens=10, messages=[]
+                )
+            assert result is direct_sentinel
+            proxy.assert_not_called()
+        finally:
+            client._tensorcost_transport.close()
+
+    def test_fail_open_routes_direct_when_tensorcost_is_down(self):
+        client = _make_anthropic_client()
+        direct_sentinel = client.messages.create.return_value
+
+        wrap(
+            client,
+            api_key="k",
+            tenant_id="t-1",
             base_url="https://api.tensorcost.com",
             applied_mode=True,
             proxy_url="https://proxy.example.com",
@@ -293,8 +318,10 @@ class TestAnthropicHardeningViaWrap:
         )
         _stub_token(client)
         try:
-            with patch("tensorcost._providers._anthropic.proxy_request") as mock:
-                mock.side_effect = TensorCostProxyError("proxy down", attempt=1)
+            with patch(
+                "tensorcost._providers._anthropic.admit_request",
+                side_effect=_admit_answering(503, {}),
+            ):
                 result = client.messages.create(
                     model="claude-3-5-sonnet-20241022", max_tokens=10, messages=[]
                 )
@@ -302,12 +329,14 @@ class TestAnthropicHardeningViaWrap:
         finally:
             client._tensorcost_transport.close()
 
-    def test_fail_open_disabled_raises_on_proxy_failure(self):
+    def test_fail_open_disabled_raises_when_tensorcost_is_down(self):
         client = _make_anthropic_client()
+        direct = client.messages.create
 
         wrap(
             client,
             api_key="k",
+            tenant_id="t-1",
             base_url="https://api.tensorcost.com",
             applied_mode=True,
             proxy_url="https://proxy.example.com",
@@ -315,11 +344,14 @@ class TestAnthropicHardeningViaWrap:
         )
         _stub_token(client)
         try:
-            with patch("tensorcost._providers._anthropic.proxy_request") as mock:
-                mock.side_effect = TensorCostProxyError("proxy down", attempt=1)
+            with patch(
+                "tensorcost._providers._anthropic.admit_request",
+                side_effect=_admit_answering(503, {}),
+            ):
                 with pytest.raises(TensorCostProxyError):
                     client.messages.create(
                         model="claude-3-5-sonnet-20241022", max_tokens=10, messages=[]
                     )
+            direct.assert_not_called()
         finally:
             client._tensorcost_transport.close()

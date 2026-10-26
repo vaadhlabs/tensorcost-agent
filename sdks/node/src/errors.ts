@@ -8,11 +8,23 @@
  * Hierarchy:
  *
  *   TensorCostError (base)
- *   ├── TensorCostNetworkError    couldn't reach the proxy at all
- *   ├── TensorCostTimeoutError    request or idle window exceeded limit
- *   ├── TensorCostProxyError      proxy responded with 5xx
- *   ├── TensorCostQuotaError      proxy responded with 429
- *   └── TensorCostProviderError   proxy forwarded an upstream provider error
+ *   ├── TensorCostNetworkError    couldn't reach the proxy at all          ┐
+ *   ├── TensorCostTimeoutError    request or idle window exceeded limit    │ outages: the only
+ *   ├── TensorCostProxyError      proxy responded with 5xx                 │ errors that may fall
+ *   ├── TensorCostQuotaError      proxy 429, or 402 plan ceiling           ┘ back to the provider
+ *   ├── TensorCostProviderError   proxy relayed an upstream provider 4xx
+ *   └── TensorCostRefusedError    TensorCost refused the call (terminal)
+ *       ├── TensorCostRunBudgetExceededError
+ *       ├── TensorCostRunStoppedError
+ *       ├── TensorCostPeriodBudgetExceededError
+ *       │   └── TensorCostBudgetHardCapError
+ *       ├── TensorCostModelGovernanceDeniedError
+ *       ├── TensorCostGuardrailHardStopError
+ *       ├── TensorCostComplianceDeniedError
+ *       └── TensorCostComplianceTeamMismatchError
+ *
+ * A refusal code this SDK version doesn't model still arrives as a plain
+ * TensorCostRefusedError with its `code`, `reason` and message intact.
  *
  * All subclasses carry:
  *   - `rootCause`   the underlying Error, if any (avoids clash with ES2022 Error.cause)
@@ -88,7 +100,9 @@ export class TensorCostProxyError extends TensorCostError {
 }
 
 /**
- * The proxy returned 429 Too Many Requests.
+ * The proxy returned 429 Too Many Requests (TensorCost's own rate limit),
+ * or 402 with no refusal body (the plan's monthly proxy-request ceiling;
+ * `status` says which). Neither carries a refusal, so both may fall back.
  * `retryAfterMs` is set when the response included a `Retry-After` header.
  */
 export class TensorCostQuotaError extends TensorCostError {
@@ -105,13 +119,52 @@ export class TensorCostQuotaError extends TensorCostError {
 }
 
 /**
- * The proxy successfully reached the upstream provider, but the provider
- * itself returned an error (4xx/5xx from OpenAI, Anthropic, etc.). The
- * proxy's response still carries the provider's status in `status`.
+ * The proxy reached the upstream provider and relayed the provider's own
+ * 4xx (OpenAI 400 invalid request, Anthropic 401, and so on). `status` is
+ * the provider's status and `body` is what the provider sent, parsed as
+ * JSON when it was JSON. Never falls back: the provider would only answer
+ * the same way again.
  */
 export class TensorCostProviderError extends TensorCostError {
-  constructor(message: string, opts: TensorCostErrorOptions = {}) {
+  readonly body: unknown;
+
+  constructor(message: string, opts: TensorCostErrorOptions & { body?: unknown } = {}) {
     super(message, opts);
+    this.body = opts.body ?? null;
+  }
+}
+
+/**
+ * TensorCost answered and the answer is no: a budget, a stop, a policy.
+ *
+ * Every refusal is terminal. It never retries and never falls back to the
+ * provider, because the proxy that sent it is healthy and the refusal is
+ * the product. `code` is the server's refusal code (null when the server
+ * refused without naming one), `reason` its optional sub-reason, and
+ * `detail` the refusal object as the server sent it.
+ *
+ * Subclasses cover the codes this SDK version models. Anything else, a
+ * code added on the server after this release included, is thrown as this
+ * class directly so it is still terminal.
+ */
+export class TensorCostRefusedError extends TensorCostError {
+  readonly code: string | null;
+  readonly reason: string | null;
+  readonly detail: Record<string, unknown> | null;
+
+  constructor(
+    message: string,
+    refusal: {
+      code?: string | null;
+      reason?: string | null;
+      detail?: Record<string, unknown> | null;
+    } = {},
+    opts: TensorCostErrorOptions = {},
+  ) {
+    super(message, opts);
+    this.code = refusal.code ?? null;
+    this.reason = refusal.reason ?? null;
+    this.detail = refusal.detail ?? null;
   }
 }
 
@@ -127,17 +180,18 @@ export class TensorCostProviderError extends TensorCostError {
  * anyway, bill the customer, and reduce the cap to a suggestion.
  *
  * See `shouldFallBackToProvider()` in proxy-client.ts, which is the single
- * predicate every provider wrapper consults before falling back.
+ * predicate every provider wrapper consults before falling back. Since
+ * 1.4.1 it is an allow-list of outages, so a refusal can't slip past it.
  */
-export class TensorCostRunBudgetExceededError extends TensorCostError {
+export class TensorCostRunBudgetExceededError extends TensorCostRefusedError {
   constructor(
     message: string,
     readonly workflowId: string | null,
     readonly capCents: number | null,
     readonly spentCents: number | null,
-    opts: TensorCostErrorOptions = {},
+    opts: TensorCostErrorOptions & { detail?: Record<string, unknown> | null } = {},
   ) {
-    super(message, opts);
+    super(message, { code: "RUN_BUDGET_EXCEEDED", detail: opts.detail ?? null }, opts);
   }
 }
 
@@ -149,7 +203,7 @@ export class TensorCostRunBudgetExceededError extends TensorCostError {
  * from a healthy proxy, so falling back to the provider would simply undo
  * it. Carries the who / when / why the proxy recorded.
  */
-export class TensorCostRunStoppedError extends TensorCostError {
+export class TensorCostRunStoppedError extends TensorCostRefusedError {
   /**
    * Build the error from the proxy's 403 `error` object. Shared by the
    * chat-completions client and the govern-layer admit client, which both
@@ -168,15 +222,14 @@ export class TensorCostRunStoppedError extends TensorCostError {
         stoppedAt: str(detail?.["stopped_at"]),
         reason: str(detail?.["reason"]),
       },
-      opts,
+      { ...opts, detail: detail ?? null },
     );
   }
 
-  readonly code = "RUN_STOPPED";
+  override readonly code = "RUN_STOPPED";
   readonly workflowId: string | null;
   readonly stoppedBy: string | null;
   readonly stoppedAt: string | null;
-  readonly reason: string | null;
 
   constructor(
     message: string,
@@ -186,13 +239,16 @@ export class TensorCostRunStoppedError extends TensorCostError {
       stoppedAt?: string | null;
       reason?: string | null;
     } = {},
-    opts: TensorCostErrorOptions = {},
+    opts: TensorCostErrorOptions & { detail?: Record<string, unknown> | null } = {},
   ) {
-    super(message, { ...opts, status: opts.status ?? 403 });
+    super(
+      message,
+      { code: "RUN_STOPPED", reason: detail.reason ?? null, detail: opts.detail ?? null },
+      { ...opts, status: opts.status ?? 403 },
+    );
     this.workflowId = detail.workflowId ?? null;
     this.stoppedBy = detail.stoppedBy ?? null;
     this.stoppedAt = detail.stoppedAt ?? null;
-    this.reason = detail.reason ?? null;
   }
 }
 
@@ -201,16 +257,97 @@ export class TensorCostRunStoppedError extends TensorCostError {
  * `code: "PERIOD_BUDGET_EXCEEDED"`). Terminal — must not fall back to the
  * provider or the cap becomes a suggestion.
  */
-export class TensorCostPeriodBudgetExceededError extends TensorCostError {
+export class TensorCostPeriodBudgetExceededError extends TensorCostRefusedError {
   constructor(
     message: string,
     readonly scope: string | null,
     readonly period: string | null,
     readonly capCents: number | null,
     readonly spentCents: number | null,
+    opts: TensorCostErrorOptions & {
+      code?: string | null;
+      reason?: string | null;
+      detail?: Record<string, unknown> | null;
+    } = {},
+  ) {
+    super(
+      message,
+      {
+        code: opts.code ?? "PERIOD_BUDGET_EXCEEDED",
+        reason: opts.reason ?? null,
+        detail: opts.detail ?? null,
+      },
+      opts,
+    );
+  }
+}
+
+/**
+ * A money budget's hard cap refused the call (HTTP 403).
+ *
+ * The server sends `error.code: "PERIOD_BUDGET_EXCEEDED"` with
+ * `error.budget_code: "BUDGET_HARD_CAP"` (that code is what made 1.4.0
+ * treat it as terminal), and older servers sent `error.code:
+ * "BUDGET_HARD_CAP"`. Both map here. `code` keeps whichever the server
+ * sent; `budgetCode` is always "BUDGET_HARD_CAP".
+ *
+ * It extends TensorCostPeriodBudgetExceededError because 1.4.0 already
+ * raised that class for the current wire shape, so an existing `catch` for
+ * it keeps working, and scope / period / capCents / spentCents are filled
+ * the same way.
+ *
+ * `reason: "spend_not_known_yet"` (with `retryable: true` on the wire)
+ * means the budget hasn't been counted yet, usually for a few seconds after
+ * it is created or its scope changes, so the cap holds calls until the
+ * first count lands. That case is `retryable`, and `retryAfterSeconds`
+ * comes from the Retry-After header or the body's `retry_after_seconds`.
+ * The SDK does not retry on its own.
+ */
+export class TensorCostBudgetHardCapError extends TensorCostPeriodBudgetExceededError {
+  readonly budgetCode = "BUDGET_HARD_CAP";
+  readonly budgetId: string | null;
+  readonly budgetName: string | null;
+  readonly burnPct: number | null;
+  readonly retryable: boolean;
+  readonly retryAfterSeconds: number | null;
+
+  constructor(
+    message: string,
+    fields: {
+      code?: string | null;
+      budgetId?: string | null;
+      budgetName?: string | null;
+      burnPct?: number | null;
+      scope?: string | null;
+      period?: string | null;
+      capCents?: number | null;
+      spentCents?: number | null;
+      reason?: string | null;
+      retryable?: boolean | null;
+      retryAfterSeconds?: number | null;
+      detail?: Record<string, unknown> | null;
+    } = {},
     opts: TensorCostErrorOptions = {},
   ) {
-    super(message, opts);
+    super(
+      message,
+      fields.scope ?? null,
+      fields.period ?? null,
+      fields.capCents ?? null,
+      fields.spentCents ?? null,
+      {
+        ...opts,
+        status: opts.status ?? 403,
+        code: fields.code ?? "BUDGET_HARD_CAP",
+        reason: fields.reason ?? null,
+        detail: fields.detail ?? null,
+      },
+    );
+    this.budgetId = fields.budgetId ?? null;
+    this.budgetName = fields.budgetName ?? null;
+    this.burnPct = fields.burnPct ?? null;
+    this.retryable = fields.retryable === true || this.reason === "spend_not_known_yet";
+    this.retryAfterSeconds = fields.retryAfterSeconds ?? null;
   }
 }
 
@@ -219,15 +356,15 @@ export class TensorCostPeriodBudgetExceededError extends TensorCostError {
  * `code: "MODEL_GOVERNANCE_DENIED"`). Terminal — must not fall back to the
  * provider, or Enforce would become a suggestion.
  */
-export class TensorCostModelGovernanceDeniedError extends TensorCostError {
+export class TensorCostModelGovernanceDeniedError extends TensorCostRefusedError {
   constructor(
     message: string,
     readonly provider: string | null,
     readonly model: string | null,
     readonly governanceStatus: string | null,
-    opts: TensorCostErrorOptions = {},
+    opts: TensorCostErrorOptions & { detail?: Record<string, unknown> | null } = {},
   ) {
-    super(message, opts);
+    super(message, { code: "MODEL_GOVERNANCE_DENIED", detail: opts.detail ?? null }, opts);
   }
 }
 
@@ -236,30 +373,48 @@ export class TensorCostModelGovernanceDeniedError extends TensorCostError {
  * `code: "GUARDRAIL_HARD_STOP"`). Terminal — same fail-closed contract as
  * run-budget and model governance denials.
  */
-export class TensorCostGuardrailHardStopError extends TensorCostError {
+export class TensorCostGuardrailHardStopError extends TensorCostRefusedError {
   constructor(
     message: string,
     readonly policyId: string | null,
-    opts: TensorCostErrorOptions = {},
+    opts: TensorCostErrorOptions & {
+      reason?: string | null;
+      detail?: Record<string, unknown> | null;
+    } = {},
   ) {
-    super(message, opts);
+    super(
+      message,
+      { code: "GUARDRAIL_HARD_STOP", reason: opts.reason ?? null, detail: opts.detail ?? null },
+      opts,
+    );
   }
 }
 
 /** Compliance policy refused this call (metadata or in-process DLP). */
-export class TensorCostComplianceDeniedError extends TensorCostError {
+export class TensorCostComplianceDeniedError extends TensorCostRefusedError {
   constructor(
     message: string,
-    readonly reason: string | null,
-    opts: TensorCostErrorOptions = {},
+    reason: string | null,
+    opts: TensorCostErrorOptions & { detail?: Record<string, unknown> | null } = {},
   ) {
-    super(message, { ...opts, status: opts.status ?? 403 });
+    super(
+      message,
+      { code: "COMPLIANCE_DENIED", reason, detail: opts.detail ?? null },
+      { ...opts, status: opts.status ?? 403 },
+    );
   }
 }
 
 /** Client team_id does not match token-bound team scope. */
-export class TensorCostComplianceTeamMismatchError extends TensorCostError {
-  constructor(message: string, opts: TensorCostErrorOptions = {}) {
-    super(message, { ...opts, status: opts.status ?? 403 });
+export class TensorCostComplianceTeamMismatchError extends TensorCostRefusedError {
+  constructor(
+    message: string,
+    opts: TensorCostErrorOptions & { detail?: Record<string, unknown> | null } = {},
+  ) {
+    super(
+      message,
+      { code: "COMPLIANCE_TEAM_MISMATCH", detail: opts.detail ?? null },
+      { ...opts, status: opts.status ?? 403 },
+    );
   }
 }
