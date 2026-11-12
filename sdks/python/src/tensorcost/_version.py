@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SDK_VERSION = "tensorcost-python/1.5.1"
+SDK_VERSION = "tensorcost-python/1.6.0"
 
 # Advertise only capabilities this build implements (non-streaming v1).
 SDK_CAPABILITIES: tuple[str, ...] = ("refusal-v1",)

@@ -1,18 +1,19 @@
-"""``application`` / ``tags`` on observations — held back in 1.5.0.
+"""``application`` / ``tags`` on observations — sent since 1.6.0.
 
-The server's ObservationDto reads both, but byoc-v0.1.40 (what design
-partners run) validates observations with ``forbidNonWhitelisted`` and has
-neither field, so an observation carrying them is rejected with a 400 and
-dropped. The fields are built here and sent only when ``SEND`` is True,
-which a later release turns on alongside the server release that accepts them.
+The server's ObservationDto reads both and the spend event takes the
+application, so calls an SDK makes directly are attributed to the
+application they were wrapped with (1.5.x held them back and every such
+call landed as "sdk:tier2"). byoc-v0.1.40 validates observations with
+``forbidNonWhitelisted`` and has neither field, so it rejects them: an
+install on that server must upgrade with 1.6.0.
 """
 
 from __future__ import annotations
 
 from typing import Any, Iterable, Optional
 
-#: Internal. Off in 1.5.0; tests flip it to pin the later behaviour.
-SEND = False
+#: Internal. On since 1.6.0; tests may flip it.
+SEND = True
 
 
 def observation_scope(application: Optional[str], tags: Optional[Iterable[str]]) -> dict[str, Any]:

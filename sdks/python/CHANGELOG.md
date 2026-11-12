@@ -3,6 +3,19 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 1.6.0 — 2026-11-12
+
+**Observations carry the application and tags you wrap with.** 1.5.x held
+`application` and `tags` back from the observations it posts for calls
+made directly (observe and govern), so every such call landed in the
+console as application "sdk:tier2" and per-application chargeback of SDK
+traffic didn't work. 1.6.0 sends them, the way proxied calls already
+carried them as `x-tc-application` / `x-tc-tags`.
+
+**Upgrade the server with it if you run BYOC.** byoc-v0.1.40 validates
+observations strictly and has neither field, so it rejects an
+observation that carries them; current TensorCost servers accept both.
+
 ## 1.5.1 — 2026-11-12
 
 **Azure OpenAI calls are reported as Azure OpenAI.** `AzureOpenAI` / `AsyncAzureOpenAI` is a

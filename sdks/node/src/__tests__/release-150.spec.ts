@@ -33,7 +33,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   globalThis.fetch = savedFetch;
-  overheadTest.setObservationScope(false);
+  overheadTest.setObservationScope(true);
   if (savedTenant === undefined) delete process.env.TENSORCOST_TENANT_ID;
   else process.env.TENSORCOST_TENANT_ID = savedTenant;
   warn.mockRestore();
@@ -177,7 +177,7 @@ describe("Bedrock and Vertex at govern warn that nothing is enforced", () => {
   });
 });
 
-describe("observations: application and tags are held back in 1.5.0", () => {
+describe("observations: application and tags are sent (1.6.0)", () => {
   const run = async () => {
     const calls = stubApi();
     const client = openaiFake();
@@ -193,17 +193,17 @@ describe("observations: application and tags are held back in 1.5.0", () => {
     return calls.filter((c) => c.url.includes("/observation")).map((c) => c.body as Record<string, unknown>);
   };
 
-  it("are not sent by default (byoc-v0.1.40 rejects them with a 400)", async () => {
+  it("are sent by default, so direct calls are attributed to their application", async () => {
     const obs = await run();
     expect(obs).toHaveLength(1);
-    expect(obs[0]).not.toHaveProperty("application");
-    expect(obs[0]).not.toHaveProperty("tags");
+    expect(obs[0]).toMatchObject({ application: "checkout", tags: ["team=pay", "tier=gold"] });
   });
 
-  it("are sent when the internal flag is on (a later release)", async () => {
-    overheadTest.setObservationScope(true);
+  it("are held back when the internal flag is off (what 1.5.x did)", async () => {
+    overheadTest.setObservationScope(false);
     const obs = await run();
-    expect(obs[0]).toMatchObject({ application: "checkout", tags: ["team=pay", "tier=gold"] });
+    expect(obs[0]).not.toHaveProperty("application");
+    expect(obs[0]).not.toHaveProperty("tags");
   });
 });
 

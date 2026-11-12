@@ -538,13 +538,18 @@ def test_lowercase_provider_code_in_a_403_is_not_a_refusal(tensorcost_api, recor
 
 
 # ---------------------------------------------------------------------------
-# Observations: application and tags are held back in 1.5.0 (byoc-v0.1.40
-# rejects them), behind _observation_scope.SEND.
+# Observations: application and tags are sent since 1.6.0, behind
+# _observation_scope.SEND (1.5.x held them back).
 
 
 @pytest.fixture
 def scope_on(monkeypatch):
     monkeypatch.setattr("tensorcost._observation_scope.SEND", True)
+
+
+@pytest.fixture
+def scope_off(monkeypatch):
+    monkeypatch.setattr("tensorcost._observation_scope.SEND", False)
 
 
 def _openai_obs(recording_transport):
@@ -563,9 +568,15 @@ def _openai_obs(recording_transport):
     return recording_transport.observations
 
 
-def test_observations_hold_back_application_and_tags_by_default(recording_transport):
+def test_observations_carry_application_and_tags_by_default(recording_transport):
     obs = _openai_obs(recording_transport)
     assert len(obs) == 1
+    assert obs[0]["application"] == "checkout"
+    assert obs[0]["tags"] == ["team=pay", "tier=gold"]
+
+
+def test_observations_hold_them_back_with_the_flag_off(recording_transport, scope_off):
+    obs = _openai_obs(recording_transport)
     assert "application" not in obs[0]
     assert "tags" not in obs[0]
 
