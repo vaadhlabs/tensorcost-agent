@@ -2,7 +2,7 @@
 
 One-line wrapper for [TensorCost](https://tensorcost.com). Adds fire-and-forget cost observability and optional inference control to OpenAI, Anthropic, AWS Bedrock, and Google Vertex AI clients without changing how your code calls the underlying provider.
 
-**Current version:** 1.5.0 — fixes 1.4.0 routing around a money budget's hard cap when fail-open was on (the default); upgrade. See [CHANGELOG](./CHANGELOG.md), [SDK compliance](https://github.com/vaadhlabs/tensorcost/blob/main/docs/features/sdk-compliance.md), and [Migrating from 0.x](#migrating-from-0x).
+**Current version:** 1.5.1 — Azure OpenAI calls are reported as Azure OpenAI, not OpenAI. 1.5.0 fixed 1.4.0 routing around a money budget's hard cap when fail-open was on (the default); upgrade from 1.4.x. See [CHANGELOG](./CHANGELOG.md), [SDK compliance](https://github.com/vaadhlabs/tensorcost/blob/main/docs/features/sdk-compliance.md), and [Migrating from 0.x](#migrating-from-0x).
 
 ## Install
 

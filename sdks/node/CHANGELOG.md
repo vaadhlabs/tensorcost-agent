@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.1 — 2026-11-12
 
 **Azure OpenAI calls are reported as Azure OpenAI.** `AzureOpenAI` is a
 subclass of `OpenAI`, so 1.5.0 and earlier reported its calls with

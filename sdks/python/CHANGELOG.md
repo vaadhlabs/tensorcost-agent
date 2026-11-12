@@ -3,7 +3,7 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 1.5.1 — 2026-11-12
 
 **Azure OpenAI calls are reported as Azure OpenAI.** `AzureOpenAI` / `AsyncAzureOpenAI` is a
 subclass of `OpenAI`, so 1.5.0 and earlier reported its calls with

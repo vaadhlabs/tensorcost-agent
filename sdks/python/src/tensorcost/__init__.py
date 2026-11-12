@@ -51,7 +51,7 @@ from ._telemetry import (
 )
 from ._retry import RetryConfig
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 __all__ = [
     "wrap",
     "prewarm",
