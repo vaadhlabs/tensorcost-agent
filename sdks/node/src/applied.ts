@@ -79,10 +79,34 @@ function readApiKey(client: Record<string, unknown>): string | null {
  * Detection: Azure clients have an `azure` property set to true, OR
  * their baseURL contains `.openai.azure.com`.
  */
+/** Hosts Azure serves OpenAI models from: classic, AI Services and AI Foundry. */
+const AZURE_OPENAI_HOSTS = [".openai.azure.com", ".cognitiveservices.azure.com", ".services.ai.azure.com"];
+
 function isAzureOpenAI(client: Record<string, unknown>): boolean {
   if (client["azure"] === true) return true;
-  const url = readBaseUrl(client) ?? "";
-  return url.includes(".openai.azure.com");
+  const ctor = (client as { constructor?: { name?: unknown } }).constructor;
+  if (ctor && ctor.name === "AzureOpenAI") return true;
+  const url = (readBaseUrl(client) ?? "").toLowerCase();
+  let host = "";
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    host = url;
+  }
+  return AZURE_OPENAI_HOSTS.some((h) => host.endsWith(h) || host.includes(h));
+}
+
+/**
+ * The provider an OpenAI-shaped client really calls. An AzureOpenAI client
+ * is an OpenAI subclass, so the wrapper used to report its calls as
+ * "openai": Azure spend landed under OpenAI, a provider-scoped budget on
+ * azure_openai never saw it, and it couldn't be paired with the Azure bill
+ * line for the same call. Observations and the govern check now say
+ * azure_openai; the proxy route is unchanged.
+ */
+export function openAiProviderFor(client: unknown): "openai" | "azure_openai" {
+  const c = (client && typeof client === "object" ? client : {}) as Record<string, unknown>;
+  return isAzureOpenAI(c) ? "azure_openai" : "openai";
 }
 
 /**

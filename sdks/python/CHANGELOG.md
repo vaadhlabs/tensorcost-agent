@@ -3,6 +3,19 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+**Azure OpenAI calls are reported as Azure OpenAI.** `AzureOpenAI` / `AsyncAzureOpenAI` is a
+subclass of `OpenAI`, so 1.5.0 and earlier reported its calls with
+provider `openai`. Azure spend then landed under OpenAI in the console, a
+budget scoped to Azure OpenAI never counted it, and it couldn't be paired
+with the Azure bill line for the same call. Observations and the govern
+check now say `azure_openai` for a client on `*.openai.azure.com`,
+`*.cognitiveservices.azure.com` or `*.services.ai.azure.com`, or of the
+`AzureOpenAI` / `AsyncAzureOpenAI` class. The proxy request and the `on_fallback` lifecycle
+event keep `openai`. Servers have accepted `azure_openai` since before
+byoc-v0.1.40.
+
 ## 1.5.0 — 2026-10-26
 
 **1.4.0 could route around a hard spend cap when fail-open was on (the

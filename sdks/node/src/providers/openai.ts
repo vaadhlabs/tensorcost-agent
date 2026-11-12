@@ -37,7 +37,7 @@ import {
   TensorCostRefusedError,
 } from "../errors.js";
 import { TensorCostConfigError } from "../config.js";
-import { providerTarget } from "../applied.js";
+import { openAiProviderFor, providerTarget } from "../applied.js";
 import { providerNativeError } from "../provider-errors.js";
 import type { CircuitBreaker } from "../circuit.js";
 import { emitEvent } from "../telemetry.js";
@@ -158,6 +158,9 @@ function wrapMethod(
     perCallParentSpanId?: string;
   },
 ): (...args: any[]) => any {
+  // azure_openai for an AzureOpenAI client: on observations and the govern
+  // check. The proxy request keeps "openai", which picks the proxy's route.
+  const providerName = openAiProviderFor(opts.clientRef);
   const wrapped = async function (this: unknown, ...args: any[]) {
     const overhead = new WrapOverhead();
     const requestAt = nowIso();
@@ -228,7 +231,7 @@ function wrapMethod(
             bearerToken,
             maxLayer: effectiveLayer,
             metadata: {
-              provider: "openai",
+              provider: providerName,
               model: String(model),
               operation: opts.operation,
               correlation_id: correlationId,
@@ -434,7 +437,7 @@ function wrapMethod(
                 );
           const obs: Observation = {
             sdk_version: SDK_VERSION,
-            provider: "openai",
+            provider: providerName,
             model: String(model),
             operation: opts.operation,
             request_at: requestAt,
@@ -476,7 +479,7 @@ function wrapMethod(
           const { input, output } = extractUsage(directResponse);
           const obs: Observation = {
             sdk_version: SDK_VERSION,
-            provider: "openai",
+            provider: providerName,
             model: String(model),
             operation: opts.operation,
             request_at: requestAt,
@@ -501,7 +504,7 @@ function wrapMethod(
         } catch (directErr) {
           const obs: Observation = {
             sdk_version: SDK_VERSION,
-            provider: "openai",
+            provider: providerName,
             model: String(model),
             operation: opts.operation,
             request_at: requestAt,
@@ -547,7 +550,7 @@ function wrapMethod(
         typeof usageRaw?.completion_tokens === "number" ? usageRaw.completion_tokens : null;
       const obs: Observation = {
         sdk_version: SDK_VERSION,
-        provider: "openai",
+        provider: providerName,
         model: String(model),
         operation: opts.operation,
         request_at: requestAt,
@@ -579,7 +582,7 @@ function wrapMethod(
       const { input, output } = extractUsage(response);
       const obs: Observation = {
         sdk_version: SDK_VERSION,
-        provider: "openai",
+        provider: providerName,
         model: String(model),
         operation: opts.operation,
         request_at: requestAt,
@@ -604,7 +607,7 @@ function wrapMethod(
     } catch (err) {
       const obs: Observation = {
         sdk_version: SDK_VERSION,
-        provider: "openai",
+        provider: providerName,
         model: String(model),
         operation: opts.operation,
         request_at: requestAt,

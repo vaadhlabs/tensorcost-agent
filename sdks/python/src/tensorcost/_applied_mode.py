@@ -102,6 +102,34 @@ def openai_provider_base_url(client: Any) -> str:
     return "https://api.openai.com"
 
 
+# Hosts Azure serves OpenAI models from: classic, AI Services and AI Foundry.
+_AZURE_OPENAI_HOSTS = (".openai.azure.com", ".cognitiveservices.azure.com", ".services.ai.azure.com")
+
+
+def openai_provider_for(client: Any) -> str:
+    """``"azure_openai"`` for an Azure OpenAI client, else ``"openai"``.
+
+    ``openai.AzureOpenAI`` subclasses ``openai.OpenAI``, so the wrapper used
+    to report its calls as ``"openai"``: Azure spend landed under OpenAI, a
+    budget scoped to azure_openai never saw it, and it couldn't be paired
+    with the Azure bill line for the same call. Observations and the govern
+    check use this; the proxy route is unchanged.
+    """
+    if client is None:
+        return "openai"
+    if type(client).__name__ in ("AzureOpenAI", "AsyncAzureOpenAI"):
+        return "azure_openai"
+    base = getattr(client, "base_url", None)
+    url = str(base).lower() if base is not None else ""
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(url).hostname or url
+    except Exception:  # pragma: no cover - defensive
+        host = url
+    return "azure_openai" if any(host.endswith(h) or h in host for h in _AZURE_OPENAI_HOSTS) else "openai"
+
+
 def anthropic_provider_auth(client: Any) -> str:
     """Extract the x-api-key value for an Anthropic client.
 

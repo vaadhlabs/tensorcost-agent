@@ -35,6 +35,7 @@ from .._attribution import resolve_scope_field
 from .._applied_mode import (
     openai_provider_auth,
     openai_provider_base_url,
+    openai_provider_for,
 )
 from .._circuit import CircuitBreaker
 from .._decision import decision_metadata
@@ -94,10 +95,11 @@ def _post_obs(
     workflow_id: str | None = None,
     application: Optional[str] = None,
     tags: Optional[list] = None,
+    provider: str = "openai",
 ) -> None:
     obs: dict = {
         "sdk_version": _SDK_VERSION,
-        "provider": "openai",
+        "provider": provider,
         "model": model,
         "operation": operation,
         "request_at": request_at,
@@ -154,6 +156,10 @@ def _wrap_method(
     workflow_id: Optional[str] = None,
     team_id: Optional[str] = None,
 ) -> Any:
+    # azure_openai for an AzureOpenAI client: on observations and the govern
+    # check. The proxy request keeps "openai", which picks the proxy's route.
+    provider_name = openai_provider_for(client_ref)
+
     @functools.wraps(bound_method)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         eff_agent_id = resolve_scope_field(client_ref, "agent_id", agent_id)
@@ -205,7 +211,7 @@ def _wrap_method(
                     bearer_token=bearer_token,
                     max_layer=effective_layer,
                     metadata={
-                        "provider": "openai",
+                        "provider": provider_name,
                         "model": str(model),
                         "operation": operation,
                         "correlation_id": correlation_id,
@@ -369,6 +375,7 @@ def _wrap_method(
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
                         application=application, tags=tags,
+                        provider=provider_name,
                     )
                     raise tc_err
 
@@ -395,6 +402,7 @@ def _wrap_method(
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
                         application=application, tags=tags,
+                        provider=provider_name,
                     )
                     return direct_response
                 except Exception as exc:
@@ -405,6 +413,7 @@ def _wrap_method(
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
                         application=application, tags=tags,
+                        provider=provider_name,
                     )
                     raise
 
@@ -420,6 +429,7 @@ def _wrap_method(
                 customer=eff_customer, feature=eff_feature,
                 agent_id=eff_agent_id, workflow_id=eff_workflow_id,
                 application=application, tags=tags,
+                provider=provider_name,
             )
             return proxy_result
 
@@ -434,6 +444,7 @@ def _wrap_method(
                 customer=eff_customer, feature=eff_feature,
                 agent_id=eff_agent_id, workflow_id=eff_workflow_id,
                 application=application, tags=tags,
+                provider=provider_name,
             )
             raise
 
@@ -445,6 +456,7 @@ def _wrap_method(
             customer=eff_customer, feature=eff_feature,
             agent_id=eff_agent_id, workflow_id=eff_workflow_id,
             application=application, tags=tags,
+            provider=provider_name,
         )
         return response
 

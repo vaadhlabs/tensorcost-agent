@@ -12,7 +12,7 @@ import type { ControlLayer, DataGrant } from "./layer.js";
 
 export type { ControlLayer, DataGrant } from "./layer.js";
 
-export type Provider = "openai" | "anthropic" | "bedrock" | "vertex";
+export type Provider = "openai" | "azure_openai" | "anthropic" | "bedrock" | "vertex";
 
 export type Operation =
   | "chat.completions"
