@@ -630,7 +630,7 @@ def test_wrap_without_tenant_id_raises_at_govern_and_above(fresh_warnings, layer
         wrap(client, api_key="k", max_layer=layer, proxy_url="https://proxy.test")
     msg = str(info.value)
     assert "TENSORCOST_TENANT_ID" in msg and "tenant_id" in msg
-    assert "Developers › SDK setup" in msg
+    assert "Connect › SDK setup" in msg
 
 
 def test_wrap_without_tenant_id_raises_even_with_fail_open_off(fresh_warnings):

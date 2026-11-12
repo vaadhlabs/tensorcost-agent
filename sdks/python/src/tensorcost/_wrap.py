@@ -41,7 +41,7 @@ def _no_tenant_error(layer: str) -> MissingConfigError:
         f"TensorCost max_layer '{layer}' needs your tenant id, and none is set, so the SDK "
         "could never check a call: stops, caps and budgets would not be enforced. Pass "
         "tenant_id=... to wrap() or set TENSORCOST_TENANT_ID. The console shows it under "
-        "Developers › SDK setup, in the TENSORCOST_TENANT_ID line of the env block."
+        "Connect › SDK setup, in the TENSORCOST_TENANT_ID line of the env block."
     )
 
 def _steer_route_error(provider: str, max_layer: str) -> MissingConfigError:
@@ -122,7 +122,7 @@ def wrap(
             "no-tenant",
             "tensorcost: no tenant id is set (tenant_id or TENSORCOST_TENANT_ID), so the SDK "
             "can't get a token and no observations reach TensorCost. Calls are not affected. "
-            "The console shows the id under Developers › SDK setup.",
+            "The console shows the id under Connect › SDK setup.",
         )
 
     # Bedrock and Vertex have no /admit check yet: govern is accepted but only

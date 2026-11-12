@@ -58,7 +58,7 @@ function noTenantError(layer: string): MissingConfigError {
     `TensorCost maxLayer '${layer}' needs your tenant id, and none is set, so the SDK ` +
       "could never check a call: stops, caps and budgets would not be enforced. Pass " +
       "{ tenantId } to wrap() or set TENSORCOST_TENANT_ID. The console shows it under " +
-      "Developers › SDK setup, in the TENSORCOST_TENANT_ID line of the env block.",
+      "Connect › SDK setup, in the TENSORCOST_TENANT_ID line of the env block.",
   );
 }
 
@@ -85,7 +85,7 @@ export function wrap<T>(client: T, options: WrapOptions = {}): T {
       "no-tenant",
       "tensorcost: no tenant id is set (tenantId or TENSORCOST_TENANT_ID), so the SDK " +
         "can't get a token and no observations reach TensorCost. Calls are not affected. " +
-        "The console shows the id under Developers › SDK setup.",
+        "The console shows the id under Connect › SDK setup.",
     );
   }
 
