@@ -126,7 +126,7 @@ describe("the tenant id is required at govern and above", () => {
     const msg = (err as Error).message;
     expect(msg).toContain("TENSORCOST_TENANT_ID");
     expect(msg).toContain("tenantId");
-    expect(msg).toContain("Developers › SDK setup");
+    expect(msg).toContain("Connect › SDK setup");
   });
 
   it("failOpenEnabled doesn't change that", () => {
