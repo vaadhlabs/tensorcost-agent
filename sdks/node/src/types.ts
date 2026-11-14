@@ -140,6 +140,12 @@ export interface Observation {
    */
   feature?: string;
   /**
+   * The account the provider billed the call under, read off the provider's
+   * response (billing-account.ts). Only on calls the SDK made itself; the
+   * proxy labels the calls it makes. Absent when the response didn't say.
+   */
+  billing_account?: string;
+  /**
    * Routing-policy application scope from `wrap({ application })`. Lands in
    * `ai.ai_spend_events.application` (the server buckets unset ones under
    * `sdk:tier2`) and lets an application-scoped route collect evidence

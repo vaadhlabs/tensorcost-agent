@@ -49,6 +49,12 @@ import type { SdkLayerClient } from "../sdk-layer.js";
 import { decisionMetadata } from "../decision.js";
 import { SDK_VERSION } from "../version.js";
 import {
+  billingAccountField,
+  billingAccountOfApiPromise,
+  billingAccountOfError,
+  clientBaseUrl,
+} from "../billing-account.js";
+import {
   WrapOverhead,
   observationScope,
   postObservation,
@@ -473,10 +479,12 @@ function wrapMethod(
         });
 
         try {
+          let directCall: unknown;
           const directResponse = await withAwaitExcluded(overhead, () =>
-            bound.apply(this, args),
+            (directCall = bound.apply(this, args)),
           );
           const { input, output } = extractUsage(directResponse);
+          const billingAccount = await billingAccountOfApiPromise(directCall, clientBaseUrl(opts.clientRef));
           const obs: Observation = {
             sdk_version: SDK_VERSION,
             provider: providerName,
@@ -497,6 +505,7 @@ function wrapMethod(
             ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
             ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
             ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
+            ...billingAccountField(billingAccount),
             ...decisionSpread,
           };
           postObservation(opts.transport, overhead, stampObservation(obs));
@@ -522,6 +531,7 @@ function wrapMethod(
             ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
             ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
             ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
+            ...billingAccountField(billingAccountOfError(directErr, clientBaseUrl(opts.clientRef))),
             ...decisionSpread,
           };
           postObservation(opts.transport, overhead, stampObservation(obs));
@@ -576,10 +586,12 @@ function wrapMethod(
 
     // Observe / govern direct path (or legacy completions.create).
     try {
+      let call: unknown;
       const response = await withAwaitExcluded(overhead, () =>
-        bound.apply(this, args),
+        (call = bound.apply(this, args)),
       );
       const { input, output } = extractUsage(response);
+      const billingAccount = await billingAccountOfApiPromise(call, clientBaseUrl(opts.clientRef));
       const obs: Observation = {
         sdk_version: SDK_VERSION,
         provider: providerName,
@@ -600,6 +612,7 @@ function wrapMethod(
         ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
         ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
         ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
+        ...billingAccountField(billingAccount),
         ...decisionSpread,
       };
       postObservation(opts.transport, overhead, stampObservation(obs));
@@ -625,6 +638,7 @@ function wrapMethod(
         ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
         ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
         ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
+        ...billingAccountField(billingAccountOfError(err, clientBaseUrl(opts.clientRef))),
         ...decisionSpread,
       };
       postObservation(opts.transport, overhead, stampObservation(obs));

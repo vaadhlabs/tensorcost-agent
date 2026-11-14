@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.7.0 — 2026-11-14
+
+**Observations name the account the provider billed the call under.**
+TensorCost can price a settled day's calls at what the provider actually
+billed for them, discounts included, but only for a provider-day where
+every metered call says which billing account it went to. The proxy
+already labels the calls it makes; calls the SDK made itself arrived
+without a label, so any day with SDK traffic stayed at the metered price.
+1.7.0 sends `billing_account` on every observation for a call the SDK made
+directly (observe, govern, and the fail-open fallback), in the format the
+provider's own records use:
+
+- Anthropic: the `anthropic-organization-id` response header.
+- OpenAI: the `openai-organization` response header (the org, not the
+  project).
+- Azure OpenAI: the resource, the endpoint host's first label, lower-cased.
+- Vertex (`@google/genai`): the project in the URL the client sends to.
+  Express mode (an API key) has no project and sends no field.
+- Bedrock: the 12-digit account of the credentials that signed the call,
+  when the AWS SDK knows it (`AWS_ACCOUNT_ID`, `aws_account_id` in the
+  shared config, SSO, assumed roles). There is no STS call; plain access
+  keys without an account send no field.
+
+The headers come from `asResponse()` on the promise the openai /
+`@anthropic-ai/sdk` client returned, which hands back the response the call
+already got: no extra request, and the caller's result is the same object.
+Error observations carry it too when the provider answered (the APIError
+keeps its headers), and streams are labelled at stream start. A missing or
+unreadable header leaves the field out; it never fails the call. A client
+pointed at a host that isn't the provider's (a gateway) sends no field,
+matching how the server reads the same headers. Calls the proxy made carry
+no field from the SDK; the proxy labels those itself.
+
+Servers since 2026-10-25 (the ones 1.6.0 needs) drop an observation field
+they don't know instead of rejecting the observation, so an older server
+loses only this field.
+
+**The missing-tenant error points at the right page.** `wrap()` without a
+tenant id said the console shows it under "Developers › SDK setup"; the
+page is Connect › SDK setup.
+
 ## 1.6.0 — 2026-11-12
 
 **Observations carry the application and tags you wrap with.** 1.5.x held

@@ -11,6 +11,7 @@ import type { Observation, Operation } from "../types.js";
 import type { ObservationTransport } from "../transport.js";
 
 import { SDK_VERSION } from "../version.js";
+import { billingAccountField, billingAccountOfCall, vertexCallUrl } from "../billing-account.js";
 import { resolveModelCallLink } from "../trace-link.js";
 import {
   WrapOverhead,
@@ -86,6 +87,8 @@ function wrapMethod(
     feature: string | null;
     application?: string | null;
     tags?: string[];
+    /** The GoogleGenAI client, for the project its calls are billed to. */
+    clientRef?: unknown;
   },
 ): (...args: unknown[]) => unknown {
   const wrapped = async (...args: unknown[]) => {
@@ -116,6 +119,8 @@ function wrapMethod(
       ...(opts.customer !== null ? { customer: opts.customer } : {}),
       ...(opts.feature !== null ? { feature: opts.feature } : {}),
       ...observationScope(opts.application, opts.tags),
+      // The project is in the URL the client sends the call to.
+      ...billingAccountField(billingAccountOfCall(vertexCallUrl(opts.clientRef), null)),
       ...metaSpread,
     };
 
@@ -209,6 +214,7 @@ export function install(
       feature,
       application: scope.application ?? null,
       tags: scope.tags ?? [],
+      clientRef: client,
     });
   }
 }
