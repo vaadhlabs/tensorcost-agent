@@ -40,7 +40,6 @@ dev = [
 Homepage = "https://tensorcost.com"
 Documentation = "https://docs.tensorcost.com"
 Source = "https://github.com/vaadhlabs/tensorcost-agent/tree/main/sdks/python"
-Changelog = "https://github.com/vaadhlabs/tensorcost-agent/blob/main/sdks/python/CHANGELOG.md"
 "Bug Tracker" = "https://github.com/vaadhlabs/tensorcost-agent/issues"
 
 [tool.hatch.build.targets.wheel]
