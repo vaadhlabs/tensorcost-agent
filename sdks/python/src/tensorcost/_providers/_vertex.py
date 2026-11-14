@@ -36,6 +36,7 @@ from .._models import Observation
 from .._transport import ObservationTransport
 from .._observation_scope import observation_scope
 from .._version import SDK_VERSION as _SDK_VERSION
+from .. import _billing_account as _ba
 
 _APPLIED_MODE_ERROR = (
     "TensorCost applied mode is not supported for Google Vertex AI clients. "
@@ -91,6 +92,7 @@ def _post_obs(
     workflow_id: Optional[str] = None,
     application: Optional[str] = None,
     tags: Optional[list] = None,
+    billing_account: Optional[str] = None,
 ) -> None:
     obs: Observation = {
         "sdk_version": _SDK_VERSION,
@@ -114,6 +116,7 @@ def _post_obs(
         # Routing-policy scope from wrap(application=, tags=); empty while
         # _observation_scope.SEND is off (1.5.0), see that module.
         **observation_scope(application, tags),
+        **_ba.field(billing_account),
     }
     try:
         transport.post(obs)
@@ -137,6 +140,7 @@ def _wrap_method(
     workflow_id: Optional[str] = None,
     application: Optional[str] = None,
     tags: Optional[list] = None,
+    client_ref: Any = None,
 ) -> Any:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         request_at = _now_iso()
@@ -153,6 +157,7 @@ def _wrap_method(
                 customer=customer, feature=feature,
                 agent_id=agent_id, workflow_id=workflow_id,
                 application=application, tags=tags,
+                billing_account=_ba.billing_account_of_call(_ba.vertex_call_url(client_ref), None),
             )
             raise
 
@@ -165,6 +170,7 @@ def _wrap_method(
                 customer=customer, feature=feature,
                 agent_id=agent_id, workflow_id=workflow_id,
                 application=application, tags=tags,
+                billing_account=_ba.billing_account_of_call(_ba.vertex_call_url(client_ref), None),
             )
             return response
 
@@ -178,6 +184,7 @@ def _wrap_method(
             customer=customer, feature=feature,
             agent_id=agent_id, workflow_id=workflow_id,
             application=application, tags=tags,
+            billing_account=_ba.billing_account_of_call(_ba.vertex_call_url(client_ref), None),
         )
         return response
 
@@ -243,5 +250,6 @@ def install(
                 workflow_id=workflow_id,
                 application=application,
                 tags=tags,
+                client_ref=client,
             ),
         )

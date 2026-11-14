@@ -46,6 +46,7 @@ import type { Observation, Operation } from "../types.js";
 import type { ObservationTransport } from "../transport.js";
 
 import { SDK_VERSION } from "../version.js";
+import { bedrockAccountOfContext, billingAccountField } from "../billing-account.js";
 import { resolveModelCallLink } from "../trace-link.js";
 import {
   WrapOverhead,
@@ -337,6 +338,7 @@ export function install(
         errorMessage = `${(err as Error).name}: ${(err as Error).message}`;
         postObservation(transport, overhead, {
           ...commonFields,
+          ...billingAccountField(bedrockAccountOfContext(context)),
           response_at: nowIso(),
           input_tokens: null,
           output_tokens: null,
@@ -348,6 +350,7 @@ export function install(
       }
       postObservation(transport, overhead, {
         ...commonFields,
+        ...billingAccountField(bedrockAccountOfContext(context)),
         response_at: nowIso(),
         input_tokens: null,
         output_tokens: null,
@@ -376,6 +379,7 @@ export function install(
 
       postObservation(transport, overhead, {
         ...commonFields,
+        ...billingAccountField(bedrockAccountOfContext(context)),
         response_at: nowIso(),
         input_tokens: input,
         output_tokens: output,
@@ -387,6 +391,7 @@ export function install(
     } catch (err) {
       postObservation(transport, overhead, {
         ...commonFields,
+        ...billingAccountField(bedrockAccountOfContext(context)),
         response_at: nowIso(),
         input_tokens: null,
         output_tokens: null,

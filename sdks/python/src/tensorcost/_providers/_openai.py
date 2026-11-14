@@ -55,6 +55,7 @@ from .._transport import ObservationTransport
 from .._observation_scope import observation_scope
 from .._provider_errors import provider_native_error
 from .._version import SDK_VERSION as _SDK_VERSION
+from .. import _billing_account as _ba
 _log = logging.getLogger("tensorcost")
 
 
@@ -95,6 +96,7 @@ def _post_obs(
     workflow_id: str | None = None,
     application: Optional[str] = None,
     tags: Optional[list] = None,
+    billing_account: Optional[str] = None,
     provider: str = "openai",
 ) -> None:
     obs: dict = {
@@ -121,6 +123,8 @@ def _post_obs(
         # Routing-policy scope from wrap(application=, tags=); empty while
         # _observation_scope.SEND is off (1.5.0), see that module.
         **observation_scope(application, tags),
+        # Only on calls the SDK made itself; the proxy labels its own.
+        **_ba.field(billing_account),
     }
     try:
         transport.post(obs)
@@ -392,8 +396,10 @@ def _wrap_method(
                         consecutive_failures=circuit.failures if circuit else 0,
                     ),
                 )
+                _cap = _ba.Capture()
                 try:
-                    direct_response = bound_method(*args, **kwargs)
+                    with _ba.capturing(_cap):
+                        direct_response = bound_method(*args, **kwargs)
                     input_tokens, output_tokens = _extract_usage(direct_response)
                     _post_obs(
                         transport, str(model), operation, tenant_id, environment,
@@ -402,6 +408,7 @@ def _wrap_method(
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
                         application=application, tags=tags,
+                        billing_account=_ba.account_of_http_call(client_ref, _cap),
                         provider=provider_name,
                     )
                     return direct_response
@@ -413,6 +420,7 @@ def _wrap_method(
                         customer=eff_customer, feature=eff_feature,
                         agent_id=eff_agent_id, workflow_id=eff_workflow_id,
                         application=application, tags=tags,
+                        billing_account=_ba.account_of_http_call(client_ref, _cap, exc),
                         provider=provider_name,
                     )
                     raise
@@ -434,8 +442,10 @@ def _wrap_method(
             return proxy_result
 
         # Observe-only path (applied_mode=False or non-chat operation).
+        _cap = _ba.Capture()
         try:
-            response = bound_method(*args, **kwargs)
+            with _ba.capturing(_cap):
+                response = bound_method(*args, **kwargs)
         except Exception as exc:
             _post_obs(
                 transport, str(model), operation, tenant_id, environment,
@@ -444,6 +454,7 @@ def _wrap_method(
                 customer=eff_customer, feature=eff_feature,
                 agent_id=eff_agent_id, workflow_id=eff_workflow_id,
                 application=application, tags=tags,
+                billing_account=_ba.account_of_http_call(client_ref, _cap, exc),
                 provider=provider_name,
             )
             raise
@@ -456,6 +467,7 @@ def _wrap_method(
             customer=eff_customer, feature=eff_feature,
             agent_id=eff_agent_id, workflow_id=eff_workflow_id,
             application=application, tags=tags,
+            billing_account=_ba.account_of_http_call(client_ref, _cap),
             provider=provider_name,
         )
         return response
@@ -551,3 +563,5 @@ def install(
                 agent_id=agent_id,
                 workflow_id=workflow_id,
             )
+    # Response headers for billing_account (_billing_account.py).
+    _ba.install_response_hook(client)
