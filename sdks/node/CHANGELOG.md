@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased
+
+Fixes from the 1.7.0 run against a self-hosted install (openai 7.62.0,
+@anthropic-ai/sdk 1.12.0).
+
+**Route mode works with a default `new OpenAI()` client.** The SDK sent the
+client's base URL, `https://api.openai.com/v1`, as `x-tc-provider-url`. The
+proxy appends `/v1/...` itself, so every call asked for `/v1/v1/...` and
+came back 404. The SDK now drops a trailing API version (`/v1`, `/v2`) the
+way the Python SDK always has: `https://api.openai.com`, and Azure's
+`/openai/v1` becomes `/openai`; deployment paths are untouched. A 4xx with
+no error body that carries `x-tc-decision` is now
+`TensorCostProxyStatusError`, which says the proxy or the provider behind it
+answered. It used to be `TensorCostGatewayRejectedError`, which blamed a
+firewall in front of TensorCost. That class is kept for 4xx answers without
+the header.
+
+**`create()` returns an APIPromise again.** The wrapper replaced
+`chat.completions.create` and `messages.create` with an async function, so
+`.withResponse()`, `.asResponse()` and `._thenUnwrap()` threw, and with
+them the provider SDKs' own helpers built on those (Anthropic's
+`messages.stream()`, openai's `chat.completions.parse()`). In observe mode,
+once the published layer is known (normally from the warmup `wrap()`
+starts), the call is made in the same tick and you get the client's own
+APIPromise back. When TensorCost has to answer first (govern's admission
+check, route's proxy, or the first calls of a process before the layer is
+known) you get a `TensorCostAPIPromise` with the same methods; in route
+mode `withResponse()` gives the proxy's response, `x-tc-decision` included.
+Every way of reading the call records it once.
+
+**Streams are recorded with their tokens.** A streamed call used to be
+recorded when the stream started, with no usage. It is now recorded when the
+stream ends, with the usage it carried: the final chunk with
+`stream_options.include_usage` on OpenAI, `message_start` and
+`message_delta` on Anthropic, in observe, govern and route. The SDK watches
+the iterator you read from and never reads ahead of you. A stream you stop
+reading is recorded when you stop, with what it had. Bedrock and Vertex
+streams are unchanged (still recorded without tokens).
+
+**Circuit-breaker transitions are no longer sent as calls.** They were
+posted as observations, which the server stores as spend events, so an
+outage added 0-token "calls". They now go to `onLifecycleEvent` as
+`on_circuit_state` and are logged when the circuit opens or closes again.
+The same was true of a govern admission check that failed open: it posted
+an extra empty observation. Now the call's own observation carries
+`decision_reason: admit_unavailable`. And an open circuit now waits 5 s
+before probing the proxy again, instead of probing on the very next call,
+so a hung proxy no longer costs every call the proxy timeout.
+
+**TensorCost being down costs a call its stated budget, once.** With
+TensorCost unreachable every call waited out the 2 s token exchange twice,
+once for the published layer and once for the compliance snapshot. Now:
+only the first calls of a cold process wait for the published layer, at most
+250 ms in all, token included; after that the layer is refreshed in the
+background. The token exchange is bounded by the budget of whatever waits on
+it (500 ms for govern's admission check, the proxy's headers timeout in
+route mode), keeps running in the background to fill the cache, and after a
+failure calls are told at once for 5 s instead of waiting on another
+exchange. A token that is about to expire is refreshed in the background
+while the current one is still used.
+
 ## 1.7.0 — 2026-11-14
 
 **Observations name the account the provider billed the call under.**

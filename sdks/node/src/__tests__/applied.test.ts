@@ -187,9 +187,9 @@ describe("installAppliedMode leaves the client alone (1.5.0)", () => {
 });
 
 describe("providerTarget — what the proxy forwards to", () => {
-  it("OpenAI: the client's base URL and a Bearer key", () => {
+  it("OpenAI: the client's base URL without /v1 (the proxy appends it) and a Bearer key", () => {
     expect(providerTarget(fakeOpenAIClient(), "openai", "x")).toEqual({
-      providerUrl: "https://api.openai.com/v1",
+      providerUrl: "https://api.openai.com",
       providerAuth: "Bearer sk-test-key",
     });
   });

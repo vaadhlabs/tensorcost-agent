@@ -93,8 +93,16 @@ export interface CompiledComplianceSnapshot {
 }
 export const SDK_LAYER_CACHE_TTL_MS = 30_000;
 export const SDK_LAYER_DECAY_MS = 5 * 60_000;
-/** Cap on the blocking sdk-layer GET so a hung TensorCost cannot stall the agent. */
+/**
+ * The most a call waits for the published layer: only a cold process's
+ * first calls wait, token exchange included, so a hung TensorCost cannot
+ * stall the agent.
+ */
 export const SDK_LAYER_FETCH_TIMEOUT_MS = 250;
+/** Timeout of the GET itself, which runs in the background and fills the cache. */
+export const SDK_LAYER_REFRESH_TIMEOUT_MS = 2_000;
+/** After a failed refresh, how long before the next background attempt. */
+export const SDK_LAYER_RETRY_MS = 5_000;
 /** Govern admit must fail-open quickly; agents already wait on the model. */
 export const ADMIT_TIMEOUT_MS = 500;
 /** Steer proxy must send response headers quickly or fail-open to direct. */

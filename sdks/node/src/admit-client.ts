@@ -3,7 +3,8 @@
  *
  * Fail-open only on an outage: network error, timeout, 5xx, or a 429 / 402
  * with no refusal body. The customer's call then proceeds to the provider and
- * an `admit_unavailable` observation is emitted when transport is set.
+ * the result says `unavailable`, so the wrapper can mark that call's own
+ * observation `admit_unavailable`.
  *
  * Every other non-2xx is an answer, and the result carries it as
  * `refusal`, a TensorCostRefusedError subclass the wrapper throws as is:
@@ -22,6 +23,8 @@ import { SDK_VERSION, sdkCapabilityHeader } from "./version.js";
 import {
   TensorCostGatewayRejectedError,
   TensorCostKeyRejectedError,
+  TensorCostProxyStatusError,
+  unexplained4xx,
   TensorCostNetworkError,
   TensorCostProxyError,
   TensorCostQuotaError,
@@ -30,7 +33,6 @@ import {
 } from "./errors.js";
 import { retryAfterMs } from "./retry.js";
 import { decisionSaysRefuse, parseRefusalBody, refusalError } from "./refusal.js";
-import { observationScope } from "./wrap-overhead.js";
 
 export interface AdmitMetadata {
   provider: Provider;
@@ -53,6 +55,7 @@ export interface AdmitRequestOptions {
   bearerToken: string;
   maxLayer: ControlLayer;
   metadata: AdmitMetadata;
+  /** No longer read: the admit client doesn't post observations of its own. */
   transport?: ObservationTransport;
   failOpen?: boolean;
   timeoutMs?: number;
@@ -67,7 +70,19 @@ export interface AdmitResult {
    * TensorCostGatewayRejectedError when something in front of TensorCost
    * answered with a non-JSON 4xx.
    */
-  refusal?: TensorCostRefusedError | TensorCostGatewayRejectedError | TensorCostKeyRejectedError;
+  refusal?:
+    | TensorCostRefusedError
+    | TensorCostGatewayRejectedError
+    | TensorCostProxyStatusError
+    | TensorCostKeyRejectedError;
+  /**
+   * True when /admit could not be reached and the call was let through
+   * (fail-open). The wrapper marks the call's own observation with
+   * decision_reason "admit_unavailable". Through 1.7.0 the admit client
+   * posted a second, empty observation for this, which the server stored
+   * as a 0-token spend event: one phantom call per admit outage.
+   */
+  unavailable?: boolean;
 }
 
 export async function admitRequest(
@@ -153,8 +168,7 @@ export async function admitRequest(
     return { allowed: true, decisionHeader };
   } catch (err) {
     if (opts.failOpen !== false) {
-      postAdmitFailureObservation(opts, err as Error);
-      return { allowed: true, decisionHeader: null };
+      return { allowed: true, decisionHeader: null, unavailable: true };
     }
     throw err;
   } finally {
@@ -171,7 +185,11 @@ async function refusalFrom4xx(
   resp: Response,
   decisionHeader: string | null,
 ): Promise<
-  TensorCostRefusedError | TensorCostGatewayRejectedError | TensorCostKeyRejectedError | undefined
+  | TensorCostRefusedError
+  | TensorCostGatewayRejectedError
+  | TensorCostProxyStatusError
+  | TensorCostKeyRejectedError
+  | undefined
 > {
   const text = await resp.text().catch(() => "");
   const parsed = parseRefusalBody(text);
@@ -197,8 +215,9 @@ async function refusalFrom4xx(
   }
   if (body === undefined || body === null || typeof body !== "object") {
     if (decisionSaysRefuse(decisionHeader)) return refusalError(null, ctx);
-    // HTML or nothing: something in front of TensorCost said no.
-    return new TensorCostGatewayRejectedError(resp.status, text ? text.slice(0, 500) : null, {
+    // HTML or nothing: something in front of TensorCost said no, unless
+    // x-tc-decision says TensorCost itself answered.
+    return unexplained4xx(resp.status, decisionHeader, text ? text.slice(0, 500) : null, {
       requestId: ctx.requestId,
     });
   }
@@ -216,36 +235,4 @@ async function refusalFrom4xx(
     { code: null },
     { status: resp.status, requestId: ctx.requestId, attempt: 1 },
   );
-}
-
-function postAdmitFailureObservation(
-  opts: AdmitRequestOptions,
-  err: Error,
-): void {
-  if (!opts.transport) return;
-  try {
-    opts.transport.post({
-      sdk_version: SDK_VERSION,
-      provider: opts.metadata.provider,
-      model: opts.metadata.model,
-      operation: opts.metadata.operation,
-      request_at: new Date().toISOString(),
-      response_at: new Date().toISOString(),
-      input_tokens: null,
-      output_tokens: null,
-      cost_usd_cents: null,
-      status: "success",
-      error_message: null,
-      correlation_id: opts.metadata.correlation_id,
-      ...(opts.metadata.environment ? { environment: opts.metadata.environment } : {}),
-      ...(opts.metadata.connection_id ? { connection_id: opts.metadata.connection_id } : {}),
-      ...observationScope(opts.metadata.application, opts.metadata.tags),
-      metadata: {
-        decision_action: "allow",
-        decision_reason: "admit_unavailable",
-      },
-    });
-  } catch {
-    /* belt-and-suspenders */
-  }
 }

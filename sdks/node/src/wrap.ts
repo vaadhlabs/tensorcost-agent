@@ -20,8 +20,7 @@ import * as openaiProvider from "./providers/openai.js";
 import * as anthropicProvider from "./providers/anthropic.js";
 import * as bedrockProvider from "./providers/bedrock.js";
 import * as vertexProvider from "./providers/vertex.js";
-import { CircuitBreaker } from "./circuit.js";
-import { bindCircuitObservations } from "./circuit-observations.js";
+import { CircuitBreaker, reportCircuitTransitions } from "./circuit.js";
 import { layerRank, needsAdmit, needsProxyUrl } from "./layer.js";
 import { getSharedRuntime, warmupSharedRuntime } from "./runtime.js";
 import type { WrapOptions } from "./types.js";
@@ -122,13 +121,12 @@ export function wrap<T>(client: T, options: WrapOptions = {}): T {
     });
   }
 
-  const circuit = new CircuitBreaker(
+  // Bedrock and Vertex never route, so their breaker never moves.
+  const circuitProvider = provider === "anthropic" ? "anthropic" : "openai";
+  let circuit: CircuitBreaker | undefined;
+  circuit = new CircuitBreaker(
     undefined,
-    bindCircuitObservations(transport, {
-      provider,
-      tenantId: config.tenantId,
-      environment: config.environment,
-    }),
+    reportCircuitTransitions(circuitProvider, config.onLifecycleEvent, () => circuit),
   );
 
   const hardening = {

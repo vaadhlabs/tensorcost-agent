@@ -2,7 +2,7 @@
  * Tests for the circuit breaker state machine.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CircuitBreaker } from "../circuit.js";
 
 function makeCircuit(openThreshold = 3, closeThreshold = 5) {
@@ -127,5 +127,22 @@ describe("CircuitBreaker", () => {
       "OPEN->HALF_OPEN",
       "HALF_OPEN->CLOSED",
     ]);
+  });
+
+  it("with probeIntervalMs, stays OPEN (bypassing) until the interval has passed", () => {
+    vi.useFakeTimers();
+    try {
+      const cb = new CircuitBreaker({ openThreshold: 1, closeThreshold: 1, probeIntervalMs: 5_000 });
+      cb.recordFailure();
+      expect(cb.currentState).toBe("OPEN");
+      expect(cb.shouldProbe()).toBe(false);
+      expect(cb.shouldBypass()).toBe(true);
+      vi.advanceTimersByTime(5_000);
+      expect(cb.shouldProbe()).toBe(true);
+      cb.recordFailure(); // probe failed: OPEN again, and the interval restarts
+      expect(cb.shouldProbe()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
