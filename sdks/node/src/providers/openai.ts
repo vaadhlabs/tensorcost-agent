@@ -59,6 +59,8 @@ import {
   tapStream,
   responseIdField,
   responseIdOf,
+  responseModelField,
+  responseModelOf,
   type CallSource,
   type Usage,
 } from "../api-promise.js";
@@ -102,15 +104,16 @@ function extractUsage(response: unknown): Usage {
     return { input: null, output: null };
   }
   const responseId = responseIdOf(response);
+  const responseModel = responseModelOf(response);
   const usage = (response as Record<string, any>).usage;
   if (!usage || typeof usage !== "object") {
-    return { input: null, output: null, responseId };
+    return { input: null, output: null, responseId, responseModel };
   }
   const u = usage as Record<string, unknown>;
   const input = typeof u.prompt_tokens === "number" ? u.prompt_tokens : null;
   const output =
     typeof u.completion_tokens === "number" ? u.completion_tokens : null;
-  return { input, output, responseId };
+  return { input, output, responseId, responseModel };
 }
 
 /**
@@ -240,6 +243,9 @@ function wrapMethod(
       // The same call seen by the proxy, a gateway or a cost import is
       // matched to this row on it.
       ...responseIdField(o.usage?.responseId),
+      // The model the provider ran: for Azure the request's model is the
+      // deployment, and the server prices from this one.
+      ...responseModelField(o.usage?.responseModel),
       ...(o.decisionMeta !== undefined
         ? { metadata: { ...(meta ?? {}), ...o.decisionMeta } }
         : meta !== undefined
