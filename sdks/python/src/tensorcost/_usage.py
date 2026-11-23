@@ -13,6 +13,13 @@ The provider's id for the call rides along the same way (``id`` on a
 response or an openai chunk, ``message.id`` on anthropic's message_start).
 The server keys the same call seen by the SDK, the proxy, a gateway or a
 cost import on it (provider_response_id).
+
+So does the model the provider says it served (``model`` on a response or
+an openai chunk, ``message.model`` on anthropic's message_start), sent as
+``response_model``. An Azure OpenAI request names a deployment
+("support-bot"), which has no price; the server prices the call from the
+model behind it. A stream sends the last chunk that names one: Azure's
+first chunk (prompt filter results) names none.
 """
 
 from __future__ import annotations
@@ -24,10 +31,16 @@ from typing import Any, Callable, Iterator, Optional
 
 Usage = tuple[Optional[int], Optional[int]]
 FinishFn = Callable[[Optional[int], Optional[int], Optional[BaseException], Optional[str]], None]
+# With ``chunk_model``: finish(input, output, error, response_id, response_model).
+FinishWithModelFn = Callable[
+    [Optional[int], Optional[int], Optional[BaseException], Optional[str], Optional[str]], None
+]
 
 # ObservationDto.provider_response_id is @MaxLength(200), and the DTO refuses
 # the whole observation over a bad field, so a longer id is left off.
 MAX_RESPONSE_ID_LENGTH = 200
+# ObservationDto.response_model is @MaxLength(200) too.
+MAX_RESPONSE_MODEL_LENGTH = 200
 
 
 def _field(obj: Any, name: str) -> Any:
@@ -57,6 +70,27 @@ def response_id_field(rid: Optional[str]) -> dict[str, str]:
     """The observation's ``provider_response_id``, absent when there is none."""
     rid = response_id(rid)
     return {"provider_response_id": rid} if rid is not None else {}
+
+
+def response_model(value: Any) -> Optional[str]:
+    """``value`` as a model id the server will take, else None."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not 0 < len(value) <= MAX_RESPONSE_MODEL_LENGTH or "\x00" in value:
+        return None
+    return value
+
+
+def response_model_of(response: Any) -> Optional[str]:
+    """``response.model``: the model the provider ran the call on."""
+    return response_model(_field(response, "model"))
+
+
+def response_model_field(model: Optional[str]) -> dict[str, str]:
+    """The observation's ``response_model``, absent when there is none."""
+    model = response_model(model)
+    return {"response_model": model} if model is not None else {}
 
 
 def parsed_for_usage(response: Any) -> Any:
@@ -92,6 +126,16 @@ def openai_chunk_id(chunk: Any) -> Optional[str]:
     return response_id_of(chunk)
 
 
+def openai_chunk_model(chunk: Any) -> Optional[str]:
+    return response_model_of(chunk)
+
+
+def anthropic_event_model(event: Any) -> Optional[str]:
+    if _field(event, "type") != "message_start":
+        return None
+    return response_model_of(_field(event, "message"))
+
+
 def anthropic_event_id(event: Any) -> Optional[str]:
     if _field(event, "type") != "message_start":
         return None
@@ -119,9 +163,13 @@ def observe_stream(
     stream: Any,
     chunk_usage: Callable[[Any], Usage],
     chunk_id: Callable[[Any], Optional[str]],
-    finish: FinishFn,
+    finish: Any,
+    chunk_model: Optional[Callable[[Any], Optional[str]]] = None,
 ) -> Any:
     """Calls ``finish(input, output, error, response_id)`` once, when ``stream`` ends.
+
+    With ``chunk_model``, ``finish`` also gets the last model a chunk named
+    (FinishWithModelFn).
 
     Check ``can_observe_stream`` first. A provider SDK Stream is returned as
     itself (same type, still a context manager): its ``_iterator`` generator
@@ -129,7 +177,7 @@ def observe_stream(
     exhausted, raised, closed, or garbage-collected unread. A bare generator
     (the proxy's dict chunks, for clients we can't type) comes back wrapped.
     """
-    state: dict[str, Any] = {"in": None, "out": None, "id": None, "done": False}
+    state: dict[str, Any] = {"in": None, "out": None, "id": None, "model": None, "done": False}
     lock = threading.Lock()
 
     def done(error: Optional[BaseException] = None) -> None:
@@ -138,7 +186,10 @@ def observe_stream(
                 return
             state["done"] = True
         try:
-            finish(state["in"], state["out"], error, state["id"])
+            if chunk_model is None:
+                finish(state["in"], state["out"], error, state["id"])
+            else:
+                finish(state["in"], state["out"], error, state["id"], state["model"])
         except Exception:  # noqa: BLE001
             pass
 
@@ -153,6 +204,10 @@ def observe_stream(
                         state["out"] = o
                     if state["id"] is None:
                         state["id"] = chunk_id(item)
+                    if chunk_model is not None:
+                        m = chunk_model(item)
+                        if m is not None:
+                            state["model"] = m
                 except Exception:  # noqa: BLE001
                     pass
                 yield item

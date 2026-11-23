@@ -130,9 +130,10 @@ def route_stream_result(
     raw_stream: Any,
     chunk_usage: Callable[[Any], Any],
     chunk_id: Callable[[Any], Optional[str]],
-    finish: Callable[[Any, Any, Optional[BaseException], Optional[str]], None],
+    finish: Callable[..., None],
     args: tuple,
     kwargs: Mapping[str, Any],
+    chunk_model: Optional[Callable[[Any], Optional[str]]] = None,
 ) -> Any:
     """A streamed proxy answer as the SDK's own Stream, observed when it ends.
 
@@ -158,6 +159,9 @@ def route_stream_result(
     else:
         stream = raw_stream
     if can_observe_stream(stream):
-        return observe_stream(stream, chunk_usage, chunk_id, finish)
-    finish(None, None, None, None)
+        return observe_stream(stream, chunk_usage, chunk_id, finish, chunk_model)
+    if chunk_model is None:
+        finish(None, None, None, None)
+    else:
+        finish(None, None, None, None, None)
     return stream
