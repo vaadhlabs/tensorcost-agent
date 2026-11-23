@@ -15,12 +15,14 @@ telemetry hooks, and the fail-open circuit breaker.
 from __future__ import annotations
 
 import functools
+import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .._admit_client import admit_request
+from .._admit_client import ADMIT_UNAVAILABLE_METADATA, AdmitOutcome, admit_call
 from .._compliance_guard import (
     assert_team_scope,
     compliance_stamp_from,
@@ -38,9 +40,13 @@ from .._applied_mode import (
     openai_provider_for,
 )
 from .._circuit import CircuitBreaker
-from .._decision import decision_metadata
-from .._errors import TensorCostProxyError, TensorCostRefusedError
+from .._errors import TensorCostProxyError, TensorCostRefusedError, TensorCostTimeoutError
+from .._budget_signals import report_would_refuse
+from .._request_options import split_request_options
+from .._typed_response import UNTYPED, replay_through_client, route_stream_result
+from .._usage import can_observe_stream, observe_stream, openai_chunk_usage, parsed_for_usage
 from .._layer import (
+    ADMIT_TIMEOUT_S,
     PROXY_HEADERS_TIMEOUT_S,
     ControlLayer,
     code_layer_for_install,
@@ -49,14 +55,23 @@ from .._layer import (
 from .._models import Observation
 from .._proxy_client import proxy_request
 from .._retry import DEFAULT_RETRY_CONFIG, RetryConfig
-from .._sdk_layer import PassthroughSdkLayer, SdkLayerClient
+from .._sdk_layer import PassthroughSdkLayer, SdkLayerClient, resolve_layer
 from .._telemetry import LifecycleEventCallback, OnFallbackEvent, emit_event
-from .._transport import ObservationTransport
+from .._transport import ObservationTransport, get_token_within
 from .._observation_scope import observation_scope
 from .._provider_errors import provider_native_error
 from .._version import SDK_VERSION as _SDK_VERSION
 from .. import _billing_account as _ba
 _log = logging.getLogger("tensorcost")
+
+
+# Below this much of the admit budget left after the token exchange, the
+# POST isn't attempted: it could only time out.
+_MIN_ADMIT_S = 0.05
+
+
+def _create_of(client: Any) -> Any:
+    return client.chat.completions.create
 
 
 def _now_iso() -> str:
@@ -98,6 +113,7 @@ def _post_obs(
     tags: Optional[list] = None,
     billing_account: Optional[str] = None,
     provider: str = "openai",
+    metadata: Optional[dict] = None,
 ) -> None:
     obs: dict = {
         "sdk_version": _SDK_VERSION,
@@ -125,6 +141,8 @@ def _post_obs(
         **observation_scope(application, tags),
         # Only on calls the SDK made itself; the proxy labels its own.
         **_ba.field(billing_account),
+        # admit_unavailable: this call went ahead without an /admit answer.
+        **({"metadata": dict(metadata)} if metadata else {}),
     }
     try:
         transport.post(obs)
@@ -175,7 +193,7 @@ def _wrap_method(
         correlation_id = str(uuid.uuid4())
 
         layer_client = sdk_layer or PassthroughSdkLayer()
-        effective_layer = layer_client.effective_layer(max_layer)
+        effective_layer, layer_decayed = resolve_layer(layer_client, max_layer)
 
         compliance_stamp: dict[str, Any] = {}
         if operation == "chat.completions":
@@ -195,22 +213,32 @@ def _wrap_method(
             except Exception:
                 pass
 
-        decision_meta: Optional[dict[str, Any]] = None
+        # Set when the call goes ahead without an /admit answer; the call's
+        # own observation then says so and keeps its agent, team and usage.
+        obs_metadata: Optional[dict] = None
         if effective_layer == "govern" and operation == "chat.completions":
             from .._proxy_client import should_fall_back_to_provider
 
+            # Token exchange and /admit together get ADMIT_TIMEOUT_S.
+            admit_started = time.monotonic()
             try:
-                bearer_token = transport.get_token()
+                bearer_token: Optional[str] = get_token_within(transport, ADMIT_TIMEOUT_S)
             except Exception as exc:  # noqa: BLE001
                 # Same rule as the proxy path: go around TensorCost only when
                 # it is unavailable, and only with fail_open_enabled.
                 if not (fail_open_enabled and should_fall_back_to_provider(exc)):
                     raise
                 bearer_token = None
-            if bearer_token is None:
-                allowed, decision_header = True, None
+            remaining = ADMIT_TIMEOUT_S - (time.monotonic() - admit_started)
+            if bearer_token is None or remaining < _MIN_ADMIT_S:
+                if bearer_token is not None and not fail_open_enabled:
+                    raise TensorCostTimeoutError(
+                        f"tensorcost: admit budget ({ADMIT_TIMEOUT_S}s) spent on the token exchange",
+                        "total",
+                    )
+                outcome = AdmitOutcome(True, None, unavailable=True)
             else:
-                allowed, decision_header = admit_request(
+                outcome = admit_call(
                     base_url=base_url,
                     bearer_token=bearer_token,
                     max_layer=effective_layer,
@@ -229,248 +257,205 @@ def _wrap_method(
                         **({"tags": ",".join(tags)} if tags else {}),
                         **({"team_id": team_id} if team_id else {}),
                     },
-                    transport=transport,
                     fail_open=fail_open_enabled,
+                    timeout_s=remaining,
                 )
-            if not allowed:
-                # admit_request raises every refusal typed by its code; this
+            if not outcome.allowed:
+                # admit_call raises every refusal typed by its code; this
                 # is only a guard. It used to be a TensorCostProviderError.
                 raise TensorCostRefusedError(
                     "tensorcost: request refused at govern layer",
                     status=403,
                     attempt=1,
                 )
-            decision_meta = decision_metadata(decision_header)
+            if outcome.unavailable:
+                obs_metadata = dict(ADMIT_UNAVAILABLE_METADATA)
+            report_would_refuse(
+                on_lifecycle_event, outcome.would_refuse,
+                provider=provider_name, model=str(model), operation=operation,
+            )
 
-        if (
-            needs_proxy_url(effective_layer)
-            and proxy_url
-            and operation == "chat.completions"
-        ):
-            provider_url = openai_provider_base_url(client_ref) if client_ref else "https://api.openai.com"
-            provider_auth = openai_provider_auth(client_ref) if client_ref else ""
+        def post(
+            input_tokens: Optional[int],
+            output_tokens: Optional[int],
+            error: Optional[BaseException] = None,
+            billing_account: Optional[str] = None,
+        ) -> None:
+            _post_obs(
+                transport, str(model), operation, tenant_id, environment,
+                connection_id, correlation_id, request_at, input_tokens, output_tokens,
+                "error" if error is not None else "success",
+                f"{type(error).__name__}: {error}" if error is not None else None,
+                customer=eff_customer, feature=eff_feature,
+                agent_id=eff_agent_id, workflow_id=eff_workflow_id,
+                application=application, tags=tags,
+                billing_account=billing_account,
+                provider=provider_name,
+                metadata=obs_metadata,
+            )
 
-            body: dict[str, Any] = dict(kwargs)
-            body["model"] = str(model)
+        def fallback(reason: str) -> None:
+            emit_event(
+                on_lifecycle_event,
+                OnFallbackEvent(
+                    kind="on_fallback",
+                    provider="openai",
+                    model=str(model),
+                    operation=operation,
+                    attempt_number=1,
+                    elapsed_ms=0.0,
+                    consecutive_failures=circuit.failures if circuit else 0,
+                    reason=reason,  # type: ignore[arg-type]
+                ),
+            )
 
-            is_streaming = body.get("stream") is True
-
-            proxy_failed = False
-            proxy_error: Optional[Exception] = None
-            proxy_result: Optional[Any] = None
-
-            if is_streaming:
-                from .._proxy_client import proxy_request_stream
-
-                circuit_was_open = circuit is not None and circuit.should_bypass()
-                should_try_proxy = not circuit_was_open
-                if circuit_was_open and circuit is not None:
-                    should_try_proxy = circuit.should_probe()
-                if should_try_proxy:
-                    try:
-                        bearer_token = transport.get_token()
-                        proxy_result, decision_header = proxy_request_stream(
-                            proxy_url=proxy_url,
-                            bearer_token=bearer_token,
-                            provider_url=provider_url,
-                            provider_auth=provider_auth,
-                            body=body,
-                            model=str(model),
-                            provider="openai",
-                            operation=operation,
-                            correlation_id=correlation_id,
-                            environment=environment,
-                            application=application,
-                            tags=tags,
-                            customer=eff_customer,
-                            feature=eff_feature,
-                            agent_id=eff_agent_id,
-                            workflow_id=eff_workflow_id,
-                            retry=retry,
-                            timeout_s=timeout_s,
-                            headers_timeout_s=headers_timeout_s,
-                            on_lifecycle_event=on_lifecycle_event,
-                            circuit=circuit,
-                            max_layer=effective_layer,
-                            fail_open_fast=fail_open_enabled,
-                        )
-                        decision_meta = decision_metadata(decision_header)
-                    except Exception as exc:  # noqa: BLE001
-                        from .._proxy_client import should_fall_back_to_provider
-
-                        if not should_fall_back_to_provider(exc):
-                            native = provider_native_error(client_ref, exc, provider_url)
-                            if native is exc:
-                                raise
-                            raise native from exc
-                        proxy_failed = True
-                        proxy_error = exc
-                    finally:
-                        if circuit is not None:
-                            circuit.release_stuck_probe()
-                else:
-                    proxy_failed = True
-            else:
-                circuit_was_open = circuit is not None and circuit.should_bypass()
-                should_try_proxy = not circuit_was_open
-                if circuit_was_open and circuit is not None:
-                    should_try_proxy = circuit.should_probe()
-
-                if should_try_proxy:
-                    try:
-                        bearer_token = transport.get_token()
-                        proxy_result, decision_header = proxy_request(
-                            proxy_url=proxy_url,
-                            bearer_token=bearer_token,
-                            provider_url=provider_url,
-                            provider_auth=provider_auth,
-                            body=body,
-                            model=str(model),
-                            provider="openai",
-                            operation=operation,
-                            correlation_id=correlation_id,
-                            environment=environment,
-                            application=application,
-                            tags=tags,
-                            customer=eff_customer,
-                            feature=eff_feature,
-                            agent_id=eff_agent_id,
-                            workflow_id=eff_workflow_id,
-                            retry=retry,
-                            timeout_s=timeout_s,
-                            headers_timeout_s=headers_timeout_s,
-                            on_lifecycle_event=on_lifecycle_event,
-                            circuit=circuit,
-                            max_layer=effective_layer,
-                            fail_open_fast=fail_open_enabled,
-                        )
-                        decision_meta = decision_metadata(decision_header)
-                    except Exception as exc:  # noqa: BLE001
-                        from .._proxy_client import should_fall_back_to_provider
-
-                        if not should_fall_back_to_provider(exc):
-                            native = provider_native_error(client_ref, exc, provider_url)
-                            if native is exc:
-                                raise
-                            raise native from exc
-                        proxy_failed = True
-                        proxy_error = exc
-                    finally:
-                        if circuit is not None:
-                            circuit.release_stuck_probe()
-                else:
-                    proxy_failed = True
-
-            if proxy_failed:
-                if not fail_open_enabled:
-                    tc_err = (
-                        proxy_error
-                        if isinstance(proxy_error, TensorCostProxyError)
-                        else TensorCostProxyError(
-                            str(proxy_error) if proxy_error else "proxy unavailable",
-                            root_cause=proxy_error if isinstance(proxy_error, Exception) else None,
-                            attempt=1,
-                        )
-                    )
-                    _post_obs(
-                        transport, str(model), operation, tenant_id, environment,
-                        connection_id, correlation_id, request_at, None, None,
-                        "error", f"{type(tc_err).__name__}: {tc_err}",
-                        customer=eff_customer, feature=eff_feature,
-                        agent_id=eff_agent_id, workflow_id=eff_workflow_id,
-                        application=application, tags=tags,
-                        provider=provider_name,
-                    )
-                    raise tc_err
-
-                # Fail-open: emit fallback event and call provider directly.
-                emit_event(
-                    on_lifecycle_event,
-                    OnFallbackEvent(
-                        kind="on_fallback",
-                        provider="openai",
-                        model=str(model),
-                        operation=operation,
-                        attempt_number=1,
-                        elapsed_ms=0.0,
-                        consecutive_failures=circuit.failures if circuit else 0,
-                    ),
+        def call_provider() -> Any:
+            """The customer's call, straight to the provider, observed."""
+            _cap = _ba.Capture()
+            try:
+                with _ba.capturing(_cap):
+                    response = bound_method(*args, **kwargs)
+            except Exception as exc:
+                post(None, None, exc, _ba.account_of_http_call(client_ref, _cap, exc))
+                raise
+            billing_account = _ba.account_of_http_call(client_ref, _cap)
+            if kwargs.get("stream") is True and can_observe_stream(response):
+                return observe_stream(
+                    response, openai_chunk_usage,
+                    lambda i, o, err: post(i, o, err, billing_account),
                 )
-                _cap = _ba.Capture()
-                try:
-                    with _ba.capturing(_cap):
-                        direct_response = bound_method(*args, **kwargs)
-                    input_tokens, output_tokens = _extract_usage(direct_response)
-                    _post_obs(
-                        transport, str(model), operation, tenant_id, environment,
-                        connection_id, correlation_id, request_at, input_tokens,
-                        output_tokens, "success", None,
-                        customer=eff_customer, feature=eff_feature,
-                        agent_id=eff_agent_id, workflow_id=eff_workflow_id,
-                        application=application, tags=tags,
-                        billing_account=_ba.account_of_http_call(client_ref, _cap),
-                        provider=provider_name,
-                    )
-                    return direct_response
-                except Exception as exc:
-                    _post_obs(
-                        transport, str(model), operation, tenant_id, environment,
-                        connection_id, correlation_id, request_at, None, None,
-                        "error", f"{type(exc).__name__}: {exc}",
-                        customer=eff_customer, feature=eff_feature,
-                        agent_id=eff_agent_id, workflow_id=eff_workflow_id,
-                        application=application, tags=tags,
-                        billing_account=_ba.account_of_http_call(client_ref, _cap, exc),
-                        provider=provider_name,
-                    )
-                    raise
+            input_tokens, output_tokens = _extract_usage(parsed_for_usage(response))
+            post(input_tokens, output_tokens, None, billing_account)
+            return response
 
-            # Proxy success.
-            resp_dict = proxy_result if isinstance(proxy_result, dict) else {}
-            usage = resp_dict.get("usage") if isinstance(resp_dict, dict) else None
-            input_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
-            output_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
-            _post_obs(
-                transport, str(model), operation, tenant_id, environment,
-                connection_id, correlation_id, request_at, input_tokens,
-                output_tokens, "success", None,
-                customer=eff_customer, feature=eff_feature,
-                agent_id=eff_agent_id, workflow_id=eff_workflow_id,
-                application=application, tags=tags,
-                provider=provider_name,
-            )
-            return proxy_result
-
-        # Observe-only path (applied_mode=False or non-chat operation).
-        _cap = _ba.Capture()
-        try:
-            with _ba.capturing(_cap):
-                response = bound_method(*args, **kwargs)
-        except Exception as exc:
-            _post_obs(
-                transport, str(model), operation, tenant_id, environment,
-                connection_id, correlation_id, request_at, None, None,
-                "error", f"{type(exc).__name__}: {exc}",
-                customer=eff_customer, feature=eff_feature,
-                agent_id=eff_agent_id, workflow_id=eff_workflow_id,
-                application=application, tags=tags,
-                billing_account=_ba.account_of_http_call(client_ref, _cap, exc),
-                provider=provider_name,
-            )
-            raise
-
-        input_tokens, output_tokens = _extract_usage(response)
-        _post_obs(
-            transport, str(model), operation, tenant_id, environment,
-            connection_id, correlation_id, request_at, input_tokens,
-            output_tokens, "success", None,
-            customer=eff_customer, feature=eff_feature,
-            agent_id=eff_agent_id, workflow_id=eff_workflow_id,
-            application=application, tags=tags,
-            billing_account=_ba.account_of_http_call(client_ref, _cap),
-            provider=provider_name,
+        wants_proxy = (
+            needs_proxy_url(max_layer) and bool(proxy_url) and operation == "chat.completions"
         )
-        return response
+        if wants_proxy and needs_proxy_url(effective_layer):
+            return route(post, fallback, call_provider, args, kwargs, model, correlation_id,
+                         eff_customer, eff_feature, eff_agent_id, eff_workflow_id,
+                         effective_layer)
+
+        if wants_proxy and layer_decayed:
+            # Route was asked for, but the published layer couldn't be had,
+            # so the client decayed to govern and goes to the provider
+            # directly. A refusal from /admit has already raised above.
+            fallback("layer_decayed")
+        return call_provider()
+
+    def route(
+        post: Any, fallback: Any, call_provider: Any, args: tuple, kwargs: dict, model: Any,
+        correlation_id: str, eff_customer: Optional[str], eff_feature: Optional[str],
+        eff_agent_id: Optional[str], eff_workflow_id: Optional[str],
+        effective_layer: ControlLayer,
+    ) -> Any:
+        from .._proxy_client import proxy_request_stream, should_fall_back_to_provider
+
+        provider_url = openai_provider_base_url(client_ref) if client_ref else "https://api.openai.com"
+        provider_auth = openai_provider_auth(client_ref) if client_ref else ""
+
+        # The body openai would send: request options become headers, query
+        # and timeout, extra_body is merged in (_request_options).
+        opts = split_request_options(kwargs)
+        body: dict[str, Any] = opts.body
+        body["model"] = str(model)
+        call_timeout_s = opts.timeout_s or timeout_s
+        is_streaming = body.get("stream") is True
+
+        proxy_error: Optional[Exception] = None
+        proxy_result: Any = None
+        sink: list = []
+        fallback_reason: Optional[str] = None
+
+        circuit_was_open = circuit is not None and circuit.should_bypass()
+        should_try_proxy = not circuit_was_open
+        if circuit_was_open and circuit is not None:
+            should_try_proxy = circuit.should_probe()
+
+        if should_try_proxy:
+            try:
+                bearer_token = get_token_within(transport, min(headers_timeout_s, call_timeout_s))
+                common = dict(
+                    proxy_url=proxy_url,
+                    bearer_token=bearer_token,
+                    provider_url=provider_url,
+                    provider_auth=provider_auth,
+                    body=body,
+                    model=str(model),
+                    provider="openai",
+                    operation=operation,
+                    correlation_id=correlation_id,
+                    environment=environment,
+                    application=application,
+                    tags=tags,
+                    customer=eff_customer,
+                    feature=eff_feature,
+                    agent_id=eff_agent_id,
+                    workflow_id=eff_workflow_id,
+                    retry=retry,
+                    timeout_s=call_timeout_s,
+                    headers_timeout_s=headers_timeout_s,
+                    on_lifecycle_event=on_lifecycle_event,
+                    circuit=circuit,
+                    max_layer=effective_layer,
+                    fail_open_fast=fail_open_enabled,
+                    extra_headers=opts.headers,
+                    extra_query=opts.query,
+                )
+                if is_streaming:
+                    proxy_result, _decision = proxy_request_stream(**common, raw=True)
+                else:
+                    proxy_result, _decision = proxy_request(**common, response_sink=sink)
+            except Exception as exc:  # noqa: BLE001
+                if not should_fall_back_to_provider(exc):
+                    native = provider_native_error(client_ref, exc, provider_url)
+                    if native is exc:
+                        raise
+                    raise native from exc
+                fallback_reason = "proxy_unavailable"
+                proxy_error = exc
+            finally:
+                if circuit is not None:
+                    circuit.release_stuck_probe()
+        else:
+            fallback_reason = "circuit_open"
+
+        if fallback_reason is not None:
+            if not fail_open_enabled:
+                tc_err = (
+                    proxy_error
+                    if isinstance(proxy_error, TensorCostProxyError)
+                    else TensorCostProxyError(
+                        str(proxy_error) if proxy_error else "proxy unavailable",
+                        root_cause=proxy_error if isinstance(proxy_error, Exception) else None,
+                        attempt=1,
+                    )
+                )
+                post(None, None, tc_err)
+                raise tc_err
+            # Fail-open: say so, then call the provider directly.
+            fallback(fallback_reason)
+            return call_provider()
+
+        if is_streaming:
+            return route_stream_result(
+                client_ref, _create_of, proxy_result, openai_chunk_usage,
+                lambda i, o, err: post(i, o, err), args, kwargs,
+            )
+
+        # Proxy success: openai's own type for it (ChatCompletion, or the
+        # raw-response wrapper under with_raw_response).
+        resp_dict = proxy_result if isinstance(proxy_result, dict) else {}
+        input_tokens, output_tokens = _extract_usage(resp_dict)
+        post(input_tokens, output_tokens)
+        resp = sink[0] if sink else None
+        typed = replay_through_client(
+            client_ref, _create_of, args, kwargs,
+            status_code=resp.status_code if resp is not None else 200,
+            headers=resp.headers if resp is not None else {"content-type": "application/json"},
+            content=resp.content if resp is not None else json.dumps(resp_dict).encode(),
+        )
+        return proxy_result if typed is UNTYPED else typed
 
     setattr(wrapper, "__tensorcost_wrapped__", True)
     return wrapper

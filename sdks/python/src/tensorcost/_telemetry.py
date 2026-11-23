@@ -18,15 +18,29 @@ What is never included:
 * Request or response bodies
 * Credentials of any kind
 
-The five event kinds::
+The event kinds::
 
     before_request   fires before each attempt (including retried ones)
     after_response   fires when a request completes successfully
     on_retry         fires when a request is going to be retried
     on_error         fires when the SDK gives up (retries exhausted or
                      a non-retriable error occurred)
-    on_fallback      fires when the circuit breaker opens and the SDK routes
-                     directly to the provider instead of the proxy
+    on_fallback      fires whenever a steer/route client sends a call straight
+                     to the provider because TensorCost is unavailable.
+                     ``reason`` says which way:
+                       proxy_unavailable  the proxy call failed (network,
+                                          timeout, 5xx, 429/402)
+                       circuit_open       the circuit breaker is open, the
+                                          proxy was not tried
+                       layer_decayed      the published layer couldn't be
+                                          fetched, so the client decayed to
+                                          govern and skipped the proxy
+                     Never for a refusal: those raise and never fall back.
+    on_budget_would_refuse
+                     fires when /admit let a call through but named budgets
+                     that would have refused it, had the SDK enforced them
+                     (the licence lacks feature.enforce_sdk). The call is
+                     not affected.
 """
 
 from __future__ import annotations
@@ -91,6 +105,18 @@ class OnFallbackEvent:
     attempt_number: int
     elapsed_ms: float
     consecutive_failures: int
+    reason: Literal["proxy_unavailable", "circuit_open", "layer_decayed"] = "proxy_unavailable"
+
+
+@dataclass(frozen=True)
+class OnBudgetWouldRefuseEvent:
+    kind: Literal["on_budget_would_refuse"]
+    provider: str
+    model: str
+    operation: str
+    attempt_number: int
+    elapsed_ms: float
+    budget_ids: tuple[str, ...]
 
 
 LifecycleEvent = Union[
@@ -99,6 +125,7 @@ LifecycleEvent = Union[
     OnRetryEvent,
     OnErrorEvent,
     OnFallbackEvent,
+    OnBudgetWouldRefuseEvent,
 ]
 
 LifecycleEventCallback = Callable[[LifecycleEvent], None]

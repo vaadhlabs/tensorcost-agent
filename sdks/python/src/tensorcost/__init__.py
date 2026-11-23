@@ -47,6 +47,7 @@ from ._telemetry import (
     OnRetryEvent,
     OnErrorEvent,
     OnFallbackEvent,
+    OnBudgetWouldRefuseEvent,
     LifecycleEventCallback,
 )
 from ._retry import RetryConfig
@@ -83,6 +84,7 @@ __all__ = [
     "OnRetryEvent",
     "OnErrorEvent",
     "OnFallbackEvent",
+    "OnBudgetWouldRefuseEvent",
     "LifecycleEventCallback",
     # Config types
     "RetryConfig",

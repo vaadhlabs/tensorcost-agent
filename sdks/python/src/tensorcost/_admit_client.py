@@ -1,8 +1,16 @@
 """Govern-layer admit — metadata-only POST /api/inference-proxy/v1/admit.
 
 Fail-open only on an outage: network error, timeout, 5xx, or a 429 / 402
-with no refusal body. The customer's call then proceeds and an ``admit_unavailable``
-observation is posted when transport is set.
+with no refusal body. The customer's call then proceeds. ``admit_call``
+says so in its outcome (``unavailable``), and the provider wrappers mark the
+call's own observation ``admit_unavailable``, so the row keeps its agent,
+team and token usage. ``admit_request`` (the older tuple API) still posts a
+separate ``admit_unavailable`` observation when given a transport.
+
+A 204 can carry ``X-TensorCost-Budget-Would-Refuse: <budget ids>``: hard caps
+that are over but not enforced at the SDK (the licence lacks
+feature.enforce_sdk). The outcome carries the ids; the wrappers raise the
+``on_budget_would_refuse`` event and log them.
 
 Every other non-2xx is an answer and raises a ``TensorCostRefusedError``
 subclass, fail-open or not: RUN_STOPPED with its who / when / why,
@@ -14,6 +22,7 @@ could not be checked for this call; that is not an outage either.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -41,6 +50,28 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+WOULD_REFUSE_HEADER = "x-tensorcost-budget-would-refuse"
+
+
+@dataclass(frozen=True)
+class AdmitOutcome:
+    """What /admit said about a call that may go ahead."""
+
+    allowed: bool
+    decision_header: Optional[str]
+    # True when /admit couldn't be reached (fail-open let the call through).
+    unavailable: bool = False
+    # Budgets that would have refused the call had the SDK enforced them.
+    would_refuse: tuple[str, ...] = ()
+
+
+def _would_refuse_ids(resp: httpx.Response) -> tuple[str, ...]:
+    raw = resp.headers.get(WOULD_REFUSE_HEADER)
+    if not raw:
+        return ()
+    return tuple(i.strip() for i in raw.split(",") if i.strip())
+
+
 def admit_request(
     *,
     base_url: str,
@@ -56,7 +87,38 @@ def admit_request(
 
     Raises a ``TensorCostRefusedError`` subclass for any refusal. Raises the
     typed outage error (network / timeout / proxy / quota) when
-    ``fail_open`` is False; otherwise an outage returns ``(True, None)``.
+    ``fail_open`` is False; otherwise an outage returns ``(True, None)`` and,
+    with ``transport``, posts an ``admit_unavailable`` observation.
+    """
+    outcome = admit_call(
+        base_url=base_url,
+        bearer_token=bearer_token,
+        max_layer=max_layer,
+        metadata=metadata,
+        fail_open=fail_open,
+        timeout_s=timeout_s,
+        http_client=http_client,
+    )
+    if outcome.unavailable and transport is not None:
+        _post_admit_unavailable(transport, metadata)
+    return outcome.allowed, outcome.decision_header
+
+
+def admit_call(
+    *,
+    base_url: str,
+    bearer_token: str,
+    max_layer: ControlLayer,
+    metadata: dict[str, Any],
+    fail_open: bool = True,
+    timeout_s: float = ADMIT_TIMEOUT_S,
+    http_client: Optional[httpx.Client] = None,
+) -> AdmitOutcome:
+    """The /admit check for one call. Posts nothing.
+
+    Raises a ``TensorCostRefusedError`` subclass for any refusal, and the
+    typed outage error when ``fail_open`` is False. With fail-open, an
+    outage returns ``AdmitOutcome(True, None, unavailable=True)``.
     """
     url = base_url.rstrip("/") + ADMIT_PATH
     headers = {
@@ -101,45 +163,50 @@ def admit_request(
                 request_id=request_id,
             )
         else:
-            return True, decision_header
+            return AdmitOutcome(True, decision_header, would_refuse=_would_refuse_ids(resp))
     except Exception:
         if fail_open:
-            if transport is not None:
-                tags = metadata.get("tags")
-                tag_list = (
-                    [t for t in tags.split(",") if t] if isinstance(tags, str) else tags
-                )
-                try:
-                    transport.post(
-                        {
-                            "sdk_version": SDK_VERSION,
-                            "provider": metadata.get("provider", "openai"),
-                            "model": metadata.get("model", "unknown"),
-                            "operation": metadata.get("operation", "chat.completions"),
-                            "request_at": _now_iso(),
-                            "response_at": _now_iso(),
-                            "input_tokens": None,
-                            "output_tokens": None,
-                            "cost_usd_cents": None,
-                            "status": "success",
-                            "error_message": None,
-                            "correlation_id": metadata.get("correlation_id", ""),
-                            **observation_scope(metadata.get("application"), tag_list),
-                            "metadata": {
-                                "decision_action": "allow",
-                                "decision_reason": "admit_unavailable",
-                            },
-                        }
-                    )
-                except Exception:
-                    pass
-            return True, None
+            return AdmitOutcome(True, None, unavailable=True)
         raise
     finally:
         if own_client:
             client.close()
     assert refusal is not None
     raise refusal
+
+
+ADMIT_UNAVAILABLE_METADATA = {
+    "decision_action": "allow",
+    "decision_reason": "admit_unavailable",
+}
+
+
+def _post_admit_unavailable(transport: ObservationTransport, metadata: dict[str, Any]) -> None:
+    tags = metadata.get("tags")
+    tag_list = [t for t in tags.split(",") if t] if isinstance(tags, str) else tags
+    try:
+        transport.post(
+            {
+                "sdk_version": SDK_VERSION,
+                "provider": metadata.get("provider", "openai"),
+                "model": metadata.get("model", "unknown"),
+                "operation": metadata.get("operation", "chat.completions"),
+                "request_at": _now_iso(),
+                "response_at": _now_iso(),
+                "input_tokens": None,
+                "output_tokens": None,
+                "cost_usd_cents": None,
+                "status": "success",
+                "error_message": None,
+                "correlation_id": metadata.get("correlation_id", ""),
+                **({"agent_id": metadata["agent_id"]} if metadata.get("agent_id") else {}),
+                **({"workflow_id": metadata["workflow_id"]} if metadata.get("workflow_id") else {}),
+                **observation_scope(metadata.get("application"), tag_list),
+                "metadata": dict(ADMIT_UNAVAILABLE_METADATA),
+            }
+        )
+    except Exception:
+        pass
 
 
 def _refusal_from_4xx(

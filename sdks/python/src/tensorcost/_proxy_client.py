@@ -88,12 +88,16 @@ def _post_with_headers_timeout(
 ) -> httpx.Response:
     """Wait for headers within headers budget, then read body before body deadline."""
     effective_headers = min(headers_wait_budget_s, body_timeout_s)
+    # Reaching the proxy at all is bounded by the short headers budget even
+    # when the headers themselves may take the whole body budget (buffered
+    # JSON): through 1.7.0 a blackholed proxy got timeout_s (60 s) to connect.
+    connect_budget = min(short_headers_timeout_s, body_timeout_s)
     call_start = time.monotonic()
     body_deadline = call_start + body_timeout_s
     stream_timeout = httpx.Timeout(
-        connect=effective_headers,
+        connect=connect_budget,
         write=effective_headers,
-        pool=effective_headers,
+        pool=connect_budget,
         read=body_timeout_s,
     )
 
@@ -127,11 +131,12 @@ def _post_with_headers_timeout(
             if headers_wait_budget_s == short_headers_timeout_s
             else "total"
         )
-        message = (
-            f"tensorcost: proxy did not respond with headers within {short_headers_timeout_s:.0f}s"
-            if kind == "headers"
-            else f"tensorcost: proxy request timed out after {body_timeout_s:.0f}s"
-        )
+        if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+            message = f"tensorcost: could not connect to the proxy within {connect_budget:g}s"
+        elif kind == "headers":
+            message = f"tensorcost: proxy did not respond with headers within {short_headers_timeout_s:.0f}s"
+        else:
+            message = f"tensorcost: proxy request timed out after {body_timeout_s:.0f}s"
         raise TensorCostTimeoutError(
             message,
             kind,
@@ -166,8 +171,17 @@ def proxy_request(
     max_layer: ControlLayer = "observe",
     fail_open_fast: bool = False,
     http_client: Optional[httpx.Client] = None,
+    extra_headers: Optional[dict[str, str]] = None,
+    extra_query: Optional[dict[str, Any]] = None,
+    response_sink: Optional[list] = None,
 ) -> tuple[dict[str, Any], Optional[str]]:
-    """Execute a proxied request with retries, timeouts, and telemetry."""
+    """Execute a proxied request with retries, timeouts, and telemetry.
+
+    ``extra_headers`` / ``extra_query`` are the caller's request options
+    (the provider SDK's own), sent as headers and query parameters; they
+    never replace a header this function sets. On success the httpx
+    response is appended to ``response_sink`` when one is given.
+    """
     call_start = time.monotonic()
 
     # Circuit bypass is decided in the provider wrapper — do not re-check here.
@@ -200,6 +214,8 @@ def proxy_request(
         headers["x-tc-agent-id"] = agent_id
     if workflow_id:
         headers["x-tc-workflow-id"] = workflow_id
+    _add_caller_headers(headers, extra_headers)
+    url = _with_query(url, extra_query)
 
     # Buffered JSON: proxy may not send headers until upstream completes.
     is_buffered_json = body.get("stream") is not True
@@ -446,6 +462,8 @@ def proxy_request(
                     request_id=request_id,
                 ),
             )
+            if response_sink is not None:
+                response_sink.append(resp)
             return json.loads(resp.content), resp.headers.get("x-tc-decision")
 
         error_body: Any = None
@@ -703,8 +721,16 @@ def proxy_request_stream(
     max_layer: ControlLayer = "observe",
     fail_open_fast: bool = False,
     http_client: Optional[httpx.Client] = None,
+    extra_headers: Optional[dict[str, str]] = None,
+    extra_query: Optional[dict[str, Any]] = None,
+    raw: bool = False,
 ) -> tuple[Any, Optional[str]]:
-    """Steer/route a streaming request; returns (sse_iterable, decision_header)."""
+    """Steer/route a streaming request; returns (sse_iterable, decision_header).
+
+    With ``raw`` the first item is a ``RawProxyStream`` instead: the
+    response's status, headers and undecoded-SSE bytes, for the provider
+    SDK to parse into its own Stream (see _typed_response).
+    """
     retry_cfg = retry or DEFAULT_RETRY_CONFIG
     path = proxy_path_for_operation(operation) or "/api/inference-proxy/v1/chat/completions"
     url = f"{proxy_url.rstrip('/')}{path}"
@@ -733,6 +759,8 @@ def proxy_request_stream(
         headers["x-tc-application"] = application
     if tags:
         headers["x-tc-tags"] = ",".join(tags)
+    _add_caller_headers(headers, extra_headers)
+    url = _with_query(url, extra_query)
 
     client = http_client or httpx.Client(timeout=timeout_s)
     close_client = http_client is None
@@ -827,6 +855,16 @@ def proxy_request_stream(
         if circuit is not None:
             circuit.record_success()
 
+        if raw:
+            def _close() -> None:
+                try:
+                    stream_ctx.__exit__(None, None, None)
+                finally:
+                    if close_client:
+                        client.close()
+
+            return RawProxyStream(resp, _close), resp.headers.get("x-tc-decision")
+
         def _iter_sse() -> Any:
             try:
                 for line in resp.iter_lines():
@@ -847,6 +885,54 @@ def proxy_request_stream(
         if close_client:
             client.close()
         raise
+
+
+class RawProxyStream:
+    """A successful streamed proxy response, not yet read."""
+
+    def __init__(self, resp: httpx.Response, close: Any) -> None:
+        self.status_code = resp.status_code
+        self.headers = resp.headers
+        self._resp = resp
+        self._close = close
+        self._closed = False
+
+    def iter_bytes(self) -> Any:
+        return self._resp.iter_bytes()
+
+    def iter_json(self) -> Any:
+        """The SSE data lines as dicts (the pre-1.7.1 return shape)."""
+        try:
+            for line in self._resp.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data in ("", "[DONE]"):
+                    continue
+                yield json.loads(data)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._close()
+
+
+def _add_caller_headers(headers: dict[str, str], extra: Optional[dict[str, str]]) -> None:
+    if not extra:
+        return
+    taken = {k.lower() for k in headers}
+    for name, value in extra.items():
+        if name.lower() not in taken:
+            headers[name] = value
+
+
+def _with_query(url: str, query: Optional[dict[str, Any]]) -> str:
+    if not query:
+        return url
+    return str(httpx.URL(url).copy_merge_params(query))
 
 
 def should_fall_back_to_provider(err: BaseException) -> bool:
