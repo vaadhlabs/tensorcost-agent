@@ -207,11 +207,26 @@ function providerAuthFor(
 }
 
 /**
+ * The provider base the proxy expects in `x-tc-provider-url`: the client's
+ * base URL without a trailing API version. The proxy appends the versioned
+ * path itself (`/v1/chat/completions`), so openai-node's default baseURL,
+ * "https://api.openai.com/v1", has to go as "https://api.openai.com"; sent
+ * as is, the proxy asked for /v1/v1/chat/completions and every route-mode
+ * call from a default `new OpenAI()` came back 404 (1.7.0). The Python SDK
+ * has always stripped it (`openai_provider_base_url`), with the same rule:
+ * only a final `/v<digits>` goes, so an Azure deployment path stays whole
+ * and Azure's `/openai/v1` becomes `/openai`.
+ */
+export function providerBaseUrl(url: string): string {
+  return url.replace(/\/+$/, "").replace(/\/v\d+$/, "");
+}
+
+/**
  * Where the proxy should forward this client's call: the client's own base
  * URL and its auth, formatted for `x-tc-provider-url` / `x-tc-provider-auth`.
  *
  * A client that already carries those as plain `defaultHeaders` entries
- * (callers who set them by hand) keeps them.
+ * (callers who set them by hand) keeps them, the URL normalised the same way.
  */
 export function providerTarget(
   client: unknown,
@@ -227,7 +242,7 @@ export function providerTarget(
     typeof manual["x-tc-provider-auth"] === "string" ? manual["x-tc-provider-auth"] : null;
   const apiKey = readApiKey(c);
   return {
-    providerUrl: manualUrl ?? readBaseUrl(c) ?? defaultUrl,
+    providerUrl: providerBaseUrl(manualUrl ?? readBaseUrl(c) ?? defaultUrl),
     providerAuth: manualAuth ?? (apiKey ? providerAuthFor(c, provider, apiKey) : ""),
   };
 }

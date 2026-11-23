@@ -159,8 +159,8 @@ await client
 If TensorCost is slow or down, your call still reaches the provider. The SDK only goes around TensorCost when it can't get an answer: a network error, a timeout, a 5xx, or a 429 or 402 with no refusal in it, and only while `failOpenEnabled` is on (the default). Anything TensorCost actually answers reaches your code as an error, and is never retried or sent around it.
 
 - **Retries.** 5xx, network errors and 429s are retried with jittered backoff, honouring `Retry-After`.
-- **Timeouts.** The check before a call is capped at 500 ms. Through the proxy, a buffered call waits up to `timeoutMs` (60 s); a streamed one waits `headersTimeoutMs` (2 s) for the stream to start and ends after `idleTimeoutMs` (30 s) without data.
-- **Circuit breaker.** After three proxy 5xx failures in a row, calls go straight to the provider until the proxy answers again.
+- **Timeouts.** The check before a call is capped at 500 ms. Through the proxy, a buffered call waits up to `timeoutMs` (60 s); a streamed one waits `headersTimeoutMs` (2 s) for the stream to start and ends after `idleTimeoutMs` (30 s) without data. With TensorCost unreachable, only the first calls of a process wait for the published layer (250 ms at most); the token exchange counts against the budget of whatever waits on it, and after it fails calls stop waiting on it for 5 s.
+- **Circuit breaker.** After three proxy failures in a row, calls go straight to the provider. Every 5 s one call probes the proxy, and once probes succeed calls go through it again. Transitions reach `onLifecycleEvent` as `on_circuit_state`; they are not sent to TensorCost.
 
 ```ts
 const client = wrap(new OpenAI(), {

@@ -10,6 +10,7 @@ export {
   TensorCostQuotaError,
   TensorCostProviderError,
   TensorCostGatewayRejectedError,
+  TensorCostProxyStatusError,
   TensorCostKeyRejectedError,
   TensorCostRefusedError,
   TensorCostBudgetHardCapError,
@@ -28,9 +29,11 @@ export type {
   OnRetryEvent,
   OnErrorEvent,
   OnFallbackEvent,
+  OnCircuitStateEvent,
   LifecycleEventCallback,
 } from "./telemetry.js";
 export type { RetryConfig } from "./retry.js";
+export { TensorCostAPIPromise } from "./api-promise.js";
 export type {
   WrapOptions,
   Observation,

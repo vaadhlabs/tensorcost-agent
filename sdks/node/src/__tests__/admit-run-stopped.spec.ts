@@ -122,7 +122,7 @@ describe("admitRequest", () => {
       metadata: META,
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
-    expect(res).toEqual({ allowed: true, decisionHeader: null });
+    expect(res).toEqual({ allowed: true, decisionHeader: null, unavailable: true });
   });
 });
 

@@ -147,7 +147,8 @@ export class TensorCostProviderError extends TensorCostError {
 /**
  * Something in front of TensorCost turned the request away: a 4xx whose
  * body isn't JSON (an HTML page from a firewall or load balancer, or
- * nothing at all). Neither TensorCost nor the provider saw the call.
+ * nothing at all) and that has no `x-tc-decision` header, which only the
+ * TensorCost proxy sets. Neither TensorCost nor the provider saw the call.
  * Terminal: going around it would mean going around whatever put the
  * firewall there, and the next call would most likely meet it too.
  */
@@ -164,6 +165,55 @@ export class TensorCostGatewayRejectedError extends TensorCostError {
     );
     this.bodyText = bodyText;
   }
+}
+
+/**
+ * The TensorCost proxy answered a 4xx without an error body to say why, but
+ * with `x-tc-decision`, so the request did reach TensorCost: either the
+ * proxy turned it down itself (a route it doesn't serve, a provider URL it
+ * can't use) or it forwarded the call and the provider's answer came back
+ * with nothing in it. 1.7.0 reported this as a firewall rejection
+ * (TensorCostGatewayRejectedError), which sent people looking in the wrong
+ * place. Terminal like that one: neither a retry nor going around
+ * TensorCost would change the answer.
+ */
+export class TensorCostProxyStatusError extends TensorCostError {
+  /** The first 500 characters of what came back, if anything did. */
+  readonly bodyText: string | null;
+  /** The x-tc-decision header the proxy sent. */
+  readonly decision: string;
+
+  constructor(
+    status: number,
+    decision: string,
+    bodyText: string | null,
+    opts: TensorCostErrorOptions = {},
+  ) {
+    super(
+      `tensorcost: the TensorCost proxy answered ${status} (x-tc-decision "${decision}"), so ` +
+        "the request reached TensorCost; the proxy, or the provider it forwarded the call " +
+        `to, returned ${status} with no error body. Check the provider URL the client is ` +
+        "configured with (sent as x-tc-provider-url) and the proxy's logs for this request.",
+      { ...opts, status },
+    );
+    this.bodyText = bodyText;
+    this.decision = decision;
+  }
+}
+
+/**
+ * A non-JSON 4xx: from TensorCost when it carries `x-tc-decision` (only the
+ * proxy sets it), otherwise from something in front of TensorCost.
+ */
+export function unexplained4xx(
+  status: number,
+  decision: string | null,
+  bodyText: string | null,
+  opts: TensorCostErrorOptions = {},
+): TensorCostGatewayRejectedError | TensorCostProxyStatusError {
+  return decision && decision.trim() !== ""
+    ? new TensorCostProxyStatusError(status, decision.trim(), bodyText, opts)
+    : new TensorCostGatewayRejectedError(status, bodyText, opts);
 }
 
 /**

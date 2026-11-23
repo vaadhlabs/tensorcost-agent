@@ -36,30 +36,37 @@ import {
   TensorCostComplianceTeamMismatchError,
   TensorCostRefusedError,
 } from "../errors.js";
-import { TensorCostConfigError } from "../config.js";
 import { openAiProviderFor, providerTarget } from "../applied.js";
 import { providerNativeError } from "../provider-errors.js";
 import type { CircuitBreaker } from "../circuit.js";
 import { emitEvent } from "../telemetry.js";
 import type { LifecycleEventCallback } from "../telemetry.js";
 import type { RetryConfig } from "../retry.js";
-import type { ControlLayer } from "../layer.js";
-import { needsProxyUrl } from "../layer.js";
+import type { CompiledComplianceSnapshot, ControlLayer } from "../layer.js";
+import { ADMIT_TIMEOUT_MS, needsProxyUrl } from "../layer.js";
 import type { SdkLayerClient } from "../sdk-layer.js";
 import { decisionMetadata } from "../decision.js";
 import { SDK_VERSION } from "../version.js";
 import {
   billingAccountField,
-  billingAccountOfApiPromise,
   billingAccountOfError,
   clientBaseUrl,
 } from "../billing-account.js";
+import {
+  TensorCostAPIPromise,
+  observeApiCall,
+  openAiStreamTracker,
+  tapStream,
+  type CallSource,
+  type Usage,
+} from "../api-promise.js";
 import {
   WrapOverhead,
   observationScope,
   postObservation,
   withAwaitExcluded,
 } from "../wrap-overhead.js";
+import { ADMIT_UNAVAILABLE, callPathToken } from "./call-path.js";
 import { resolveModelCallLink } from "../trace-link.js";
 const MARKER = "__tensorcost_wrapped__";
 const WITH_META_MARKER = "__tensorcost_with_meta__";
@@ -167,7 +174,13 @@ function wrapMethod(
   // azure_openai for an AzureOpenAI client: on observations and the govern
   // check. The proxy request keeps "openai", which picks the proxy's route.
   const providerName = openAiProviderFor(opts.clientRef);
-  const wrapped = async function (this: unknown, ...args: any[]) {
+
+  // Not async: create() hands back an APIPromise (see api-promise.ts). The
+  // provider's own when nothing has to be checked first, a
+  // TensorCostAPIPromise when /admit, the proxy or a cold layer fetch must
+  // finish before the call is made.
+  const wrapped = function (this: unknown, ...args: any[]) {
+    const self = this;
     const overhead = new WrapOverhead();
     const requestAt = nowIso();
     const firstArg = args[0];
@@ -182,7 +195,6 @@ function wrapMethod(
 
     // Build metadata once per call. Per-call overrides beat wrap-time defaults.
     const meta = buildMetadata(opts.deployment, opts.promptTemplateId, opts.perCallMeta);
-    const metaSpread = meta !== undefined ? { metadata: meta } : {};
     // Per-agent-run attribution. Dedicated top-level fields (NOT the
     // metadata bag — see Observation.agent_id doc in types.ts). Per-call
     // withMeta() override beats the wrap-time default.
@@ -193,174 +205,278 @@ function wrapMethod(
     const resolvedFeature =
       opts.perCallFeature ?? opts.hardening.feature ?? undefined;
 
-    const effectiveLayer = await withAwaitExcluded(overhead, () =>
-      opts.hardening.sdkLayer.effectiveLayer(opts.hardening.maxLayer),
-    );
-
     let complianceStamp: { compliance_frameworks?: string[]; dlp_action?: string } =
       {};
-    if (opts.operation === "chat.completions") {
-      try {
-        assertTeamScope({ clientTeamId: opts.hardening.teamId ?? null });
-        const complianceSnap = await withAwaitExcluded(overhead, () =>
-          opts.hardening.sdkLayer.getComplianceSnapshot(effectiveLayer),
-        );
-        const dlpResult = enforceInProcessDlp(
-          extractOpenAiMessagesText(args),
-          complianceSnap,
-          args,
-        );
-        complianceStamp = complianceStampFrom(complianceSnap, dlpResult);
-      } catch (err) {
-        if (
-          err instanceof TensorCostComplianceDeniedError ||
-          err instanceof TensorCostComplianceTeamMismatchError
-        ) {
-          throw err;
-        }
-        // Fail-open on snapshot fetch errors unless HIPAA/PCI closed (server enforces on admit).
-      }
-    }
 
-    let decisionMeta: Record<string, string> | undefined;
-    if (
-      effectiveLayer === "govern" &&
-      opts.operation === "chat.completions"
-    ) {
-      try {
-        const getToken =
-          opts.getToken ?? (() => opts.transport.getToken());
-        const admit = await withAwaitExcluded(overhead, async () => {
-          const bearerToken = await getToken();
-          return admitRequest({
-            baseUrl: opts.hardening.baseUrl,
-            bearerToken,
-            maxLayer: effectiveLayer,
-            metadata: {
-              provider: providerName,
-              model: String(model),
-              operation: opts.operation,
-              correlation_id: correlationId,
-              environment: opts.environment,
-              connection_id: opts.connectionId,
-              agent_id: resolvedAgentId,
-              workflow_id: resolvedWorkflowId,
-              customer: resolvedCustomer,
-              feature: resolvedFeature,
-              application: opts.hardening.application ?? null,
-              tags: opts.hardening.tags ?? [],
-              team_id: opts.hardening.teamId ?? null,
-            },
-            transport: opts.transport,
-            failOpen: opts.hardening.failOpenEnabled,
-          });
-        });
-        if (!admit.allowed) {
-          // The admit client types every refusal by its code. The generic
-          // error is only a guard; it used to say "model governance" for
-          // every refusal, budget caps included.
-          throw (
-            admit.refusal ??
-            new TensorCostRefusedError("tensorcost: request refused at govern layer", {}, {
-              status: 403,
-              attempt: 1,
-            })
-          );
-        }
-        decisionMeta = decisionMetadata(admit.decisionHeader);
-      } catch (err) {
-        // Same rule as the proxy path: go around TensorCost only when it
-        // is unavailable (token exchange or admit unreachable), and only
-        // with failOpenEnabled. A refusal, known code or not, stops the call.
-        if (!shouldFallBackToProvider(err) || !opts.hardening.failOpenEnabled) throw err;
-      }
-    }
-
-    const decisionSpread =
-      decisionMeta !== undefined
-        ? {
-            metadata: {
-              ...(meta !== undefined ? meta : {}),
-              ...decisionMeta,
-            },
-          }
-        : metaSpread;
-
-    const stampObservation = (obs: Observation): Observation => ({
-      ...obs,
-      ...(complianceStamp.compliance_frameworks?.length
-        ? { compliance_frameworks: complianceStamp.compliance_frameworks }
-        : {}),
-      ...(complianceStamp.dlp_action ? { dlp_action: complianceStamp.dlp_action } : {}),
-      ...observationScope(opts.hardening.application, opts.hardening.tags),
+    const observation = (o: {
+      status: "success" | "error";
+      usage?: Usage;
+      error?: unknown;
+      billingAccount?: string | null;
+      decisionMeta?: Record<string, string>;
+    }): Observation => ({
+      sdk_version: SDK_VERSION,
+      provider: providerName,
+      model: String(model),
+      operation: opts.operation,
+      request_at: requestAt,
+      response_at: nowIso(),
+      input_tokens: o.usage?.input ?? null,
+      output_tokens: o.usage?.output ?? null,
+      cost_usd_cents: null,
+      status: o.status,
+      error_message:
+        o.error !== undefined ? `${(o.error as Error)?.name}: ${(o.error as Error)?.message}` : null,
+      correlation_id: correlationId,
+      ...traceLink,
+      ...(opts.environment !== null ? { environment: opts.environment } : {}),
+      ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
+      ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
+      ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
+      ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
+      ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
+      ...(o.billingAccount !== undefined ? billingAccountField(o.billingAccount) : {}),
+      ...(o.decisionMeta !== undefined
+        ? { metadata: { ...(meta ?? {}), ...o.decisionMeta } }
+        : meta !== undefined
+          ? { metadata: meta }
+          : {}),
     });
 
-    // steer/route path: route through proxy-client with full hardening.
-    const proxyUrl = opts.hardening.proxyUrl;
-    if (
-      needsProxyUrl(effectiveLayer) &&
-      proxyUrl &&
-      opts.operation === "chat.completions"
-    ) {
-      const { providerUrl, providerAuth } = providerTarget(
-        opts.clientRef,
-        "openai",
-        "https://api.openai.com/v1",
+    const post = (obs: Observation): void =>
+      postObservation(opts.transport, overhead, {
+        ...obs,
+        ...(complianceStamp.compliance_frameworks?.length
+          ? { compliance_frameworks: complianceStamp.compliance_frameworks }
+          : {}),
+        ...(complianceStamp.dlp_action ? { dlp_action: complianceStamp.dlp_action } : {}),
+        ...observationScope(opts.hardening.application, opts.hardening.tags),
+      });
+
+    /** In-process DLP and the team check, from a compliance snapshot. */
+    const applyCompliance = (snap: CompiledComplianceSnapshot | null): void => {
+      assertTeamScope({ clientTeamId: opts.hardening.teamId ?? null });
+      const dlpResult = enforceInProcessDlp(extractOpenAiMessagesText(args), snap, args);
+      complianceStamp = complianceStampFrom(snap, dlpResult);
+    };
+
+    /**
+     * Call the provider and record the call when its answer (or its stream)
+     * is in. Returns what the client's create() returned, observed.
+     */
+    const callProvider = (decisionMeta?: Record<string, string>): unknown => {
+      const url = clientBaseUrl(opts.clientRef);
+      let call: unknown;
+      try {
+        call = bound.apply(self, args);
+      } catch (err) {
+        call = Promise.reject(err);
+      }
+      overhead.pauseForAwait();
+      return observeApiCall(call, {
+        url,
+        usageOf: extractUsage,
+        streamTracker: openAiStreamTracker,
+        success: (usage, billingAccount) => {
+          overhead.resumeAfterAwait();
+          post(observation({ status: "success", usage, billingAccount, decisionMeta }));
+        },
+        error: (err) => {
+          overhead.resumeAfterAwait();
+          post(
+            observation({
+              status: "error",
+              error: err,
+              billingAccount: billingAccountOfError(err, url),
+              decisionMeta,
+            }),
+          );
+        },
+      });
+    };
+
+    const proxied = (layer: ControlLayer) =>
+      needsProxyUrl(layer) && !!opts.hardening.proxyUrl && opts.operation === "chat.completions";
+    const admitted = (layer: ControlLayer) =>
+      layer === "govern" && opts.operation === "chat.completions";
+
+    // Same tick when the layer is known and nothing needs checking first:
+    // the caller gets the client's own APIPromise.
+    let known: ReturnType<SdkLayerClient["peek"]> = null;
+    try {
+      const sl = opts.hardening.sdkLayer as Partial<SdkLayerClient>;
+      known = typeof sl.peek === "function" ? sl.peek.call(sl, opts.hardening.maxLayer) : null;
+    } catch (err) {
+      return TensorCostAPIPromise.rejected(err);
+    }
+    if (known !== null && !proxied(known.layer) && !admitted(known.layer)) {
+      if (opts.operation === "chat.completions") {
+        try {
+          applyCompliance(known.compliance);
+        } catch (err) {
+          if (
+            err instanceof TensorCostComplianceDeniedError ||
+            err instanceof TensorCostComplianceTeamMismatchError
+          ) {
+            return TensorCostAPIPromise.rejected(err);
+          }
+        }
+      }
+      return callProvider();
+    }
+
+    const run = async (): Promise<CallSource> => {
+      const effectiveLayer = await withAwaitExcluded(overhead, () =>
+        opts.hardening.sdkLayer.effectiveLayer(opts.hardening.maxLayer),
       );
 
-      const body: Record<string, unknown> = {
-        ...(firstArg && typeof firstArg === "object" ? firstArg : {}),
-        model: String(model),
-      };
+      if (opts.operation === "chat.completions") {
+        try {
+          const complianceSnap = await withAwaitExcluded(overhead, () =>
+            opts.hardening.sdkLayer.getComplianceSnapshot(effectiveLayer),
+          );
+          applyCompliance(complianceSnap);
+        } catch (err) {
+          if (
+            err instanceof TensorCostComplianceDeniedError ||
+            err instanceof TensorCostComplianceTeamMismatchError
+          ) {
+            throw err;
+          }
+          // Fail-open on snapshot fetch errors unless HIPAA/PCI closed (server enforces on admit).
+        }
+      }
 
-      const isStreamingRequest = body.stream === true;
+      let decisionMeta: Record<string, string> | undefined;
+      if (admitted(effectiveLayer)) {
+        try {
+          const admit = await withAwaitExcluded(overhead, async () => {
+            // The token wait counts against admit's own budget: with
+            // TensorCost unreachable the call waits at most that, once.
+            const bearerToken = await callPathToken(opts, ADMIT_TIMEOUT_MS);
+            return admitRequest({
+              baseUrl: opts.hardening.baseUrl,
+              bearerToken,
+              maxLayer: effectiveLayer,
+              metadata: {
+                provider: providerName,
+                model: String(model),
+                operation: opts.operation,
+                correlation_id: correlationId,
+                environment: opts.environment,
+                connection_id: opts.connectionId,
+                agent_id: resolvedAgentId,
+                workflow_id: resolvedWorkflowId,
+                customer: resolvedCustomer,
+                feature: resolvedFeature,
+                application: opts.hardening.application ?? null,
+                tags: opts.hardening.tags ?? [],
+                team_id: opts.hardening.teamId ?? null,
+              },
+              failOpen: opts.hardening.failOpenEnabled,
+            });
+          });
+          if (!admit.allowed) {
+            // The admit client types every refusal by its code. The generic
+            // error is only a guard; it used to say "model governance" for
+            // every refusal, budget caps included.
+            throw (
+              admit.refusal ??
+              new TensorCostRefusedError("tensorcost: request refused at govern layer", {}, {
+                status: 403,
+                attempt: 1,
+              })
+            );
+          }
+          decisionMeta = admit.unavailable ? ADMIT_UNAVAILABLE : decisionMetadata(admit.decisionHeader);
+        } catch (err) {
+          // Same rule as the proxy path: go around TensorCost only when it
+          // is unavailable (token exchange or admit unreachable), and only
+          // with failOpenEnabled. A refusal, known code or not, stops the call.
+          if (!shouldFallBackToProvider(err) || !opts.hardening.failOpenEnabled) throw err;
+          decisionMeta = ADMIT_UNAVAILABLE;
+        }
+      }
 
-      let proxyResult: unknown;
-      let proxyFailed = false;
-      let proxyFailureError: Error | null = null;
+      // steer/route path: route through proxy-client with full hardening.
+      const proxyUrl = opts.hardening.proxyUrl;
+      if (proxied(effectiveLayer) && proxyUrl) {
+        const { providerUrl, providerAuth } = providerTarget(
+          opts.clientRef,
+          "openai",
+          "https://api.openai.com/v1",
+        );
 
-      if (isStreamingRequest) {
+        const body: Record<string, unknown> = {
+          ...(firstArg && typeof firstArg === "object" ? firstArg : {}),
+          model: String(model),
+        };
+
+        const isStreamingRequest = body.stream === true;
+        const request = {
+          proxyUrl,
+          providerUrl,
+          providerAuth,
+          body,
+          model: String(model),
+          provider: "openai" as const,
+          operation: String(opts.operation),
+          correlationId,
+          environment: opts.environment,
+          application: opts.hardening.application ?? null,
+          tags: opts.hardening.tags ?? [],
+          agentId: resolvedAgentId,
+          workflowId: resolvedWorkflowId,
+          customer: resolvedCustomer,
+          feature: resolvedFeature,
+          teamId: opts.hardening.teamId ?? undefined,
+          retry: opts.hardening.retry,
+          timeoutMs: opts.hardening.timeoutMs,
+          headersTimeoutMs: opts.hardening.headersTimeoutMs,
+          idleTimeoutMs: opts.hardening.idleTimeoutMs,
+          onLifecycleEvent: opts.hardening.onLifecycleEvent,
+          circuit: opts.hardening.circuit,
+          maxLayer: effectiveLayer,
+          failOpenFast: opts.hardening.failOpenEnabled,
+        };
+
+        let proxyResult: unknown;
+        let proxyResponse: Response | null = null;
+        let proxyFailed = false;
+        let proxyFailureError: Error | null = null;
+
+        // Snapshot circuit state before the call to detect fallback events.
         const circuitWasOpen = opts.hardening.circuit.shouldBypass();
         let shouldTryProxy = !circuitWasOpen;
         if (circuitWasOpen) {
           shouldTryProxy = opts.hardening.circuit.shouldProbe();
         }
+
         if (shouldTryProxy) {
           try {
-            const getToken = opts.getToken ?? (() => (opts.transport as any).getToken());
-            const proxyStreamResp = await withAwaitExcluded(overhead, async () => {
-              const bearerToken = await getToken();
-              return proxyRequestStream({
-                proxyUrl,
-                bearerToken,
-                providerUrl,
-                providerAuth,
-                body,
-                model: String(model),
-                provider: "openai",
-                operation: String(opts.operation),
-                correlationId,
-                environment: opts.environment,
-                application: opts.hardening.application ?? null,
-                tags: opts.hardening.tags ?? [],
-                agentId: resolvedAgentId,
-                workflowId: resolvedWorkflowId,
-                customer: resolvedCustomer,
-                feature: resolvedFeature,
-                teamId: opts.hardening.teamId ?? undefined,
-                retry: opts.hardening.retry,
-                timeoutMs: opts.hardening.timeoutMs,
-                headersTimeoutMs: opts.hardening.headersTimeoutMs,
-                idleTimeoutMs: opts.hardening.idleTimeoutMs,
-                onLifecycleEvent: opts.hardening.onLifecycleEvent,
-                circuit: opts.hardening.circuit,
-                maxLayer: effectiveLayer,
-                failOpenFast: opts.hardening.failOpenEnabled,
+            // The token wait counts against the proxy's headers budget.
+            if (isStreamingRequest) {
+              const proxyStreamResp = await withAwaitExcluded(overhead, async () => {
+                const bearerToken = await callPathToken(opts, opts.hardening.headersTimeoutMs);
+                return proxyRequestStream({ ...request, bearerToken });
               });
-            });
-            decisionMeta = decisionMetadata(proxyStreamResp.decisionHeader);
-            proxyResult = sseChunksFromStream(proxyStreamResp.stream);
+              decisionMeta = decisionMetadata(proxyStreamResp.decisionHeader);
+              proxyResult = sseChunksFromStream(proxyStreamResp.stream);
+              proxyResponse = proxyStreamResp.response ?? null;
+            } else {
+              const proxyResp = await withAwaitExcluded(overhead, async () => {
+                const bearerToken = await callPathToken(opts, opts.hardening.headersTimeoutMs);
+                return proxyRequest({ ...request, bearerToken });
+              });
+              proxyResult = proxyResp.body;
+              proxyResponse = proxyResp.response ?? null;
+              decisionMeta = decisionMetadata(proxyResp.decisionHeader);
+            }
           } catch (proxyErr) {
+            // A run-budget refusal is a decision, not a failure. Rethrow it
+            // immediately so it never reaches the fail-open fallback below —
+            // otherwise the cap would be enforced by the proxy and then
+            // silently bypassed by us calling OpenAI directly.
             if (!shouldFallBackToProvider(proxyErr)) throw providerNativeError(opts.clientRef, proxyErr);
             proxyFailed = true;
             proxyFailureError = proxyErr as Error;
@@ -370,280 +486,65 @@ function wrapMethod(
         } else {
           proxyFailed = true;
         }
-      } else {
-      // Snapshot circuit state before the call to detect fallback events.
-      const circuitWasOpen = opts.hardening.circuit.shouldBypass();
-      let shouldTryProxy = !circuitWasOpen;
-      if (circuitWasOpen) {
-        shouldTryProxy = opts.hardening.circuit.shouldProbe();
-      }
 
-      if (shouldTryProxy) {
-        try {
-          const getToken = opts.getToken ?? (() => (opts.transport as any).getToken());
-          const proxyResp = await withAwaitExcluded(overhead, async () => {
-            const bearerToken = await getToken();
-            return proxyRequest({
-              proxyUrl,
-              bearerToken,
-              providerUrl,
-              providerAuth,
-              body,
-              model: String(model),
-              provider: "openai",
-              operation: String(opts.operation),
-              correlationId,
-              environment: opts.environment,
-              application: opts.hardening.application ?? null,
-              tags: opts.hardening.tags ?? [],
-              agentId: resolvedAgentId,
-              workflowId: resolvedWorkflowId,
-              customer: resolvedCustomer,
-              feature: resolvedFeature,
-              teamId: opts.hardening.teamId ?? undefined,
-              retry: opts.hardening.retry,
-              timeoutMs: opts.hardening.timeoutMs,
-              headersTimeoutMs: opts.hardening.headersTimeoutMs,
-              onLifecycleEvent: opts.hardening.onLifecycleEvent,
-              circuit: opts.hardening.circuit,
-              maxLayer: effectiveLayer,
-              failOpenFast: opts.hardening.failOpenEnabled,
-            });
+        // Fail-open: direct provider only when the proxy path failed — not
+        // after a successful HALF_OPEN probe (circuitWasOpen must not trigger
+        // a second provider call).
+        if (proxyFailed) {
+          if (!opts.hardening.failOpenEnabled) {
+            // Customer opted out of fail-open. Throw the proxy error.
+            const tcErr =
+              proxyFailureError instanceof TensorCostProxyError
+                ? proxyFailureError
+                : new TensorCostProxyError(
+                    proxyFailureError?.message ?? "proxy unavailable",
+                    { cause: proxyFailureError ?? undefined, attempt: 1 },
+                  );
+            post(observation({ status: "error", error: tcErr, decisionMeta }));
+            throw tcErr;
+          }
+
+          // Emit fallback event and call the provider directly.
+          emitEvent(opts.hardening.onLifecycleEvent, {
+            kind: "on_fallback",
+            provider: "openai",
+            model: String(model),
+            operation: String(opts.operation),
+            attemptNumber: 1,
+            elapsedMs: 0,
+            consecutiveFailures: opts.hardening.circuit.failures,
           });
-          proxyResult = proxyResp.body;
-          decisionMeta = decisionMetadata(proxyResp.decisionHeader);
-        } catch (proxyErr) {
-          // A run-budget refusal is a decision, not a failure. Rethrow it
-          // immediately so it never reaches the fail-open fallback below —
-          // otherwise the cap would be enforced by the proxy and then
-          // silently bypassed by us calling OpenAI directly.
-          if (!shouldFallBackToProvider(proxyErr)) throw providerNativeError(opts.clientRef, proxyErr);
-          proxyFailed = true;
-          proxyFailureError = proxyErr as Error;
-        } finally {
-          opts.hardening.circuit.releaseStuckProbe();
-        }
-      } else {
-        proxyFailed = true;
-      }
-      } // !isStreamingRequest
-
-      // Fail-open: direct provider only when the proxy path failed — not
-      // after a successful HALF_OPEN probe (circuitWasOpen must not trigger
-      // a second provider call).
-      if (proxyFailed) {
-        if (!opts.hardening.failOpenEnabled) {
-          // Customer opted out of fail-open. Throw the proxy error.
-          const tcErr =
-            proxyFailureError instanceof TensorCostProxyError
-              ? proxyFailureError
-              : new TensorCostProxyError(
-                  proxyFailureError?.message ?? "proxy unavailable",
-                  { cause: proxyFailureError ?? undefined, attempt: 1 },
-                );
-          const obs: Observation = {
-            sdk_version: SDK_VERSION,
-            provider: providerName,
-            model: String(model),
-            operation: opts.operation,
-            request_at: requestAt,
-            response_at: nowIso(),
-            input_tokens: null,
-            output_tokens: null,
-            cost_usd_cents: null,
-            status: "error",
-            error_message: `${tcErr.name}: ${tcErr.message}`,
-            correlation_id: correlationId,
-            ...traceLink,
-            ...(opts.environment !== null ? { environment: opts.environment } : {}),
-            ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-            ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-            ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-            ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-            ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-            ...decisionSpread,
-          };
-          postObservation(opts.transport, overhead, stampObservation(obs));
-          throw tcErr;
+          return { kind: "call", call: callProvider(decisionMeta) };
         }
 
-        // Emit fallback event and call the provider directly.
-        emitEvent(opts.hardening.onLifecycleEvent, {
-          kind: "on_fallback",
-          provider: "openai",
-          model: String(model),
-          operation: String(opts.operation),
-          attemptNumber: 1,
-          elapsedMs: 0,
-          consecutiveFailures: opts.hardening.circuit.failures,
-        });
-
-        try {
-          let directCall: unknown;
-          const directResponse = await withAwaitExcluded(overhead, () =>
-            (directCall = bound.apply(this, args)),
+        // Proxy call succeeded. A stream is recorded when it ends, with the
+        // usage chunk the proxy relayed.
+        const proxyMeta = decisionMeta;
+        if (isStreamingRequest) {
+          overhead.pauseForAwait();
+          const stream = tapStream(
+            proxyResult,
+            openAiStreamTracker(),
+            (usage) => {
+              overhead.resumeAfterAwait();
+              post(observation({ status: "success", usage, decisionMeta: proxyMeta }));
+            },
+            (err) => {
+              overhead.resumeAfterAwait();
+              post(observation({ status: "error", error: err, decisionMeta: proxyMeta }));
+            },
           );
-          const { input, output } = extractUsage(directResponse);
-          const billingAccount = await billingAccountOfApiPromise(directCall, clientBaseUrl(opts.clientRef));
-          const obs: Observation = {
-            sdk_version: SDK_VERSION,
-            provider: providerName,
-            model: String(model),
-            operation: opts.operation,
-            request_at: requestAt,
-            response_at: nowIso(),
-            input_tokens: input,
-            output_tokens: output,
-            cost_usd_cents: null,
-            status: "success",
-            error_message: null,
-            correlation_id: correlationId,
-            ...traceLink,
-            ...(opts.environment !== null ? { environment: opts.environment } : {}),
-            ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-            ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-            ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-            ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-            ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-            ...billingAccountField(billingAccount),
-            ...decisionSpread,
-          };
-          postObservation(opts.transport, overhead, stampObservation(obs));
-          return directResponse;
-        } catch (directErr) {
-          const obs: Observation = {
-            sdk_version: SDK_VERSION,
-            provider: providerName,
-            model: String(model),
-            operation: opts.operation,
-            request_at: requestAt,
-            response_at: nowIso(),
-            input_tokens: null,
-            output_tokens: null,
-            cost_usd_cents: null,
-            status: "error",
-            error_message: `${(directErr as Error).name}: ${(directErr as Error).message}`,
-            correlation_id: correlationId,
-            ...traceLink,
-            ...(opts.environment !== null ? { environment: opts.environment } : {}),
-            ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-            ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-            ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-            ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-            ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-            ...billingAccountField(billingAccountOfError(directErr, clientBaseUrl(opts.clientRef))),
-            ...decisionSpread,
-          };
-          postObservation(opts.transport, overhead, stampObservation(obs));
-          throw directErr;
+          return { kind: "proxy", data: stream, response: proxyResponse };
         }
+        post(observation({ status: "success", usage: extractUsage(proxyResult), decisionMeta: proxyMeta }));
+        return { kind: "proxy", data: proxyResult, response: proxyResponse };
       }
 
-      const proxyDecisionSpread =
-        decisionMeta !== undefined
-          ? {
-              metadata: {
-                ...(meta !== undefined ? meta : {}),
-                ...decisionMeta,
-              },
-            }
-          : metaSpread;
+      // Observe / govern direct path (or legacy completions.create).
+      return { kind: "call", call: callProvider(decisionMeta) };
+    };
 
-      // Proxy call succeeded.
-      const respBody = isStreamingRequest
-        ? null
-        : (proxyResult as Record<string, unknown>);
-      const usageRaw = respBody?.usage as Record<string, unknown> | undefined;
-      const input =
-        typeof usageRaw?.prompt_tokens === "number" ? usageRaw.prompt_tokens : null;
-      const output =
-        typeof usageRaw?.completion_tokens === "number" ? usageRaw.completion_tokens : null;
-      const obs: Observation = {
-        sdk_version: SDK_VERSION,
-        provider: providerName,
-        model: String(model),
-        operation: opts.operation,
-        request_at: requestAt,
-        response_at: nowIso(),
-        input_tokens: input,
-        output_tokens: output,
-        cost_usd_cents: null,
-        status: "success",
-        error_message: null,
-        correlation_id: correlationId,
-        ...traceLink,
-        ...(opts.environment !== null ? { environment: opts.environment } : {}),
-        ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-        ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-        ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-        ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-        ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-        ...proxyDecisionSpread,
-      };
-      postObservation(opts.transport, overhead, stampObservation(obs));
-      return proxyResult;
-    }
-
-    // Observe / govern direct path (or legacy completions.create).
-    try {
-      let call: unknown;
-      const response = await withAwaitExcluded(overhead, () =>
-        (call = bound.apply(this, args)),
-      );
-      const { input, output } = extractUsage(response);
-      const billingAccount = await billingAccountOfApiPromise(call, clientBaseUrl(opts.clientRef));
-      const obs: Observation = {
-        sdk_version: SDK_VERSION,
-        provider: providerName,
-        model: String(model),
-        operation: opts.operation,
-        request_at: requestAt,
-        response_at: nowIso(),
-        input_tokens: input,
-        output_tokens: output,
-        cost_usd_cents: null,
-        status: "success",
-        error_message: null,
-        correlation_id: correlationId,
-        ...traceLink,
-        ...(opts.environment !== null ? { environment: opts.environment } : {}),
-        ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-        ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-        ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-        ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-        ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-        ...billingAccountField(billingAccount),
-        ...decisionSpread,
-      };
-      postObservation(opts.transport, overhead, stampObservation(obs));
-      return response;
-    } catch (err) {
-      const obs: Observation = {
-        sdk_version: SDK_VERSION,
-        provider: providerName,
-        model: String(model),
-        operation: opts.operation,
-        request_at: requestAt,
-        response_at: nowIso(),
-        input_tokens: null,
-        output_tokens: null,
-        cost_usd_cents: null,
-        status: "error",
-        error_message: `${(err as Error).name}: ${(err as Error).message}`,
-        correlation_id: correlationId,
-        ...traceLink,
-        ...(opts.environment !== null ? { environment: opts.environment } : {}),
-        ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-        ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-        ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-        ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-        ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-        ...billingAccountField(billingAccountOfError(err, clientBaseUrl(opts.clientRef))),
-        ...decisionSpread,
-      };
-      postObservation(opts.transport, overhead, stampObservation(obs));
-      throw err;
-    }
+    return new TensorCostAPIPromise(run());
   };
 
   Object.defineProperty(wrapped, MARKER, { value: true, enumerable: false });

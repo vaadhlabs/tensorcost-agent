@@ -31,9 +31,18 @@ import { MissingConfigError } from "./config.js";
 import type { Observation } from "./types.js";
 import { SDK_VERSION } from "./version.js";
 const TOKEN_REFRESH_LEEWAY_MS = 60_000;
+/** A token this close to expiry is not handed out; the caller waits for a new one. */
+const TOKEN_EXPIRY_MARGIN_MS = 5_000;
 const DEFAULT_TOKEN_LIFETIME_MS = 15 * 60_000;
 const MAX_QUEUE_DEPTH = 1024;
 const DEFAULT_TIMEOUT_MS = 2_000;
+/**
+ * After a token exchange fails because TensorCost is unreachable, how long
+ * callers on the request path are told so straight away instead of starting
+ * (and waiting on) another exchange. Observations made meanwhile are lost
+ * either way; the call is not slowed down by them.
+ */
+const TOKEN_OUTAGE_COOLDOWN_MS = 5_000;
 
 export interface TransportOptions {
   baseUrl: string;
@@ -63,6 +72,10 @@ export class ObservationTransport {
   private tokenCache: TokenCache | null = null;
   /** In-flight token-exchange promise; coalesces concurrent refreshes. */
   private tokenInflight: Promise<string> | null = null;
+  /** When the in-flight exchange started (Date.now()). */
+  private tokenInflightStartedAt = 0;
+  /** The last exchange that failed because TensorCost was unreachable. */
+  private lastOutage: { err: Error; at: number } | null = null;
 
   constructor(opts: TransportOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
@@ -139,9 +152,67 @@ export class ObservationTransport {
     }
   }
 
-  /** Exchange or return cached JWT for proxy/admit/sdk-layer calls. */
-  async getToken(): Promise<string> {
-    return this.fetchToken();
+  /**
+   * Exchange or return the cached JWT for proxy/admit/sdk-layer calls.
+   *
+   * `budgetMs` is for callers on the customer's request path. They wait at
+   * most that long, and no longer than that after the exchange in flight
+   * started; the exchange itself carries on (with its own timeout) and
+   * fills the cache for the next call. Giving up throws
+   * TensorCostTimeoutError, which the fail-open rule reads as TensorCost
+   * being unavailable. Within TOKEN_OUTAGE_COOLDOWN_MS of an exchange that
+   * failed the same way, the call is told at once rather than made to wait
+   * on another one. Through 1.7.0 every call waited out the full 2 s
+   * exchange timeout, twice, whenever TensorCost was unreachable.
+   */
+  async getToken(opts: { budgetMs?: number } = {}): Promise<string> {
+    const cached = this.cachedToken();
+    if (cached !== null) return cached;
+    if (opts.budgetMs === undefined) return this.fetchToken();
+    const now = Date.now();
+    if (this.lastOutage && now - this.lastOutage.at < TOKEN_OUTAGE_COOLDOWN_MS) {
+      throw this.lastOutage.err;
+    }
+    const exchange = this.fetchToken();
+    const wait = Math.max(0, Math.min(opts.budgetMs, this.tokenInflightStartedAt + opts.budgetMs - now));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        exchange,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new TensorCostTimeoutError(
+                  `tensorcost: token-exchange did not answer within ${opts.budgetMs}ms`,
+                  "total",
+                ),
+              ),
+            wait,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * The cached token while it is still good. Inside the refresh leeway it is
+   * still returned, and a refresh starts in the background, so the call
+   * that notices the token is ageing doesn't wait for its replacement.
+   */
+  private cachedToken(): string | null {
+    const c = this.tokenCache;
+    if (!c) return null;
+    const now = Date.now();
+    if (now < c.expiresAt - TOKEN_REFRESH_LEEWAY_MS) return c.token;
+    if (now < c.expiresAt - TOKEN_EXPIRY_MARGIN_MS) {
+      const cooling = this.lastOutage && now - this.lastOutage.at < TOKEN_OUTAGE_COOLDOWN_MS;
+      if (!this.tokenInflight && !cooling) void this.startExchange();
+      return c.token;
+    }
+    return null;
   }
 
   /** In-flight observation POST count (microtask queue + network). */
@@ -161,19 +232,29 @@ export class ObservationTransport {
   }
 
   private async fetchToken(): Promise<string> {
-    const now = Date.now();
-    if (
-      this.tokenCache &&
-      now < this.tokenCache.expiresAt - TOKEN_REFRESH_LEEWAY_MS
-    ) {
-      return this.tokenCache.token;
-    }
-    if (this.tokenInflight) {
-      return this.tokenInflight;
-    }
-    this.tokenInflight = this.exchangeToken().finally(() => {
-      this.tokenInflight = null;
-    });
+    const cached = this.cachedToken();
+    if (cached !== null) return cached;
+    return this.tokenInflight ?? this.startExchange();
+  }
+
+  private startExchange(): Promise<string> {
+    this.tokenInflightStartedAt = Date.now();
+    this.tokenInflight = this.exchangeToken()
+      .then(
+        (token) => {
+          this.lastOutage = null;
+          return token;
+        },
+        (err: unknown) => {
+          if (isOutage(err)) this.lastOutage = { err: err as Error, at: Date.now() };
+          throw err;
+        },
+      )
+      .finally(() => {
+        this.tokenInflight = null;
+      });
+    // A bounded caller may have stopped waiting; nobody else may be listening.
+    this.tokenInflight.catch(() => undefined);
     return this.tokenInflight;
   }
 
@@ -258,7 +339,18 @@ export class ObservationTransport {
   }
 }
 
+/** The exchange failed because TensorCost was unreachable, not because it said no. */
+function isOutage(err: unknown): boolean {
+  return (
+    err instanceof TensorCostNetworkError ||
+    err instanceof TensorCostTimeoutError ||
+    err instanceof TensorCostProxyError ||
+    err instanceof TensorCostQuotaError
+  );
+}
+
 export const __test__ = {
+  TOKEN_OUTAGE_COOLDOWN_MS,
   SDK_VERSION,
   MAX_QUEUE_DEPTH,
 };

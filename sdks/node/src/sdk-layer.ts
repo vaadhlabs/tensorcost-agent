@@ -2,9 +2,15 @@
  * Fetches the console-published control layer with a 30s cache.
  * Decays to govern when the endpoint is unreachable for SDK_LAYER_DECAY_MS.
  *
- * Refresh never blocks an agent call once a snapshot exists: expired cache
- * is served immediately (stale-while-revalidate). Cold fetch is capped at
- * SDK_LAYER_FETCH_TIMEOUT_MS so a hung TensorCost cannot stall the model call.
+ * A call waits on TensorCost here at most once, and for at most
+ * SDK_LAYER_FETCH_TIMEOUT_MS: the first call of a cold process, before any
+ * answer (or failure) is known, token exchange included. Every other call
+ * is answered from what is known (fresh cache, stale cache within the decay
+ * window, or the decay fallback after a failure) and refreshes in the
+ * background. Through 1.7.0 the cold cap applied to the GET alone, after an
+ * unbounded token exchange, and a failure was never remembered, so with
+ * TensorCost unreachable every call paid the 2 s exchange timeout once for
+ * the layer and again for the compliance snapshot.
  */
 
 import type { CompiledComplianceSnapshot, ControlLayer } from "./layer.js";
@@ -15,6 +21,8 @@ import {
   SDK_LAYER_CACHE_TTL_MS,
   SDK_LAYER_DECAY_MS,
   SDK_LAYER_FETCH_TIMEOUT_MS,
+  SDK_LAYER_REFRESH_TIMEOUT_MS,
+  SDK_LAYER_RETRY_MS,
   SDK_LAYER_PATH,
   type DataGrant,
   type DlpAction,
@@ -107,7 +115,12 @@ export class SdkLayerClient {
   } | null = null;
   /** 0 until the first successful fetch — cold start must not skip decay-to-govern. */
   private lastSuccessAt = 0;
+  /** When the last refresh failed; 0 after a success. */
+  private lastFailureAt = 0;
+  /** The token is bound to another team (403): every call throws it until a refresh succeeds. */
+  private teamMismatch: TensorCostComplianceTeamMismatchError | null = null;
   private refreshInflight: Promise<void> | null = null;
+  private refreshStartedAt = 0;
 
   constructor(opts: SdkLayerClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
@@ -120,21 +133,27 @@ export class SdkLayerClient {
   async getComplianceSnapshot(
     codeMaxLayer: ControlLayer = "observe",
   ): Promise<CompiledComplianceSnapshot | null> {
-    const snap = await this.fetchPublishedSnapshot(codeMaxLayer);
-    if (snap.compliance) return snap.compliance;
-    if (this.cache?.compliance?.fail_mode === "closed") {
-      throw new TensorCostComplianceDeniedError(
-        "tensorcost: compliance snapshot unavailable (fail-closed)",
-        "snapshot_unavailable",
-      );
-    }
-    return null;
+    return this.complianceOf(await this.fetchPublishedSnapshot(codeMaxLayer));
   }
 
   /** effective = min(codeMaxLayer, published). */
   async effectiveLayer(codeMaxLayer: ControlLayer): Promise<ControlLayer> {
     const snap = await this.fetchPublishedSnapshot(codeMaxLayer);
     return minLayer(codeMaxLayer, snap.layer);
+  }
+
+  /**
+   * What effectiveLayer() and getComplianceSnapshot() would answer, when
+   * that is known without waiting; null for a cold client that has no
+   * answer yet. Throws what they would throw. Lets a wrapper call the
+   * provider in the same tick and hand back the provider's own APIPromise.
+   */
+  peek(
+    codeMaxLayer: ControlLayer,
+  ): { layer: ControlLayer; compliance: CompiledComplianceSnapshot | null } | null {
+    const snap = this.snapshotNow(codeMaxLayer, Date.now());
+    if (snap === null) return null;
+    return { layer: minLayer(codeMaxLayer, snap.layer), compliance: this.complianceOf(snap) };
   }
 
   /** intersect(codeMaxGrants, console.data_grants). Absent codeMax = all console grants. */
@@ -148,47 +167,100 @@ export class SdkLayerClient {
     return intersectGrants(snap.compliance.max_grants, consoleGrants);
   }
 
+  private complianceOf(snap: LayerSnapshot): CompiledComplianceSnapshot | null {
+    if (snap.compliance) return snap.compliance;
+    if (this.cache?.compliance?.fail_mode === "closed") {
+      throw new TensorCostComplianceDeniedError(
+        "tensorcost: compliance snapshot unavailable (fail-closed)",
+        "snapshot_unavailable",
+      );
+    }
+    return null;
+  }
+
   private async fetchPublishedSnapshot(codeMaxLayer: ControlLayer): Promise<LayerSnapshot> {
-    const now = Date.now();
+    const known = this.snapshotNow(codeMaxLayer, Date.now());
+    if (known !== null) return known;
 
+    // Cold: nothing known yet. Wait for the one refresh, at most the budget,
+    // measured from when that refresh started.
+    this.scheduleRefresh(Date.now(), true);
+    const inflight = this.refreshInflight;
+    const wait = Math.max(0, this.refreshStartedAt + SDK_LAYER_FETCH_TIMEOUT_MS - Date.now());
+    if (inflight && wait > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        inflight,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, wait);
+        }),
+      ]).finally(() => clearTimeout(timer));
+    }
+    const now = Date.now();
+    return this.snapshotNow(codeMaxLayer, now) ?? this.fallback(codeMaxLayer, now);
+  }
+
+  /** The snapshot a call can use right now, or null when the client is cold. */
+  private snapshotNow(codeMaxLayer: ControlLayer, now: number): LayerSnapshot | null {
+    if (this.teamMismatch) {
+      this.scheduleRefresh(now);
+      throw this.teamMismatch;
+    }
     if (this.cache && now - this.cache.fetchedAt < SDK_LAYER_CACHE_TTL_MS) {
-      return {
-        layer: this.cache.layer,
-        dataGrants: this.cache.dataGrants,
-        compliance: this.cache.compliance,
-      };
+      return this.cachedSnapshot();
     }
-
     if (this.cache && now - this.lastSuccessAt < SDK_LAYER_DECAY_MS) {
-      this.scheduleRefresh();
-      return {
-        layer: this.cache.layer,
-        dataGrants: this.cache.dataGrants,
-        compliance: this.cache.compliance,
-      };
+      this.scheduleRefresh(now);
+      return this.cachedSnapshot();
     }
-
-    return this.refreshNow(codeMaxLayer);
+    if (this.cache || this.lastFailureAt > 0) {
+      this.scheduleRefresh(now);
+      return this.fallback(codeMaxLayer, now);
+    }
+    return null;
   }
 
-  private scheduleRefresh(): void {
+  private cachedSnapshot(): LayerSnapshot {
+    const c = this.cache!;
+    return { layer: c.layer, dataGrants: c.dataGrants, compliance: c.compliance };
+  }
+
+  /** What a call gets when TensorCost hasn't answered. */
+  private fallback(codeMaxLayer: ControlLayer, now: number): LayerSnapshot {
+    if (now - this.lastSuccessAt >= SDK_LAYER_DECAY_MS) {
+      if (this.cache?.compliance?.fail_mode === "closed") {
+        throw new TensorCostComplianceDeniedError(
+          "tensorcost: compliance snapshot unavailable (fail-closed)",
+          "snapshot_unavailable",
+        );
+      }
+      return { layer: "govern", dataGrants: [], compliance: null };
+    }
+    return {
+      layer: this.cache?.layer ?? codeMaxLayer,
+      dataGrants: this.cache?.dataGrants ?? [],
+      compliance: this.cache?.compliance ?? null,
+    };
+  }
+
+  /** Start a background refresh unless one is running or one failed a moment ago. */
+  private scheduleRefresh(now: number, cold = false): void {
     if (this.refreshInflight) return;
-    this.refreshInflight = this.refreshNow("observe")
-      .then(() => undefined)
-      .catch(() => undefined)
-      .finally(() => {
-        this.refreshInflight = null;
-      });
+    if (!cold && this.lastFailureAt > 0 && now - this.lastFailureAt < SDK_LAYER_RETRY_MS) return;
+    this.refreshStartedAt = now;
+    this.refreshInflight = this.refresh().finally(() => {
+      this.refreshInflight = null;
+    });
   }
 
-  private async refreshNow(codeMaxLayer: ControlLayer): Promise<LayerSnapshot> {
-    const now = Date.now();
+  /** One GET of the published layer. Never rejects; the outcome lands in the fields. */
+  private async refresh(): Promise<void> {
     try {
       const token = await this.getToken();
       const qs = this.teamId ? `?teamId=${encodeURIComponent(this.teamId)}` : "";
       const url = `${this.baseUrl}${SDK_LAYER_PATH}${qs}`;
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), SDK_LAYER_FETCH_TIMEOUT_MS);
+      const timer = setTimeout(() => controller.abort(), SDK_LAYER_REFRESH_TIMEOUT_MS);
       try {
         const resp = await this.fetchImpl(url, {
           method: "GET",
@@ -201,9 +273,11 @@ export class SdkLayerClient {
         });
 
         if (resp.status === 403) {
-          throw new TensorCostComplianceTeamMismatchError(
+          this.teamMismatch = new TensorCostComplianceTeamMismatchError(
             "tensorcost: SDK team scope does not match token binding",
           );
+          this.lastFailureAt = Date.now();
+          return;
         }
         if (!resp.ok) {
           throw new Error(`sdk-layer GET failed status=${resp.status}`);
@@ -233,31 +307,13 @@ export class SdkLayerClient {
 
         this.cache = { layer, dataGrants, compliance, fetchedAt: Date.now() };
         this.lastSuccessAt = Date.now();
-        return { layer, dataGrants, compliance };
+        this.lastFailureAt = 0;
+        this.teamMismatch = null;
       } finally {
         clearTimeout(timer);
       }
-    } catch (err) {
-      if (
-        err instanceof TensorCostComplianceTeamMismatchError ||
-        err instanceof TensorCostComplianceDeniedError
-      ) {
-        throw err;
-      }
-      if (now - this.lastSuccessAt >= SDK_LAYER_DECAY_MS) {
-        if (this.cache?.compliance?.fail_mode === "closed") {
-          throw new TensorCostComplianceDeniedError(
-            "tensorcost: compliance snapshot unavailable (fail-closed)",
-            "snapshot_unavailable",
-          );
-        }
-        return { layer: "govern", dataGrants: [], compliance: null };
-      }
-      return {
-        layer: this.cache?.layer ?? codeMaxLayer,
-        dataGrants: this.cache?.dataGrants ?? [],
-        compliance: this.cache?.compliance ?? null,
-      };
+    } catch {
+      this.lastFailureAt = Date.now();
     }
   }
 }

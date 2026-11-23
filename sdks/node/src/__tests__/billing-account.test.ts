@@ -226,14 +226,16 @@ describe("openai", () => {
     expect(observations[0]).not.toHaveProperty("billing_account");
   });
 
-  it("a streaming call is labelled at stream start, and the stream is the caller's", async () => {
+  it("a streaming call is labelled when the stream ends, and the stream is the caller's", async () => {
     const { transport, observations } = capture();
     const stream = { [Symbol.asyncIterator]: async function* () {} };
     const c = client("https://api.openai.com/v1", () =>
       apiPromise(stream, new Headers({ "openai-organization": "org-oai" })),
     );
     openaiProvider.install(c, transport, null, null, null, defaultHardening());
-    expect(await (c.chat.completions.create as any)({ ...req, stream: true })).toBe(stream);
+    const got = await (c.chat.completions.create as any)({ ...req, stream: true });
+    expect(got).toBe(stream);
+    for await (const _ of got) void _;
     await flush();
     expect(observations[0].billing_account).toBe("org-oai");
   });
