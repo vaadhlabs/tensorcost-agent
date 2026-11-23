@@ -264,12 +264,12 @@ class TestOpenAIHardeningViaWrap:
 
 
 def _admit_answering(status: int, body: Any = None):
-    """side_effect for admit_request: the real client against a canned answer."""
+    """side_effect for admit_call: the real client against a canned answer."""
     import httpx
 
     import tensorcost._admit_client as admit_mod
 
-    real = admit_mod.admit_request
+    real = admit_mod.admit_call
 
     def handler(_request: Any) -> Any:
         return httpx.Response(status, json=body) if body is not None else httpx.Response(status)
@@ -299,7 +299,7 @@ class TestAnthropicHardeningViaWrap:
         _stub_token(client)
         try:
             with patch("tensorcost._providers._anthropic.proxy_request") as proxy, patch(
-                "tensorcost._providers._anthropic.admit_request",
+                "tensorcost._providers._anthropic.admit_call",
                 side_effect=_admit_answering(204),
             ):
                 result = client.messages.create(
@@ -326,7 +326,7 @@ class TestAnthropicHardeningViaWrap:
         _stub_token(client)
         try:
             with patch(
-                "tensorcost._providers._anthropic.admit_request",
+                "tensorcost._providers._anthropic.admit_call",
                 side_effect=_admit_answering(503, {}),
             ):
                 result = client.messages.create(
@@ -352,7 +352,7 @@ class TestAnthropicHardeningViaWrap:
         _stub_token(client)
         try:
             with patch(
-                "tensorcost._providers._anthropic.admit_request",
+                "tensorcost._providers._anthropic.admit_call",
                 side_effect=_admit_answering(503, {}),
             ):
                 with pytest.raises(TensorCostProxyError):

@@ -35,7 +35,13 @@ def prewarm(
     except Exception:
         pass
     try:
-        sdk_layer.effective_layer(config.max_layer)
+        # Blocking on purpose: prewarm runs at init, off any call path, and
+        # a call's own wait for the layer is capped (SdkLayerClient).
+        refresh = getattr(sdk_layer, "_refresh_now", None)
+        if callable(refresh):
+            refresh(config.max_layer)
+        else:
+            sdk_layer.effective_layer(config.max_layer)
     except Exception:
         pass
 
