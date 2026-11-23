@@ -15,6 +15,8 @@
  *   TENSORCOST_TEST_ANTHROPIC=/path/to/node_modules/@anthropic-ai/sdk/index.mjs
  *
  * 1.5.0 was checked against openai@4.104.0 and @anthropic-ai/sdk@0.65.0.
+ * The "keeps the APIPromise" suites were written against openai@7.62.0 and
+ * @anthropic-ai/sdk@1.12.0 (the 1.7.0 Zelvora run, matrix evidence K).
  */
 
 import { existsSync } from "node:fs";
@@ -264,5 +266,161 @@ describe.skipIf(!ANTHROPIC || !existsSync(ANTHROPIC))("a real @anthropic-ai/sdk 
     expect(err).toBeInstanceOf(TensorCostBudgetHardCapError);
     expect(err).toMatchObject({ retryable: true, retryAfterSeconds: 5 });
     expect(calls.map((x) => x.url)).toEqual(["http://api.tc.test/api/inference-proxy/v1/admit"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The 1.7.0 Zelvora findings (matrix evidence K) against the real clients.
+// ---------------------------------------------------------------------------
+
+// Anthropic's SSE names each event (`event: message_start`); OpenAI's doesn't.
+const sse = (events: unknown[]) =>
+  new Response(
+    events
+      .map((e) => {
+        const type = (e as { type?: unknown }).type;
+        return `${typeof type === "string" ? `event: ${type}\n` : ""}data: ${JSON.stringify(e)}\n\n`;
+      })
+      .join("") + "data: [DONE]\n\n",
+    {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+    },
+  );
+
+function recorder(scn: { layer?: string; openai?: () => Response; anthropic?: () => Response; proxy?: () => Response }) {
+  const observations: Record<string, any>[] = [];
+  const proxyHeaders: Headers[] = [];
+  const f = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const url = typeof input === "string" ? input : (input as Request).url ?? String(input);
+    if (url.includes("/sdk-token/exchange")) return json(200, { token: "jwt", expires_in: 900 });
+    if (url.includes("/v1/sdk-layer")) return json(200, { published_layer: scn.layer ?? "observe" });
+    if (url.includes("/observation")) {
+      observations.push(JSON.parse(String(init.body)));
+      return new Response(null, { status: 202 });
+    }
+    if (url.includes("/v1/admit")) return new Response(null, { status: 204, headers: { "x-tc-decision": "layer=govern; action=allow" } });
+    if (url.startsWith("http://proxy.test")) {
+      proxyHeaders.push(new Headers(init.headers ?? {}));
+      return scn.proxy!();
+    }
+    if (url.startsWith("https://api.openai.com")) return scn.openai ? scn.openai() : json(200, chatOk);
+    if (url.startsWith("https://api.anthropic.com")) return scn.anthropic ? scn.anthropic() : json(200, msgOk);
+    throw new TypeError(`fetch failed: unrouted ${url}`);
+  }) as typeof fetch;
+  return { f, observations, proxyHeaders };
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 20));
+const tcOpts = { apiKey: "tc", tenantId: TENANT, baseUrl: "http://api.tc.test" };
+
+describe.skipIf(!OPENAI || !existsSync(OPENAI))("a real openai client keeps its APIPromise", () => {
+  async function setup(scn: Parameters<typeof recorder>[0], opts: Record<string, unknown> = {}) {
+    const { default: OpenAI } = (await import(OPENAI)) as { default: new (o: unknown) => any };
+    const r = recorder(scn);
+    globalThis.fetch = r.f;
+    const c = new OpenAI({ apiKey: "sk-provider", fetch: r.f, maxRetries: 0 });
+    wrap(c, { ...tcOpts, ...opts });
+    const { prewarm } = await import("../prewarm.js");
+    await prewarm({ ...tcOpts, ...opts });
+    return { ...r, c };
+  }
+  const ask = { model: "gpt-4.1-mini", messages: [{ role: "user", content: "Say ok." }] };
+
+  it("observe: create() is openai's APIPromise; withResponse() and asResponse() work and record", async () => {
+    const { c, observations } = await setup({});
+    const p = c.chat.completions.create(ask);
+    expect(p.constructor.name).toBe("APIPromise");
+    const { data, response } = await p.withResponse();
+    expect(data.id).toBe("chatcmpl-direct");
+    expect(response.status).toBe(200);
+    const raw = await c.chat.completions.create(ask).asResponse();
+    expect((await raw.json()).id).toBe("chatcmpl-direct");
+    await tick();
+    expect(observations).toHaveLength(2);
+    expect(observations.map((o) => [o.input_tokens, o.output_tokens])).toEqual([[1, 1], [1, 1]]);
+  });
+
+  it("observe: a stream with include_usage is recorded with its usage when it ends", async () => {
+    const chunks = [
+      { id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: { content: "Ok." }, finish_reason: null }] },
+      { id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [], usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } },
+    ];
+    const { c, observations } = await setup({ openai: () => sse(chunks) });
+    const stream = await c.chat.completions.create({ ...ask, stream: true, stream_options: { include_usage: true } });
+    let n = 0;
+    for await (const _ of stream) n += 1;
+    expect(n).toBe(3);
+    await tick();
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({ input_tokens: 10, output_tokens: 2 });
+  });
+
+  it("observe: openai's own chat.completions.stream() helper works through the wrapper", async (ctx) => {
+    const chunks = [
+      { id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: { role: "assistant", content: "Ok." }, finish_reason: null }] },
+      { id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 4, completion_tokens: 1, total_tokens: 5 } },
+    ];
+    const { c, observations } = await setup({ openai: () => sse(chunks) });
+    // openai@4 has it under beta.chat.completions only.
+    if (typeof c.chat.completions.stream !== "function") ctx.skip();
+    const final = await c.chat.completions.stream({ ...ask, stream_options: { include_usage: true } }).finalChatCompletion();
+    expect(final.choices[0].message.content).toBe("Ok.");
+    await tick();
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({ input_tokens: 4, output_tokens: 1 });
+  });
+
+  it("route: a default client sends x-tc-provider-url https://api.openai.com, and withResponse() works", async () => {
+    const { c, proxyHeaders } = await setup(
+      { layer: "route", proxy: () => json(200, chatOk, { "x-tc-decision": "layer=route; action=pass_through" }) },
+      { maxLayer: "route", proxyUrl: "http://proxy.test" },
+    );
+    const { data, response } = await c.chat.completions.create(ask).withResponse();
+    expect(data.id).toBe("chatcmpl-direct");
+    expect(response.headers.get("x-tc-decision")).toContain("pass_through");
+    expect(proxyHeaders[0]!.get("x-tc-provider-url")).toBe("https://api.openai.com");
+  });
+});
+
+describe.skipIf(!ANTHROPIC || !existsSync(ANTHROPIC))("a real @anthropic-ai/sdk client keeps its APIPromise", () => {
+  async function setup(scn: Parameters<typeof recorder>[0]) {
+    const { default: Anthropic } = (await import(ANTHROPIC)) as { default: new (o: unknown) => any };
+    const r = recorder(scn);
+    globalThis.fetch = r.f;
+    const c = new Anthropic({ apiKey: "sk-ant", fetch: r.f, maxRetries: 0 });
+    wrap(c, tcOpts);
+    const { prewarm } = await import("../prewarm.js");
+    await prewarm(tcOpts);
+    return { ...r, c };
+  }
+  const ask = { model: "claude-haiku-4-5", max_tokens: 8, messages: [{ role: "user", content: "x" }] };
+  const events = [
+    { type: "message_start", message: { id: "msg_s", type: "message", role: "assistant", content: [], model: "claude-haiku-4-5", stop_reason: null, usage: { input_tokens: 12, output_tokens: 1 } } },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Ok." } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } },
+    { type: "message_stop" },
+  ];
+
+  it("observe: messages.create() is the SDK's APIPromise and withResponse() records", async () => {
+    const { c, observations } = await setup({});
+    const p = c.messages.create(ask);
+    expect(p.constructor.name).toBe("APIPromise");
+    const { data } = await p.withResponse();
+    expect(data.id).toBe("msg_direct");
+    await tick();
+    expect(observations).toHaveLength(1);
+  });
+
+  it("observe: messages.stream() (which calls create().withResponse()) works and records the usage", async () => {
+    const { c, observations } = await setup({ anthropic: () => sse(events) });
+    const final = await c.messages.stream(ask).finalMessage();
+    expect(final.content[0].text).toBe("Ok.");
+    await tick();
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({ provider: "anthropic", input_tokens: 12, output_tokens: 4 });
   });
 });

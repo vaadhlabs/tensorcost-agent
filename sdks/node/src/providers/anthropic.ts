@@ -31,24 +31,30 @@ import {
   TensorCostComplianceTeamMismatchError,
   TensorCostRefusedError,
 } from "../errors.js";
-import { TensorCostConfigError } from "../config.js";
 import { providerTarget } from "../applied.js";
 import { providerNativeError } from "../provider-errors.js";
 import type { CircuitBreaker } from "../circuit.js";
 import { emitEvent } from "../telemetry.js";
 import type { LifecycleEventCallback } from "../telemetry.js";
 import type { RetryConfig } from "../retry.js";
-import type { ControlLayer } from "../layer.js";
-import { needsProxyUrl } from "../layer.js";
+import type { CompiledComplianceSnapshot, ControlLayer } from "../layer.js";
+import { ADMIT_TIMEOUT_MS, needsProxyUrl } from "../layer.js";
 import type { SdkLayerClient } from "../sdk-layer.js";
 import { decisionMetadata } from "../decision.js";
 import { SDK_VERSION } from "../version.js";
 import {
   billingAccountField,
-  billingAccountOfApiPromise,
   billingAccountOfError,
   clientBaseUrl,
 } from "../billing-account.js";
+import {
+  TensorCostAPIPromise,
+  anthropicStreamTracker,
+  observeApiCall,
+  tapStream,
+  type CallSource,
+  type Usage,
+} from "../api-promise.js";
 import { resolveModelCallLink } from "../trace-link.js";
 import {
   WrapOverhead,
@@ -56,6 +62,7 @@ import {
   postObservation,
   withAwaitExcluded,
 } from "../wrap-overhead.js";
+import { ADMIT_UNAVAILABLE, callPathToken } from "./call-path.js";
 const MARKER = "__tensorcost_wrapped__";
 const WITH_META_MARKER = "__tensorcost_with_meta__";
 
@@ -149,7 +156,12 @@ function wrapMethod(
     perCallParentSpanId?: string;
   },
 ): (...args: any[]) => any {
-  const wrapped = async function (this: unknown, ...args: any[]) {
+  // Not async: create() hands back an APIPromise, as the OpenAI wrapper
+  // does (see api-promise.ts). @anthropic-ai/sdk's own messages.stream()
+  // calls create(...).withResponse(), so through 1.7.0 it failed outright
+  // on a wrapped client.
+  const wrapped = function (this: unknown, ...args: any[]) {
+    const self = this;
     const overhead = new WrapOverhead();
     const requestAt = nowIso();
     const firstArg = args[0];
@@ -163,7 +175,6 @@ function wrapMethod(
     });
 
     const meta = buildMetadata(opts.deployment, opts.promptTemplateId, opts.perCallMeta);
-    const metaSpread = meta !== undefined ? { metadata: meta } : {};
     // Per-agent-run attribution. Dedicated top-level fields (NOT the
     // metadata bag — see Observation.agent_id doc in types.ts). Per-call
     // withMeta() override beats the wrap-time default.
@@ -174,414 +185,315 @@ function wrapMethod(
     const resolvedFeature =
       opts.perCallFeature ?? opts.hardening.feature ?? undefined;
 
-    const effectiveLayer = await withAwaitExcluded(overhead, () =>
-      opts.hardening.sdkLayer.effectiveLayer(opts.hardening.maxLayer),
-    );
-
     let complianceStamp: { compliance_frameworks?: string[]; dlp_action?: string } =
       {};
-    try {
-      assertTeamScope({ clientTeamId: opts.hardening.teamId ?? null });
-      const complianceSnap = await withAwaitExcluded(overhead, () =>
-        opts.hardening.sdkLayer.getComplianceSnapshot(effectiveLayer),
-      );
-      const dlpResult = enforceInProcessDlp(
-        extractAnthropicMessagesText(firstArg),
-        complianceSnap,
-      );
-      complianceStamp = complianceStampFrom(complianceSnap, dlpResult);
-    } catch (err) {
-      if (
-        err instanceof TensorCostComplianceDeniedError ||
-        err instanceof TensorCostComplianceTeamMismatchError
-      ) {
-        throw err;
-      }
-    }
 
-    let decisionMeta: Record<string, string> | undefined;
-    if (effectiveLayer === "govern") {
-      try {
-        const getToken =
-          opts.getToken ?? (() => opts.transport.getToken());
-        const admit = await withAwaitExcluded(overhead, async () => {
-          const bearerToken = await getToken();
-          return admitRequest({
-            baseUrl: opts.hardening.baseUrl,
-            bearerToken,
-            maxLayer: effectiveLayer,
-            metadata: {
-              provider: "anthropic",
-              model: String(model),
-              operation: "messages",
-              correlation_id: correlationId,
-              environment: opts.environment,
-              connection_id: opts.connectionId,
-              agent_id: resolvedAgentId,
-              workflow_id: resolvedWorkflowId,
-              customer: resolvedCustomer,
-              feature: resolvedFeature,
-              application: opts.hardening.application ?? null,
-              tags: opts.hardening.tags ?? [],
-              team_id: opts.hardening.teamId ?? null,
-            },
-            transport: opts.transport,
-            failOpen: opts.hardening.failOpenEnabled,
-          });
-        });
-        if (!admit.allowed) {
-          // The admit client types every refusal by its code. The generic
-          // error is only a guard; it used to say "model governance" for
-          // every refusal, budget caps included.
-          throw (
-            admit.refusal ??
-            new TensorCostRefusedError("tensorcost: request refused at govern layer", {}, {
-              status: 403,
-              attempt: 1,
-            })
-          );
-        }
-        decisionMeta = decisionMetadata(admit.decisionHeader);
-      } catch (err) {
-        // Same rule as the proxy path: go around TensorCost only when it
-        // is unavailable (token exchange or admit unreachable), and only
-        // with failOpenEnabled. A refusal, known code or not, stops the call.
-        if (!shouldFallBackToProvider(err) || !opts.hardening.failOpenEnabled) throw err;
-      }
-    }
-
-    const decisionSpread =
-      decisionMeta !== undefined
-        ? {
-            metadata: {
-              ...(meta !== undefined ? meta : {}),
-              ...decisionMeta,
-            },
-          }
-        : metaSpread;
-
-    const stampObservation = (obs: Observation): Observation => ({
-      ...obs,
-      ...(complianceStamp.compliance_frameworks?.length
-        ? { compliance_frameworks: complianceStamp.compliance_frameworks }
-        : {}),
-      ...(complianceStamp.dlp_action ? { dlp_action: complianceStamp.dlp_action } : {}),
-      ...observationScope(opts.hardening.application, opts.hardening.tags),
+    const observation = (o: {
+      status: "success" | "error";
+      usage?: Usage;
+      error?: unknown;
+      billingAccount?: string | null;
+      decisionMeta?: Record<string, string>;
+    }): Observation => ({
+      sdk_version: SDK_VERSION,
+      provider: "anthropic",
+      model: String(model),
+      operation: "messages",
+      request_at: requestAt,
+      response_at: nowIso(),
+      input_tokens: o.usage?.input ?? null,
+      output_tokens: o.usage?.output ?? null,
+      cost_usd_cents: null,
+      status: o.status,
+      error_message:
+        o.error !== undefined ? `${(o.error as Error)?.name}: ${(o.error as Error)?.message}` : null,
+      correlation_id: correlationId,
+      ...traceLink,
+      ...(opts.environment !== null ? { environment: opts.environment } : {}),
+      ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
+      ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
+      ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
+      ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
+      ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
+      ...(o.billingAccount !== undefined ? billingAccountField(o.billingAccount) : {}),
+      ...(o.decisionMeta !== undefined
+        ? { metadata: { ...(meta ?? {}), ...o.decisionMeta } }
+        : meta !== undefined
+          ? { metadata: meta }
+          : {}),
     });
 
-    const proxyUrl = opts.hardening.proxyUrl;
-    if (needsProxyUrl(effectiveLayer) && proxyUrl) {
-      const { providerUrl, providerAuth } = providerTarget(
-        opts.clientRef,
-        "anthropic",
-        "https://api.anthropic.com",
-      );
+    const post = (obs: Observation): void =>
+      postObservation(opts.transport, overhead, {
+        ...obs,
+        ...(complianceStamp.compliance_frameworks?.length
+          ? { compliance_frameworks: complianceStamp.compliance_frameworks }
+          : {}),
+        ...(complianceStamp.dlp_action ? { dlp_action: complianceStamp.dlp_action } : {}),
+        ...observationScope(opts.hardening.application, opts.hardening.tags),
+      });
 
-      const body: Record<string, unknown> = {
-        ...(firstArg && typeof firstArg === "object" ? firstArg : {}),
-        model: String(model),
-      };
+    const applyCompliance = (snap: CompiledComplianceSnapshot | null): void => {
+      assertTeamScope({ clientTeamId: opts.hardening.teamId ?? null });
+      const dlpResult = enforceInProcessDlp(extractAnthropicMessagesText(firstArg), snap);
+      complianceStamp = complianceStampFrom(snap, dlpResult);
+    };
 
-      const isStreamingRequest = body.stream === true;
-
-      let proxyResult: unknown;
-      let proxyFailed = false;
-      let proxyFailureError: Error | null = null;
-
-      const circuitWasOpen = opts.hardening.circuit.shouldBypass();
-      let shouldTryProxy = !circuitWasOpen;
-      if (circuitWasOpen) {
-        shouldTryProxy = opts.hardening.circuit.shouldProbe();
-      }
-
-      if (shouldTryProxy) {
-        try {
-          const getToken = opts.getToken ?? (() => (opts.transport as any).getToken());
-          if (isStreamingRequest) {
-            const proxyStreamResp = await withAwaitExcluded(overhead, async () => {
-              const bearerToken = await getToken();
-              return proxyRequestStream({
-                proxyUrl,
-                bearerToken,
-                providerUrl,
-                providerAuth,
-                body,
-                model: String(model),
-                provider: "anthropic",
-                operation: "messages",
-                correlationId,
-                environment: opts.environment,
-                application: opts.hardening.application ?? null,
-                tags: opts.hardening.tags ?? [],
-                agentId: resolvedAgentId,
-                workflowId: resolvedWorkflowId,
-                customer: resolvedCustomer,
-                feature: resolvedFeature,
-                teamId: opts.hardening.teamId ?? undefined,
-                retry: opts.hardening.retry,
-                timeoutMs: opts.hardening.timeoutMs,
-                headersTimeoutMs: opts.hardening.headersTimeoutMs,
-                idleTimeoutMs: opts.hardening.idleTimeoutMs,
-                onLifecycleEvent: opts.hardening.onLifecycleEvent,
-                circuit: opts.hardening.circuit,
-                maxLayer: effectiveLayer,
-                failOpenFast: opts.hardening.failOpenEnabled,
-              });
-            });
-            decisionMeta = decisionMetadata(proxyStreamResp.decisionHeader);
-            proxyResult = sseChunksFromStream(proxyStreamResp.stream);
-          } else {
-            const proxyResp = await withAwaitExcluded(overhead, async () => {
-              const bearerToken = await getToken();
-              return proxyRequest({
-                proxyUrl,
-                bearerToken,
-                providerUrl,
-                providerAuth,
-                body,
-                model: String(model),
-                provider: "anthropic",
-                operation: "messages",
-                correlationId,
-                environment: opts.environment,
-                application: opts.hardening.application ?? null,
-                tags: opts.hardening.tags ?? [],
-                agentId: resolvedAgentId,
-                workflowId: resolvedWorkflowId,
-                customer: resolvedCustomer,
-                feature: resolvedFeature,
-                retry: opts.hardening.retry,
-                timeoutMs: opts.hardening.timeoutMs,
-                headersTimeoutMs: opts.hardening.headersTimeoutMs,
-                onLifecycleEvent: opts.hardening.onLifecycleEvent,
-                circuit: opts.hardening.circuit,
-                maxLayer: effectiveLayer,
-                failOpenFast: opts.hardening.failOpenEnabled,
-              });
-            });
-            proxyResult = proxyResp.body;
-            decisionMeta = decisionMetadata(proxyResp.decisionHeader);
-          }
-        } catch (proxyErr) {
-          if (!shouldFallBackToProvider(proxyErr)) throw providerNativeError(opts.clientRef, proxyErr);
-          proxyFailed = true;
-          proxyFailureError = proxyErr as Error;
-        } finally {
-          opts.hardening.circuit.releaseStuckProbe();
-        }
-      } else {
-        proxyFailed = true;
-      }
-
-      if (proxyFailed) {
-        if (!opts.hardening.failOpenEnabled) {
-          const tcErr =
-            proxyFailureError instanceof TensorCostProxyError
-              ? proxyFailureError
-              : new TensorCostProxyError(
-                  proxyFailureError?.message ?? "proxy unavailable",
-                  { cause: proxyFailureError ?? undefined, attempt: 1 },
-                );
-          const obs: Observation = {
-            sdk_version: SDK_VERSION,
-            provider: "anthropic",
-            model: String(model),
-            operation: "messages",
-            request_at: requestAt,
-            response_at: nowIso(),
-            input_tokens: null,
-            output_tokens: null,
-            cost_usd_cents: null,
-            status: "error",
-            error_message: `${tcErr.name}: ${tcErr.message}`,
-            correlation_id: correlationId,
-            ...traceLink,
-            ...(opts.environment !== null ? { environment: opts.environment } : {}),
-            ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-            ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-            ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-            ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-            ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-            ...decisionSpread,
-          };
-          postObservation(opts.transport, overhead, stampObservation(obs));
-          throw tcErr;
-        }
-
-        emitEvent(opts.hardening.onLifecycleEvent, {
-          kind: "on_fallback",
-          provider: "anthropic",
-          model: String(model),
-          operation: "messages",
-          attemptNumber: 1,
-          elapsedMs: 0,
-          consecutiveFailures: opts.hardening.circuit.failures,
-        });
-
-        try {
-          let directCall: unknown;
-          const directResponse = await withAwaitExcluded(overhead, () =>
-            (directCall = bound.apply(this, args)),
-          );
-          const { input, output } = extractUsage(directResponse);
-          const billingAccount = await billingAccountOfApiPromise(directCall, clientBaseUrl(opts.clientRef));
-          const obs: Observation = {
-            sdk_version: SDK_VERSION,
-            provider: "anthropic",
-            model: String(model),
-            operation: "messages",
-            request_at: requestAt,
-            response_at: nowIso(),
-            input_tokens: input,
-            output_tokens: output,
-            cost_usd_cents: null,
-            status: "success",
-            error_message: null,
-            correlation_id: correlationId,
-            ...traceLink,
-            ...(opts.environment !== null ? { environment: opts.environment } : {}),
-            ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-            ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-            ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-            ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-            ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-            ...billingAccountField(billingAccount),
-            ...decisionSpread,
-          };
-          postObservation(opts.transport, overhead, stampObservation(obs));
-          return directResponse;
-        } catch (directErr) {
-          const obs: Observation = {
-            sdk_version: SDK_VERSION,
-            provider: "anthropic",
-            model: String(model),
-            operation: "messages",
-            request_at: requestAt,
-            response_at: nowIso(),
-            input_tokens: null,
-            output_tokens: null,
-            cost_usd_cents: null,
-            status: "error",
-            error_message: `${(directErr as Error).name}: ${(directErr as Error).message}`,
-            correlation_id: correlationId,
-            ...traceLink,
-            ...(opts.environment !== null ? { environment: opts.environment } : {}),
-            ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-            ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-            ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-            ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-            ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-            ...billingAccountField(billingAccountOfError(directErr, clientBaseUrl(opts.clientRef))),
-            ...decisionSpread,
-          };
-          postObservation(opts.transport, overhead, stampObservation(obs));
-          throw directErr;
-        }
-      }
-
-      const proxyDecisionSpread =
-        decisionMeta !== undefined
-          ? {
-              metadata: {
-                ...(meta !== undefined ? meta : {}),
-                ...decisionMeta,
-              },
-            }
-          : metaSpread;
-
-      // Proxy success.
-      const respBody = proxyResult as Record<string, unknown>;
-      const usageRaw = respBody?.usage as Record<string, unknown> | undefined;
-      const input =
-        typeof usageRaw?.input_tokens === "number" ? usageRaw.input_tokens : null;
-      const output =
-        typeof usageRaw?.output_tokens === "number" ? usageRaw.output_tokens : null;
-      const obs: Observation = {
-        sdk_version: SDK_VERSION,
-        provider: "anthropic",
-        model: String(model),
-        operation: "messages",
-        request_at: requestAt,
-        response_at: nowIso(),
-        input_tokens: input,
-        output_tokens: output,
-        cost_usd_cents: null,
-        status: "success",
-        error_message: null,
-        correlation_id: correlationId,
-        ...traceLink,
-        ...(opts.environment !== null ? { environment: opts.environment } : {}),
-        ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-        ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-        ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-        ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-        ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-        ...proxyDecisionSpread,
-      };
-      postObservation(opts.transport, overhead, stampObservation(obs));
-      return proxyResult;
-    }
-
-    // Observe / govern direct path.
-    try {
+    const callProvider = (decisionMeta?: Record<string, string>): unknown => {
+      const url = clientBaseUrl(opts.clientRef);
       let call: unknown;
-      const response = await withAwaitExcluded(overhead, () =>
-        (call = bound.apply(this, args)),
-      );
-      const { input, output } = extractUsage(response);
-      const billingAccount = await billingAccountOfApiPromise(call, clientBaseUrl(opts.clientRef));
-      const obs: Observation = {
-        sdk_version: SDK_VERSION,
-        provider: "anthropic",
-        model: String(model),
-        operation: "messages",
-        request_at: requestAt,
-        response_at: nowIso(),
-        input_tokens: input,
-        output_tokens: output,
-        cost_usd_cents: null,
-        status: "success",
-        error_message: null,
-        correlation_id: correlationId,
-        ...traceLink,
-        ...(opts.environment !== null ? { environment: opts.environment } : {}),
-        ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-        ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-        ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-        ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-        ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-        ...billingAccountField(billingAccount),
-        ...decisionSpread,
-      };
-      postObservation(opts.transport, overhead, stampObservation(obs));
-      return response;
+      try {
+        call = bound.apply(self, args);
+      } catch (err) {
+        call = Promise.reject(err);
+      }
+      overhead.pauseForAwait();
+      return observeApiCall(call, {
+        url,
+        usageOf: extractUsage,
+        streamTracker: anthropicStreamTracker,
+        success: (usage, billingAccount) => {
+          overhead.resumeAfterAwait();
+          post(observation({ status: "success", usage, billingAccount, decisionMeta }));
+        },
+        error: (err) => {
+          overhead.resumeAfterAwait();
+          post(
+            observation({
+              status: "error",
+              error: err,
+              billingAccount: billingAccountOfError(err, url),
+              decisionMeta,
+            }),
+          );
+        },
+      });
+    };
+
+    const proxied = (layer: ControlLayer) => needsProxyUrl(layer) && !!opts.hardening.proxyUrl;
+
+    let known: ReturnType<SdkLayerClient["peek"]> = null;
+    try {
+      const sl = opts.hardening.sdkLayer as Partial<SdkLayerClient>;
+      known = typeof sl.peek === "function" ? sl.peek.call(sl, opts.hardening.maxLayer) : null;
     } catch (err) {
-      const obs: Observation = {
-        sdk_version: SDK_VERSION,
-        provider: "anthropic",
-        model: String(model),
-        operation: "messages",
-        request_at: requestAt,
-        response_at: nowIso(),
-        input_tokens: null,
-        output_tokens: null,
-        cost_usd_cents: null,
-        status: "error",
-        error_message: `${(err as Error).name}: ${(err as Error).message}`,
-        correlation_id: correlationId,
-        ...traceLink,
-        ...(opts.environment !== null ? { environment: opts.environment } : {}),
-        ...(opts.connectionId !== null ? { connection_id: opts.connectionId } : {}),
-        ...(resolvedAgentId !== undefined ? { agent_id: resolvedAgentId } : {}),
-        ...(resolvedWorkflowId !== undefined ? { workflow_id: resolvedWorkflowId } : {}),
-        ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
-        ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
-        ...billingAccountField(billingAccountOfError(err, clientBaseUrl(opts.clientRef))),
-        ...decisionSpread,
-      };
-      postObservation(opts.transport, overhead, stampObservation(obs));
-      throw err;
+      return TensorCostAPIPromise.rejected(err);
     }
+    if (known !== null && !proxied(known.layer) && known.layer !== "govern") {
+      try {
+        applyCompliance(known.compliance);
+      } catch (err) {
+        if (
+          err instanceof TensorCostComplianceDeniedError ||
+          err instanceof TensorCostComplianceTeamMismatchError
+        ) {
+          return TensorCostAPIPromise.rejected(err);
+        }
+      }
+      return callProvider();
+    }
+
+    const run = async (): Promise<CallSource> => {
+      const effectiveLayer = await withAwaitExcluded(overhead, () =>
+        opts.hardening.sdkLayer.effectiveLayer(opts.hardening.maxLayer),
+      );
+
+      try {
+        const complianceSnap = await withAwaitExcluded(overhead, () =>
+          opts.hardening.sdkLayer.getComplianceSnapshot(effectiveLayer),
+        );
+        applyCompliance(complianceSnap);
+      } catch (err) {
+        if (
+          err instanceof TensorCostComplianceDeniedError ||
+          err instanceof TensorCostComplianceTeamMismatchError
+        ) {
+          throw err;
+        }
+      }
+
+      let decisionMeta: Record<string, string> | undefined;
+      if (effectiveLayer === "govern") {
+        try {
+          const admit = await withAwaitExcluded(overhead, async () => {
+            const bearerToken = await callPathToken(opts, ADMIT_TIMEOUT_MS);
+            return admitRequest({
+              baseUrl: opts.hardening.baseUrl,
+              bearerToken,
+              maxLayer: effectiveLayer,
+              metadata: {
+                provider: "anthropic",
+                model: String(model),
+                operation: "messages",
+                correlation_id: correlationId,
+                environment: opts.environment,
+                connection_id: opts.connectionId,
+                agent_id: resolvedAgentId,
+                workflow_id: resolvedWorkflowId,
+                customer: resolvedCustomer,
+                feature: resolvedFeature,
+                application: opts.hardening.application ?? null,
+                tags: opts.hardening.tags ?? [],
+                team_id: opts.hardening.teamId ?? null,
+              },
+              failOpen: opts.hardening.failOpenEnabled,
+            });
+          });
+          if (!admit.allowed) {
+            // The admit client types every refusal by its code. The generic
+            // error is only a guard; it used to say "model governance" for
+            // every refusal, budget caps included.
+            throw (
+              admit.refusal ??
+              new TensorCostRefusedError("tensorcost: request refused at govern layer", {}, {
+                status: 403,
+                attempt: 1,
+              })
+            );
+          }
+          decisionMeta = admit.unavailable ? ADMIT_UNAVAILABLE : decisionMetadata(admit.decisionHeader);
+        } catch (err) {
+          // Same rule as the proxy path: go around TensorCost only when it
+          // is unavailable (token exchange or admit unreachable), and only
+          // with failOpenEnabled. A refusal, known code or not, stops the call.
+          if (!shouldFallBackToProvider(err) || !opts.hardening.failOpenEnabled) throw err;
+          decisionMeta = ADMIT_UNAVAILABLE;
+        }
+      }
+
+      const proxyUrl = opts.hardening.proxyUrl;
+      if (proxied(effectiveLayer) && proxyUrl) {
+        const { providerUrl, providerAuth } = providerTarget(
+          opts.clientRef,
+          "anthropic",
+          "https://api.anthropic.com",
+        );
+
+        const body: Record<string, unknown> = {
+          ...(firstArg && typeof firstArg === "object" ? firstArg : {}),
+          model: String(model),
+        };
+
+        const isStreamingRequest = body.stream === true;
+        const request = {
+          proxyUrl,
+          providerUrl,
+          providerAuth,
+          body,
+          model: String(model),
+          provider: "anthropic" as const,
+          operation: "messages",
+          correlationId,
+          environment: opts.environment,
+          application: opts.hardening.application ?? null,
+          tags: opts.hardening.tags ?? [],
+          agentId: resolvedAgentId,
+          workflowId: resolvedWorkflowId,
+          customer: resolvedCustomer,
+          feature: resolvedFeature,
+          teamId: opts.hardening.teamId ?? undefined,
+          retry: opts.hardening.retry,
+          timeoutMs: opts.hardening.timeoutMs,
+          headersTimeoutMs: opts.hardening.headersTimeoutMs,
+          idleTimeoutMs: opts.hardening.idleTimeoutMs,
+          onLifecycleEvent: opts.hardening.onLifecycleEvent,
+          circuit: opts.hardening.circuit,
+          maxLayer: effectiveLayer,
+          failOpenFast: opts.hardening.failOpenEnabled,
+        };
+
+        let proxyResult: unknown;
+        let proxyResponse: Response | null = null;
+        let proxyFailed = false;
+        let proxyFailureError: Error | null = null;
+
+        const circuitWasOpen = opts.hardening.circuit.shouldBypass();
+        let shouldTryProxy = !circuitWasOpen;
+        if (circuitWasOpen) {
+          shouldTryProxy = opts.hardening.circuit.shouldProbe();
+        }
+
+        if (shouldTryProxy) {
+          try {
+            if (isStreamingRequest) {
+              const proxyStreamResp = await withAwaitExcluded(overhead, async () => {
+                const bearerToken = await callPathToken(opts, opts.hardening.headersTimeoutMs);
+                return proxyRequestStream({ ...request, bearerToken });
+              });
+              decisionMeta = decisionMetadata(proxyStreamResp.decisionHeader);
+              proxyResult = sseChunksFromStream(proxyStreamResp.stream);
+              proxyResponse = proxyStreamResp.response ?? null;
+            } else {
+              const proxyResp = await withAwaitExcluded(overhead, async () => {
+                const bearerToken = await callPathToken(opts, opts.hardening.headersTimeoutMs);
+                return proxyRequest({ ...request, bearerToken });
+              });
+              proxyResult = proxyResp.body;
+              proxyResponse = proxyResp.response ?? null;
+              decisionMeta = decisionMetadata(proxyResp.decisionHeader);
+            }
+          } catch (proxyErr) {
+            if (!shouldFallBackToProvider(proxyErr)) throw providerNativeError(opts.clientRef, proxyErr);
+            proxyFailed = true;
+            proxyFailureError = proxyErr as Error;
+          } finally {
+            opts.hardening.circuit.releaseStuckProbe();
+          }
+        } else {
+          proxyFailed = true;
+        }
+
+        if (proxyFailed) {
+          if (!opts.hardening.failOpenEnabled) {
+            const tcErr =
+              proxyFailureError instanceof TensorCostProxyError
+                ? proxyFailureError
+                : new TensorCostProxyError(
+                    proxyFailureError?.message ?? "proxy unavailable",
+                    { cause: proxyFailureError ?? undefined, attempt: 1 },
+                  );
+            post(observation({ status: "error", error: tcErr, decisionMeta }));
+            throw tcErr;
+          }
+
+          emitEvent(opts.hardening.onLifecycleEvent, {
+            kind: "on_fallback",
+            provider: "anthropic",
+            model: String(model),
+            operation: "messages",
+            attemptNumber: 1,
+            elapsedMs: 0,
+            consecutiveFailures: opts.hardening.circuit.failures,
+          });
+          return { kind: "call", call: callProvider(decisionMeta) };
+        }
+
+        const proxyMeta = decisionMeta;
+        if (isStreamingRequest) {
+          overhead.pauseForAwait();
+          const stream = tapStream(
+            proxyResult,
+            anthropicStreamTracker(),
+            (usage) => {
+              overhead.resumeAfterAwait();
+              post(observation({ status: "success", usage, decisionMeta: proxyMeta }));
+            },
+            (err) => {
+              overhead.resumeAfterAwait();
+              post(observation({ status: "error", error: err, decisionMeta: proxyMeta }));
+            },
+          );
+          return { kind: "proxy", data: stream, response: proxyResponse };
+        }
+        post(observation({ status: "success", usage: extractUsage(proxyResult), decisionMeta: proxyMeta }));
+        return { kind: "proxy", data: proxyResult, response: proxyResponse };
+      }
+
+      // Observe / govern direct path.
+      return { kind: "call", call: callProvider(decisionMeta) };
+    };
+
+    return new TensorCostAPIPromise(run());
   };
 
   Object.defineProperty(wrapped, MARKER, { value: true, enumerable: false });

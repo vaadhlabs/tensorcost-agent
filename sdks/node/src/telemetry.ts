@@ -26,6 +26,17 @@
  *                    a non-retriable error occurred)
  *   on_fallback      fires when the circuit breaker opens and the SDK routes
  *                    to the provider directly instead of the proxy
+ *
+ * And one that isn't about a single request:
+ *
+ *   on_circuit_state fires when the fail-open circuit breaker changes state
+ *                    (CLOSED, OPEN, HALF_OPEN). Through 1.7.0 these were
+ *                    posted to TensorCost as observations, which the server
+ *                    stores as spend events: every transition became a
+ *                    0-token "call". TensorCost has no ingest for SDK events
+ *                    that aren't calls, so they now stay in the process:
+ *                    this event, and a console.warn when the circuit opens
+ *                    or closes again.
  */
 
 export type Provider = "openai" | "anthropic";
@@ -71,12 +82,24 @@ export interface OnFallbackEvent extends TelemetryBase {
   consecutiveFailures: number;
 }
 
+export type CircuitStateName = "CLOSED" | "OPEN" | "HALF_OPEN";
+
+export interface OnCircuitStateEvent {
+  kind: "on_circuit_state";
+  provider: Provider;
+  from: CircuitStateName;
+  to: CircuitStateName;
+  /** Consecutive proxy failures counted when the transition happened. */
+  consecutiveFailures: number;
+}
+
 export type LifecycleEvent =
   | BeforeRequestEvent
   | AfterResponseEvent
   | OnRetryEvent
   | OnErrorEvent
-  | OnFallbackEvent;
+  | OnFallbackEvent
+  | OnCircuitStateEvent;
 
 export type LifecycleEventCallback = (event: LifecycleEvent) => void;
 

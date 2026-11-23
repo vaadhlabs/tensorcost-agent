@@ -41,7 +41,9 @@
  *     provider's own error, relayed verbatim by the proxy. The wrappers
  *     rethrow it as the provider SDK's own error type when they can.
  *   - any other 4xx without one (HTML, text, empty) →
- *     TensorCostGatewayRejectedError: turned away before TensorCost.
+ *     TensorCostProxyStatusError when it carries x-tc-decision (the proxy
+ *     answered), else TensorCostGatewayRejectedError: turned away before
+ *     TensorCost.
  *
  * Circuit breaker:
  *   - Maintained on the CircuitBreaker instance passed in.
@@ -58,6 +60,8 @@ import {
   TensorCostQuotaError,
   TensorCostProviderError,
   TensorCostGatewayRejectedError,
+  TensorCostProxyStatusError,
+  unexplained4xx,
   TensorCostKeyRejectedError,
   TensorCostRefusedError,
 } from "./errors.js";
@@ -139,6 +143,8 @@ export interface ProxyRequestOptions {
 export interface ProxyRequestResult {
   body: unknown;
   decisionHeader: string | null;
+  /** The proxy's response (body already read), for withResponse() / asResponse(). */
+  response: Response;
 }
 
 async function readJsonWithDeadline(
@@ -403,6 +409,7 @@ export async function proxyRequest(
       return {
         body: await readJsonWithDeadline(resp, bodyDeadline, attempt + 1),
         decisionHeader: resp.headers.get("x-tc-decision"),
+        response: resp,
       };
     }
 
@@ -570,10 +577,16 @@ function nonRefusal4xx(
   errorBody: unknown,
   requestId: string | null,
   attempt: number,
-): TensorCostProviderError | TensorCostGatewayRejectedError | TensorCostRefusedError | TensorCostKeyRejectedError {
+):
+  | TensorCostProviderError
+  | TensorCostGatewayRejectedError
+  | TensorCostProxyStatusError
+  | TensorCostRefusedError
+  | TensorCostKeyRejectedError {
   if (errorBody === null || typeof errorBody === "string") {
-    return new TensorCostGatewayRejectedError(
+    return unexplained4xx(
       resp.status,
+      resp.headers.get("x-tc-decision"),
       typeof errorBody === "string" ? errorBody.slice(0, 500) : null,
       { requestId, attempt },
     );
@@ -663,6 +676,8 @@ export interface ProxyStreamResult {
   /** Raw SSE body from the proxy — same wire shape as the upstream provider. */
   stream: ReadableStream<Uint8Array>;
   decisionHeader: string | null;
+  /** The proxy's response (its body is `stream`), for withResponse(). */
+  response: Response;
 }
 
 /** Abort SSE consumption when no chunk arrives within idleTimeoutMs. */
@@ -845,6 +860,7 @@ export async function proxyRequestStream(
       return {
         stream: wrapStreamWithIdleTimeout(resp.body, idleTimeoutMs),
         decisionHeader: resp.headers.get("x-tc-decision"),
+        response: resp,
       };
     }
 
