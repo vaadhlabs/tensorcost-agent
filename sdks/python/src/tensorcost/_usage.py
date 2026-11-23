@@ -8,6 +8,11 @@
   message_delta events). The observation is posted when the stream ends.
 
 Through 1.7.0 the last two were posted at once as 0/0 tokens.
+
+The provider's id for the call rides along the same way (``id`` on a
+response or an openai chunk, ``message.id`` on anthropic's message_start).
+The server keys the same call seen by the SDK, the proxy, a gateway or a
+cost import on it (provider_response_id).
 """
 
 from __future__ import annotations
@@ -18,7 +23,11 @@ import weakref
 from typing import Any, Callable, Iterator, Optional
 
 Usage = tuple[Optional[int], Optional[int]]
-FinishFn = Callable[[Optional[int], Optional[int], Optional[BaseException]], None]
+FinishFn = Callable[[Optional[int], Optional[int], Optional[BaseException], Optional[str]], None]
+
+# ObservationDto.provider_response_id is @MaxLength(200), and the DTO refuses
+# the whole observation over a bad field, so a longer id is left off.
+MAX_RESPONSE_ID_LENGTH = 200
 
 
 def _field(obj: Any, name: str) -> Any:
@@ -29,6 +38,25 @@ def _field(obj: Any, name: str) -> Any:
 
 def _int(value: Any) -> Optional[int]:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def response_id(value: Any) -> Optional[str]:
+    """``value`` as a provider response id the server will take, else None."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if 0 < len(value) <= MAX_RESPONSE_ID_LENGTH else None
+
+
+def response_id_of(response: Any) -> Optional[str]:
+    """``response.id``: chatcmpl-/cmpl-/resp_ on openai, msg_ on anthropic."""
+    return response_id(_field(response, "id"))
+
+
+def response_id_field(rid: Optional[str]) -> dict[str, str]:
+    """The observation's ``provider_response_id``, absent when there is none."""
+    rid = response_id(rid)
+    return {"provider_response_id": rid} if rid is not None else {}
 
 
 def parsed_for_usage(response: Any) -> Any:
@@ -60,6 +88,16 @@ def openai_chunk_usage(chunk: Any) -> Usage:
     return _int(_field(usage, "prompt_tokens")), _int(_field(usage, "completion_tokens"))
 
 
+def openai_chunk_id(chunk: Any) -> Optional[str]:
+    return response_id_of(chunk)
+
+
+def anthropic_event_id(event: Any) -> Optional[str]:
+    if _field(event, "type") != "message_start":
+        return None
+    return response_id_of(_field(event, "message"))
+
+
 def anthropic_event_usage(event: Any) -> Usage:
     kind = _field(event, "type")
     if kind == "message_start":
@@ -77,8 +115,13 @@ def can_observe_stream(stream: Any) -> bool:
     return inspect.isgenerator(getattr(stream, "_iterator", None)) or inspect.isgenerator(stream)
 
 
-def observe_stream(stream: Any, chunk_usage: Callable[[Any], Usage], finish: FinishFn) -> Any:
-    """Calls ``finish(input, output, error)`` once, when ``stream`` ends.
+def observe_stream(
+    stream: Any,
+    chunk_usage: Callable[[Any], Usage],
+    chunk_id: Callable[[Any], Optional[str]],
+    finish: FinishFn,
+) -> Any:
+    """Calls ``finish(input, output, error, response_id)`` once, when ``stream`` ends.
 
     Check ``can_observe_stream`` first. A provider SDK Stream is returned as
     itself (same type, still a context manager): its ``_iterator`` generator
@@ -86,7 +129,7 @@ def observe_stream(stream: Any, chunk_usage: Callable[[Any], Usage], finish: Fin
     exhausted, raised, closed, or garbage-collected unread. A bare generator
     (the proxy's dict chunks, for clients we can't type) comes back wrapped.
     """
-    state: dict[str, Any] = {"in": None, "out": None, "done": False}
+    state: dict[str, Any] = {"in": None, "out": None, "id": None, "done": False}
     lock = threading.Lock()
 
     def done(error: Optional[BaseException] = None) -> None:
@@ -95,7 +138,7 @@ def observe_stream(stream: Any, chunk_usage: Callable[[Any], Usage], finish: Fin
                 return
             state["done"] = True
         try:
-            finish(state["in"], state["out"], error)
+            finish(state["in"], state["out"], error, state["id"])
         except Exception:  # noqa: BLE001
             pass
 
@@ -108,6 +151,8 @@ def observe_stream(stream: Any, chunk_usage: Callable[[Any], Usage], finish: Fin
                         state["in"] = i
                     if o is not None:
                         state["out"] = o
+                    if state["id"] is None:
+                        state["id"] = chunk_id(item)
                 except Exception:  # noqa: BLE001
                     pass
                 yield item

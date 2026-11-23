@@ -164,3 +164,23 @@ def test_route_connect_timeout_is_the_headers_budget_not_the_body_budget(api):
     t = api["proxy_requests"][0].extensions["timeout"]
     assert t["connect"] == 2.0
     assert t["read"] == 60.0
+
+
+def test_route_observation_carries_the_completion_id(api, recording_transport):
+    # The proxy records the same call under the same id; the same-call rule
+    # keys the two rows on it.
+    _client(api).chat.completions.create(model="gpt-4o-mini", messages=MSGS)
+    obs = [o for o in recording_transport.observations if o.get("operation") == "chat.completions"]
+    assert len(obs) == 1
+    assert obs[0]["provider_response_id"] == "chatcmpl-proxy"
+
+
+def test_route_stream_observation_carries_the_chunks_id(api, recording_transport):
+    s = _client(api).chat.completions.create(
+        model="gpt-4o-mini", messages=MSGS, stream=True, stream_options={"include_usage": True},
+    )
+    with s as stream:
+        list(stream)
+    obs = [o for o in recording_transport.observations if o.get("operation") == "chat.completions"]
+    assert len(obs) == 1
+    assert obs[0]["provider_response_id"] == "c1"

@@ -47,6 +47,7 @@ import type { ObservationTransport } from "../transport.js";
 
 import { SDK_VERSION } from "../version.js";
 import { bedrockAccountOfContext, billingAccountField } from "../billing-account.js";
+import { responseId, responseIdField } from "../api-promise.js";
 import { resolveModelCallLink } from "../trace-link.js";
 import {
   WrapOverhead,
@@ -115,6 +116,20 @@ interface MiddlewareStack {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * The call's x-amzn-requestid, on every Bedrock response, streams too: the
+ * id the proxy, the invocation log and the CUR know the call by. Anthropic
+ * on Bedrock also answers with a msg_bdrk_ id in the body, which none of
+ * them have, so it isn't used.
+ */
+function requestIdOf(result: { output?: unknown; response?: unknown } | undefined): string | null {
+  const meta = (result?.output as { $metadata?: { requestId?: unknown } } | undefined)?.$metadata;
+  const fromMeta = responseId(meta?.requestId);
+  if (fromMeta !== null) return fromMeta;
+  const headers = (result?.response as { headers?: Record<string, unknown> } | undefined)?.headers;
+  return headers && typeof headers === "object" ? responseId(headers["x-amzn-requestid"]) : null;
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -356,6 +371,7 @@ export function install(
         output_tokens: null,
         cost_usd_cents: null,
         status,
+        ...responseIdField(requestIdOf(result)),
         // Signal to operators that this is a streaming placeholder, not a gap.
         error_message:
           "streaming: per-chunk token accounting not yet implemented",
@@ -386,6 +402,7 @@ export function install(
         cost_usd_cents: null,
         status: "success",
         error_message: null,
+        ...responseIdField(requestIdOf(result)),
       });
       return result;
     } catch (err) {
