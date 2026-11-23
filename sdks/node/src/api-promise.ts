@@ -44,6 +44,12 @@ export interface Usage {
   output: number | null;
   /** The provider's id for the call: chatcmpl-/cmpl-, msg_, Bedrock's request id. */
   responseId?: string | null;
+  /**
+   * The model the provider ran the call on (`model` on the body or a chunk,
+   * `message.model` on Anthropic's message_start). For Azure the request's
+   * model is the deployment; the server prices from this one.
+   */
+  responseModel?: string | null;
 }
 
 /**
@@ -62,6 +68,27 @@ export function responseId(v: unknown): string | null {
 /** `body.id`, the id OpenAI and Anthropic put on a response body or chunk. */
 export function responseIdOf(body: unknown): string | null {
   return body && typeof body === "object" ? responseId((body as Record<string, unknown>)["id"]) : null;
+}
+
+/** ObservationDto.response_model is @MaxLength(200) too. */
+export const MAX_RESPONSE_MODEL_LENGTH = 200;
+
+/** `v` as a model id the server will take, else null. */
+export function responseModel(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t.length > 0 && t.length <= MAX_RESPONSE_MODEL_LENGTH && !t.includes("\u0000") ? t : null;
+}
+
+/** `body.model`, the model OpenAI and Anthropic name on a response body or chunk. */
+export function responseModelOf(body: unknown): string | null {
+  return body && typeof body === "object" ? responseModel((body as Record<string, unknown>)["model"]) : null;
+}
+
+/** The observation's response_model, absent when there is none. */
+export function responseModelField(model: unknown): { response_model?: string } {
+  const m = responseModel(model);
+  return m !== null ? { response_model: m } : {};
 }
 
 /** The observation's provider_response_id, absent when there is none. */
@@ -366,15 +393,18 @@ const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
 export function openAiStreamTracker(): StreamUsageTracker {
   let usage: Usage = NO_USAGE;
   let id: string | null = null;
+  // The last chunk that names one: Azure's first chunk names none.
+  let model: string | null = null;
   return {
     see(chunk) {
       id ??= responseIdOf(chunk);
+      model = responseModelOf(chunk) ?? model;
       const u = (chunk as { usage?: Record<string, unknown> | null } | null)?.usage;
       if (u && typeof u === "object") {
         usage = { input: num(u["prompt_tokens"]), output: num(u["completion_tokens"]) };
       }
     },
-    usage: () => ({ ...usage, responseId: id }),
+    usage: () => ({ ...usage, responseId: id, responseModel: model }),
   };
 }
 
@@ -386,12 +416,14 @@ export function anthropicStreamTracker(): StreamUsageTracker {
   let input: number | null = null;
   let output: number | null = null;
   let id: string | null = null;
+  let model: string | null = null;
   return {
     see(event) {
       const e = event as Record<string, any> | null;
       if (!e || typeof e !== "object") return;
       if (e.type === "message_start") {
         id ??= responseIdOf(e.message);
+        model ??= responseModelOf(e.message);
         const u = e.message?.usage;
         if (u && typeof u === "object") {
           input = num(u.input_tokens) ?? input;
@@ -402,7 +434,7 @@ export function anthropicStreamTracker(): StreamUsageTracker {
         input = num(e.usage.input_tokens) ?? input;
       }
     },
-    usage: () => ({ input, output, responseId: id }),
+    usage: () => ({ input, output, responseId: id, responseModel: model }),
   };
 }
 

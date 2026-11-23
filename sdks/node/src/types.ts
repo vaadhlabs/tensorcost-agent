@@ -154,6 +154,13 @@ export interface Observation {
    */
   provider_response_id?: string;
   /**
+   * The model the provider's response named (`model` on the body or the
+   * last chunk that names one; `message.model` on Anthropic). For Azure
+   * OpenAI `model` is the deployment ("support-bot"); the server prices
+   * from this one. At most 200 characters; absent when the response gave none.
+   */
+  response_model?: string;
+  /**
    * Routing-policy application scope from `wrap({ application })`. Lands in
    * `ai.ai_spend_events.application` (the server buckets unset ones under
    * `sdk:tier2`) and lets an application-scoped route collect evidence
