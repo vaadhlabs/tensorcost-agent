@@ -436,9 +436,11 @@ class TestAnthropicAppliedMode:
                 max_layer="route", proxy_url="https://proxy.example.com",
             )
 
+        from tensorcost._admit_client import AdmitOutcome
+
         with patch("tensorcost._providers._anthropic.proxy_request") as mock_proxy, patch(
-            "tensorcost._providers._anthropic.admit_request",
-            return_value=(True, "layer=govern; action=allow"),
+            "tensorcost._providers._anthropic.admit_call",
+            return_value=AdmitOutcome(True, "layer=govern; action=allow"),
         ) as mock_admit:
             result = client.messages.create(
                 model="claude-3-5-sonnet-20241022", max_tokens=10,
@@ -475,12 +477,12 @@ class TestAnthropicAppliedMode:
 
         import tensorcost._admit_client as admit_mod
 
-        real = admit_mod.admit_request
+        real = admit_mod.admit_call
 
         def via_mock_transport(**kw):
             return real(**kw, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
 
-        with patch("tensorcost._providers._anthropic.admit_request", side_effect=via_mock_transport):
+        with patch("tensorcost._providers._anthropic.admit_call", side_effect=via_mock_transport):
             with pytest.raises(TensorCostBudgetHardCapError) as info:
                 client.messages.create(model="claude-3-5-sonnet-20241022", max_tokens=10, messages=[])
 

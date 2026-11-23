@@ -30,6 +30,7 @@ def get_shared_runtime(
         base_url=config.base_url,
         api_key=config.api_key,
         tenant_id=config.tenant_id,
+        team_id=config.team_id,
         fail_open=config.fail_open,
     )
     sdk_layer = SdkLayerClient(

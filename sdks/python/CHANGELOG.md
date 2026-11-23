@@ -3,6 +3,48 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+Fixes from a field test of 1.7.0 (openai 3.57.0) against a self-hosted install.
+
+**Route mode returns openai's own types.** `create()` returned the proxy's
+JSON as a dict and a streamed call yielded dicts. The proxy's response is now
+replayed through a copy of the customer's client (`with_options` with a
+replaying HTTP client), so the call returns a `ChatCompletion`, a `Stream` of
+`ChatCompletionChunk`s, or under `with_raw_response` the raw-response wrapper,
+exactly as unwrapped. `extra_headers`, `extra_query`, `extra_body` and
+`timeout` are request options again instead of JSON fields (OpenAI answered
+400 "Unrecognized request argument supplied: extra_headers", which broke every
+`with_raw_response` call). The proxy connect timeout is the 2 s headers budget,
+not `timeout_s`.
+
+**Usage is read from every response shape.** `with_raw_response` calls and
+streamed calls (openai's final usage chunk, Anthropic's message_start /
+message_delta) were recorded as 0/0 tokens. A streamed call's observation is
+posted when the stream ends.
+
+**TensorCost down costs a call at most its stated budget.** The token exchange
+ran on the caller's thread before the 0.25 s sdk-layer cap applied, so a
+blackholed install made every call wait 6.5-8.5 s. The layer refresh (token
+plus GET) now runs on its own thread and a call waits at most 0.25 s for it;
+the govern path's token exchange and /admit share the 0.5 s admit budget.
+
+**on_fallback for every way a route client goes direct**, with a `reason`:
+`proxy_unavailable`, `circuit_open`, or `layer_decayed` (the layer couldn't be
+fetched and the client decayed to govern, which fired nothing before).
+
+**Observations carry the team and survive an outage.** `x-tc-team-id` is sent
+on every observation POST. Deliveries that fail because TensorCost is
+unreachable wait in a bounded in-memory queue (5,000, oldest dropped first,
+`dropped_observations` counts them) and are replayed after the next delivery
+that works. An `admit_unavailable` call is now marked on its own observation,
+with its agent and real token usage, instead of a separate empty row.
+
+**Warn-only budgets are surfaced.** A 204 from /admit with
+`X-TensorCost-Budget-Would-Refuse` raises the new `on_budget_would_refuse`
+lifecycle event (`OnBudgetWouldRefuseEvent.budget_ids`) and logs one warning
+per budget id, at most once a minute.
+
 ## 1.7.0 — 2026-11-14
 
 **Observations name the account the provider billed the call under.**
