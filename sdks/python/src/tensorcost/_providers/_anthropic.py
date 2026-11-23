@@ -24,12 +24,15 @@ from .._request_options import split_request_options
 from .._typed_response import UNTYPED, replay_through_client, route_stream_result
 from .._usage import (
     anthropic_event_id,
+    anthropic_event_model,
     anthropic_event_usage,
     can_observe_stream,
     observe_stream,
     parsed_for_usage,
     response_id_field,
     response_id_of,
+    response_model_field,
+    response_model_of,
 )
 from .._compliance_guard import (
     assert_team_scope,
@@ -116,6 +119,7 @@ def _post_obs(
     billing_account: Optional[str] = None,
     metadata: Optional[dict] = None,
     provider_response_id: Optional[str] = None,
+    response_model: Optional[str] = None,
 ) -> None:
     obs: dict = {
         "sdk_version": _SDK_VERSION,
@@ -148,6 +152,9 @@ def _post_obs(
         # msg_…: the same call seen by the proxy, a gateway or a cost import
         # is matched to this row on it.
         **response_id_field(provider_response_id),
+        # The model the provider ran the call on: for Azure the request's
+        # model is the deployment, and the server prices from this one.
+        **response_model_field(response_model),
     }
     try:
         transport.post(obs)
@@ -278,6 +285,7 @@ def _wrap_method(
             error: Optional[BaseException] = None,
             billing_account: Optional[str] = None,
             response_id: Optional[str] = None,
+            served_model: Optional[str] = None,
         ) -> None:
             _post_obs(
                 transport, str(model), tenant_id, environment,
@@ -290,6 +298,7 @@ def _wrap_method(
                 billing_account=billing_account,
                 metadata=obs_metadata,
                 provider_response_id=response_id,
+                response_model=served_model,
             )
 
         def call_provider() -> Any:
@@ -304,11 +313,12 @@ def _wrap_method(
             if kwargs.get("stream") is True and can_observe_stream(response):
                 return observe_stream(
                     response, anthropic_event_usage, anthropic_event_id,
-                    lambda i, o, err, rid: post(i, o, err, billing_account, rid),
+                    lambda i, o, err, rid, m: post(i, o, err, billing_account, rid, m),
+                    anthropic_event_model,
                 )
             parsed = parsed_for_usage(response)
             input_tokens, output_tokens = _extract_usage(parsed)
-            post(input_tokens, output_tokens, None, billing_account, response_id_of(parsed))
+            post(input_tokens, output_tokens, None, billing_account, response_id_of(parsed), response_model_of(parsed))
             return response
 
         # anthropic_layer() pins install() to govern while the proxy has no
@@ -416,13 +426,13 @@ def _wrap_method(
             if is_streaming:
                 return route_stream_result(
                     client_ref, _create_of, proxy_result, anthropic_event_usage, anthropic_event_id,
-                    lambda i, o, err, rid: post(i, o, err, None, rid), args, kwargs,
+                    lambda i, o, err, rid, m: post(i, o, err, None, rid, m), args, kwargs, anthropic_event_model,
                 )
 
             # Proxy success, as anthropic's own Message where we can.
             resp_dict = proxy_result if isinstance(proxy_result, dict) else {}
             input_tokens, output_tokens = _extract_usage(resp_dict)
-            post(input_tokens, output_tokens, None, None, response_id_of(resp_dict))
+            post(input_tokens, output_tokens, None, None, response_id_of(resp_dict), response_model_of(resp_dict))
             resp = sink[0] if sink else None
             typed = replay_through_client(
                 client_ref, _create_of, args, kwargs,

@@ -22,6 +22,9 @@ class Observation(TypedDict, total=False):
     input_tokens: Optional[int]
     output_tokens: Optional[int]
     cost_usd_cents: Optional[int]  # SDK doesn't compute; backend fills
+    # The model the provider's response named. For Azure OpenAI ``model`` is
+    # the deployment ("support-bot"); the server prices from this one.
+    response_model: str
     status: str  # "success" | "error"
     error_message: Optional[str]
     correlation_id: str  # uuid4

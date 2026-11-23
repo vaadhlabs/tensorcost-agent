@@ -48,10 +48,13 @@ from .._usage import (
     can_observe_stream,
     observe_stream,
     openai_chunk_id,
+    openai_chunk_model,
     openai_chunk_usage,
     parsed_for_usage,
     response_id_field,
     response_id_of,
+    response_model_field,
+    response_model_of,
 )
 from .._layer import (
     ADMIT_TIMEOUT_S,
@@ -123,6 +126,7 @@ def _post_obs(
     provider: str = "openai",
     metadata: Optional[dict] = None,
     provider_response_id: Optional[str] = None,
+    response_model: Optional[str] = None,
 ) -> None:
     obs: dict = {
         "sdk_version": _SDK_VERSION,
@@ -155,6 +159,9 @@ def _post_obs(
         # The provider's id for the call: the same call seen by the proxy, a
         # gateway or a cost import is matched to this row on it.
         **response_id_field(provider_response_id),
+        # The model the provider ran the call on: for Azure the request's
+        # model is the deployment, and the server prices from this one.
+        **response_model_field(response_model),
     }
     try:
         transport.post(obs)
@@ -293,6 +300,7 @@ def _wrap_method(
             error: Optional[BaseException] = None,
             billing_account: Optional[str] = None,
             response_id: Optional[str] = None,
+            served_model: Optional[str] = None,
         ) -> None:
             _post_obs(
                 transport, str(model), operation, tenant_id, environment,
@@ -306,6 +314,7 @@ def _wrap_method(
                 provider=provider_name,
                 metadata=obs_metadata,
                 provider_response_id=response_id,
+                response_model=served_model,
             )
 
         def fallback(reason: str) -> None:
@@ -336,11 +345,12 @@ def _wrap_method(
             if kwargs.get("stream") is True and can_observe_stream(response):
                 return observe_stream(
                     response, openai_chunk_usage, openai_chunk_id,
-                    lambda i, o, err, rid: post(i, o, err, billing_account, rid),
+                    lambda i, o, err, rid, m: post(i, o, err, billing_account, rid, m),
+                    openai_chunk_model,
                 )
             parsed = parsed_for_usage(response)
             input_tokens, output_tokens = _extract_usage(parsed)
-            post(input_tokens, output_tokens, None, billing_account, response_id_of(parsed))
+            post(input_tokens, output_tokens, None, billing_account, response_id_of(parsed), response_model_of(parsed))
             return response
 
         wants_proxy = (
@@ -455,14 +465,14 @@ def _wrap_method(
         if is_streaming:
             return route_stream_result(
                 client_ref, _create_of, proxy_result, openai_chunk_usage, openai_chunk_id,
-                lambda i, o, err, rid: post(i, o, err, None, rid), args, kwargs,
+                lambda i, o, err, rid, m: post(i, o, err, None, rid, m), args, kwargs, openai_chunk_model,
             )
 
         # Proxy success: openai's own type for it (ChatCompletion, or the
         # raw-response wrapper under with_raw_response).
         resp_dict = proxy_result if isinstance(proxy_result, dict) else {}
         input_tokens, output_tokens = _extract_usage(resp_dict)
-        post(input_tokens, output_tokens, None, None, response_id_of(resp_dict))
+        post(input_tokens, output_tokens, None, None, response_id_of(resp_dict), response_model_of(resp_dict))
         resp = sink[0] if sink else None
         typed = replay_through_client(
             client_ref, _create_of, args, kwargs,
