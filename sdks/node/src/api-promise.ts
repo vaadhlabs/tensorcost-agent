@@ -30,6 +30,11 @@
  * final chunk with stream_options.include_usage; Anthropic's message_start
  * and message_delta), by watching the iterator the caller pulls from, never
  * by reading ahead of the caller.
+ *
+ * The provider's id for the call rides along with the usage (`id` on a
+ * body or an OpenAI chunk, `message.id` on Anthropic's message_start). The
+ * server keys the same call seen by the SDK, the proxy, a gateway or a cost
+ * import on it (provider_response_id).
  */
 
 import { billingAccountOfApiPromise, billingAccountOfCall } from "./billing-account.js";
@@ -37,6 +42,32 @@ import { billingAccountOfApiPromise, billingAccountOfCall } from "./billing-acco
 export interface Usage {
   input: number | null;
   output: number | null;
+  /** The provider's id for the call: chatcmpl-/cmpl-, msg_, Bedrock's request id. */
+  responseId?: string | null;
+}
+
+/**
+ * ObservationDto.provider_response_id is @MaxLength(200), and the DTO
+ * refuses the whole observation over a bad field, so a longer id is left off.
+ */
+export const MAX_RESPONSE_ID_LENGTH = 200;
+
+/** `v` as a provider response id the server will take, else null. */
+export function responseId(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t.length > 0 && t.length <= MAX_RESPONSE_ID_LENGTH ? t : null;
+}
+
+/** `body.id`, the id OpenAI and Anthropic put on a response body or chunk. */
+export function responseIdOf(body: unknown): string | null {
+  return body && typeof body === "object" ? responseId((body as Record<string, unknown>)["id"]) : null;
+}
+
+/** The observation's provider_response_id, absent when there is none. */
+export function responseIdField(id: unknown): { provider_response_id?: string } {
+  const rid = responseId(id);
+  return rid !== null ? { provider_response_id: rid } : {};
 }
 
 const NO_USAGE: Usage = { input: null, output: null };
@@ -334,14 +365,16 @@ const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
 /** OpenAI chat chunks: usage rides on the final chunk with stream_options.include_usage. */
 export function openAiStreamTracker(): StreamUsageTracker {
   let usage: Usage = NO_USAGE;
+  let id: string | null = null;
   return {
     see(chunk) {
+      id ??= responseIdOf(chunk);
       const u = (chunk as { usage?: Record<string, unknown> | null } | null)?.usage;
       if (u && typeof u === "object") {
         usage = { input: num(u["prompt_tokens"]), output: num(u["completion_tokens"]) };
       }
     },
-    usage: () => usage,
+    usage: () => ({ ...usage, responseId: id }),
   };
 }
 
@@ -352,11 +385,13 @@ export function openAiStreamTracker(): StreamUsageTracker {
 export function anthropicStreamTracker(): StreamUsageTracker {
   let input: number | null = null;
   let output: number | null = null;
+  let id: string | null = null;
   return {
     see(event) {
       const e = event as Record<string, any> | null;
       if (!e || typeof e !== "object") return;
       if (e.type === "message_start") {
+        id ??= responseIdOf(e.message);
         const u = e.message?.usage;
         if (u && typeof u === "object") {
           input = num(u.input_tokens) ?? input;
@@ -367,7 +402,7 @@ export function anthropicStreamTracker(): StreamUsageTracker {
         input = num(e.usage.input_tokens) ?? input;
       }
     },
-    usage: () => ({ input, output }),
+    usage: () => ({ input, output, responseId: id }),
   };
 }
 

@@ -12,6 +12,7 @@ import type { ObservationTransport } from "../transport.js";
 
 import { SDK_VERSION } from "../version.js";
 import { billingAccountField, billingAccountOfCall, vertexCallUrl } from "../billing-account.js";
+import { responseIdField } from "../api-promise.js";
 import { resolveModelCallLink } from "../trace-link.js";
 import {
   WrapOverhead,
@@ -150,6 +151,12 @@ function wrapMethod(
         cost_usd_cents: null,
         status: "success",
         error_message: null,
+        // GenerateContentResponse.responseId. A stream isn't read here, so
+        // its observation has none.
+        ...responseIdField(
+          (response as { responseId?: unknown; response_id?: unknown } | null)?.responseId ??
+            (response as { response_id?: unknown } | null)?.response_id,
+        ),
       });
       return response;
     } catch (err) {

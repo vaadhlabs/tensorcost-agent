@@ -49,3 +49,7 @@ class Observation(TypedDict, total=False):
     agent_id: Optional[str]
     # Agent-run attribution — optional; lands in ``ai.ai_spend_events.workflow_id``.
     workflow_id: Optional[str]
+    # The provider's id for the call (chatcmpl-/cmpl-, msg_, Bedrock's
+    # x-amzn-requestid, Vertex's response_id); at most 200 characters.
+    # Absent when the provider gave none.
+    provider_response_id: str

@@ -52,6 +52,8 @@ import {
   anthropicStreamTracker,
   observeApiCall,
   tapStream,
+  responseIdField,
+  responseIdOf,
   type CallSource,
   type Usage,
 } from "../api-promise.js";
@@ -90,21 +92,20 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function extractUsage(
-  response: unknown,
-): { input: number | null; output: number | null } {
+function extractUsage(response: unknown): Usage {
   if (!response || typeof response !== "object") {
     return { input: null, output: null };
   }
+  const responseId = responseIdOf(response);
   const usage = (response as Record<string, any>).usage;
   if (!usage || typeof usage !== "object") {
-    return { input: null, output: null };
+    return { input: null, output: null, responseId };
   }
   const u = usage as Record<string, unknown>;
   const input = typeof u.input_tokens === "number" ? u.input_tokens : null;
   const output =
     typeof u.output_tokens === "number" ? u.output_tokens : null;
-  return { input, output };
+  return { input, output, responseId };
 }
 
 /**
@@ -216,6 +217,9 @@ function wrapMethod(
       ...(resolvedCustomer !== undefined ? { customer: resolvedCustomer } : {}),
       ...(resolvedFeature !== undefined ? { feature: resolvedFeature } : {}),
       ...(o.billingAccount !== undefined ? billingAccountField(o.billingAccount) : {}),
+      // The same call seen by the proxy, a gateway or a cost import is
+      // matched to this row on it.
+      ...responseIdField(o.usage?.responseId),
       ...(o.decisionMeta !== undefined
         ? { metadata: { ...(meta ?? {}), ...o.decisionMeta } }
         : meta !== undefined

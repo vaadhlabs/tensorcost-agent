@@ -129,7 +129,8 @@ def route_stream_result(
     method_of: Callable[[Any], Callable[..., Any]],
     raw_stream: Any,
     chunk_usage: Callable[[Any], Any],
-    finish: Callable[[Any, Any, Optional[BaseException]], None],
+    chunk_id: Callable[[Any], Optional[str]],
+    finish: Callable[[Any, Any, Optional[BaseException], Optional[str]], None],
     args: tuple,
     kwargs: Mapping[str, Any],
 ) -> Any:
@@ -157,6 +158,6 @@ def route_stream_result(
     else:
         stream = raw_stream
     if can_observe_stream(stream):
-        return observe_stream(stream, chunk_usage, finish)
-    finish(None, None, None)
+        return observe_stream(stream, chunk_usage, chunk_id, finish)
+    finish(None, None, None, None)
     return stream

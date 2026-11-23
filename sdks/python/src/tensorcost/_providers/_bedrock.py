@@ -64,6 +64,7 @@ from .._models import Observation
 from .._transport import ObservationTransport
 
 from .._observation_scope import observation_scope
+from .._usage import response_id, response_id_field
 from .._version import SDK_VERSION as _SDK_VERSION
 from .. import _billing_account as _ba
 _log = logging.getLogger("tensorcost")
@@ -78,6 +79,23 @@ _APPLIED_MODE_ERROR = (
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _request_id(response: Any) -> Optional[str]:
+    """The call's x-amzn-requestid, on every Bedrock response, streams too.
+
+    This is the id the proxy, the invocation log and the CUR know the call
+    by. Anthropic on Bedrock also answers with a msg_bdrk_ id in the body,
+    which none of them have, so it isn't used.
+    """
+    meta = response.get("ResponseMetadata") if isinstance(response, dict) else None
+    if not isinstance(meta, dict):
+        return None
+    rid = response_id(meta.get("RequestId"))
+    if rid is not None:
+        return rid
+    headers = meta.get("HTTPHeaders")
+    return response_id(headers.get("x-amzn-requestid")) if isinstance(headers, dict) else None
 
 
 def _tokens_from_headers(response: Any) -> "tuple[int | None, int | None] | None":
@@ -199,6 +217,7 @@ def _post_obs(
     application: Optional[str] = None,
     tags: Optional[list] = None,
     billing_account: Optional[str] = None,
+    provider_response_id: Optional[str] = None,
 ) -> None:
     obs: Observation = {
         "sdk_version": _SDK_VERSION,
@@ -225,6 +244,7 @@ def _post_obs(
         # _observation_scope.SEND is off (1.5.0), see that module.
         **observation_scope(application, tags),
         **_ba.field(billing_account),
+        **response_id_field(provider_response_id),
     }
     try:
         transport.post(obs)
@@ -282,6 +302,7 @@ def _wrap_method(
                 agent_id=agent_id, workflow_id=workflow_id,
                 application=application, tags=tags,
                 billing_account=_ba.bedrock_account_of_client(client_ref),
+                provider_response_id=_request_id(response),
             )
             return response
 
@@ -296,6 +317,7 @@ def _wrap_method(
             agent_id=agent_id, workflow_id=workflow_id,
             application=application, tags=tags,
             billing_account=_ba.bedrock_account_of_client(client_ref),
+            provider_response_id=_request_id(response),
         )
         return response
 

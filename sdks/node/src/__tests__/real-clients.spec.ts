@@ -339,6 +339,7 @@ describe.skipIf(!OPENAI || !existsSync(OPENAI))("a real openai client keeps its 
     await tick();
     expect(observations).toHaveLength(2);
     expect(observations.map((o) => [o.input_tokens, o.output_tokens])).toEqual([[1, 1], [1, 1]]);
+    expect(observations.map((o) => o.provider_response_id)).toEqual(["chatcmpl-direct", "chatcmpl-direct"]);
   });
 
   it("observe: a stream with include_usage is recorded with its usage when it ends", async () => {
@@ -354,7 +355,7 @@ describe.skipIf(!OPENAI || !existsSync(OPENAI))("a real openai client keeps its 
     expect(n).toBe(3);
     await tick();
     expect(observations).toHaveLength(1);
-    expect(observations[0]).toMatchObject({ input_tokens: 10, output_tokens: 2 });
+    expect(observations[0]).toMatchObject({ input_tokens: 10, output_tokens: 2, provider_response_id: "c" });
   });
 
   it("observe: openai's own chat.completions.stream() helper works through the wrapper", async (ctx) => {
@@ -369,11 +370,11 @@ describe.skipIf(!OPENAI || !existsSync(OPENAI))("a real openai client keeps its 
     expect(final.choices[0].message.content).toBe("Ok.");
     await tick();
     expect(observations).toHaveLength(1);
-    expect(observations[0]).toMatchObject({ input_tokens: 4, output_tokens: 1 });
+    expect(observations[0]).toMatchObject({ input_tokens: 4, output_tokens: 1, provider_response_id: "c" });
   });
 
   it("route: a default client sends x-tc-provider-url https://api.openai.com, and withResponse() works", async () => {
-    const { c, proxyHeaders } = await setup(
+    const { c, proxyHeaders, observations } = await setup(
       { layer: "route", proxy: () => json(200, chatOk, { "x-tc-decision": "layer=route; action=pass_through" }) },
       { maxLayer: "route", proxyUrl: "http://proxy.test" },
     );
@@ -381,6 +382,8 @@ describe.skipIf(!OPENAI || !existsSync(OPENAI))("a real openai client keeps its 
     expect(data.id).toBe("chatcmpl-direct");
     expect(response.headers.get("x-tc-decision")).toContain("pass_through");
     expect(proxyHeaders[0]!.get("x-tc-provider-url")).toBe("https://api.openai.com");
+    await tick();
+    expect(observations.map((o) => o.provider_response_id)).toEqual(["chatcmpl-direct"]);
   });
 });
 
@@ -413,6 +416,7 @@ describe.skipIf(!ANTHROPIC || !existsSync(ANTHROPIC))("a real @anthropic-ai/sdk 
     expect(data.id).toBe("msg_direct");
     await tick();
     expect(observations).toHaveLength(1);
+    expect(observations[0]!.provider_response_id).toBe("msg_direct");
   });
 
   it("observe: messages.stream() (which calls create().withResponse()) works and records the usage", async () => {
@@ -421,6 +425,11 @@ describe.skipIf(!ANTHROPIC || !existsSync(ANTHROPIC))("a real @anthropic-ai/sdk 
     expect(final.content[0].text).toBe("Ok.");
     await tick();
     expect(observations).toHaveLength(1);
-    expect(observations[0]).toMatchObject({ provider: "anthropic", input_tokens: 12, output_tokens: 4 });
+    expect(observations[0]).toMatchObject({
+      provider: "anthropic",
+      input_tokens: 12,
+      output_tokens: 4,
+      provider_response_id: "msg_s",
+    });
   });
 });
