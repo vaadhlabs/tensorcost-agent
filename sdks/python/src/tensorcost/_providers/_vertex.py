@@ -35,6 +35,7 @@ from typing import Any, Callable, Optional
 from .._models import Observation
 from .._transport import ObservationTransport
 from .._observation_scope import observation_scope
+from .._usage import response_id, response_id_field
 from .._version import SDK_VERSION as _SDK_VERSION
 from .. import _billing_account as _ba
 
@@ -93,6 +94,7 @@ def _post_obs(
     application: Optional[str] = None,
     tags: Optional[list] = None,
     billing_account: Optional[str] = None,
+    provider_response_id: Optional[str] = None,
 ) -> None:
     obs: Observation = {
         "sdk_version": _SDK_VERSION,
@@ -117,6 +119,7 @@ def _post_obs(
         # _observation_scope.SEND is off (1.5.0), see that module.
         **observation_scope(application, tags),
         **_ba.field(billing_account),
+        **response_id_field(provider_response_id),
     }
     try:
         transport.post(obs)
@@ -185,6 +188,9 @@ def _wrap_method(
             agent_id=agent_id, workflow_id=workflow_id,
             application=application, tags=tags,
             billing_account=_ba.billing_account_of_call(_ba.vertex_call_url(client_ref), None),
+            # GenerateContentResponse.response_id. A stream isn't read here,
+            # so its observation has none.
+            provider_response_id=response_id(getattr(response, "response_id", None)),
         )
         return response
 

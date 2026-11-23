@@ -146,6 +146,14 @@ export interface Observation {
    */
   billing_account?: string;
   /**
+   * The provider's id for the call: chatcmpl-/cmpl- (OpenAI), msg_
+   * (Anthropic), the x-amzn-requestid (Bedrock), responseId (Vertex). The
+   * server keys the same call seen by the SDK, the proxy, a gateway or a
+   * cost import on it. At most 200 characters; absent when the provider
+   * gave none.
+   */
+  provider_response_id?: string;
+  /**
    * Routing-policy application scope from `wrap({ application })`. Lands in
    * `ai.ai_spend_events.application` (the server buckets unset ones under
    * `sdk:tier2`) and lets an application-scoped route collect evidence
