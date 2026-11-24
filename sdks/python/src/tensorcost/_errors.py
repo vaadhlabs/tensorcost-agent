@@ -9,9 +9,10 @@ Hierarchy::
     TensorCostError (base)
     ├── TensorCostNetworkError    couldn't reach the proxy at all          ┐ outages: the only
     ├── TensorCostTimeoutError    request or idle window exceeded limit    │ errors that may fall
-    ├── TensorCostProxyError      proxy responded with 5xx                 │ back to the provider
-    ├── TensorCostQuotaError      proxy 429, or 402 plan ceiling           ┘
-    ├── TensorCostProviderError   proxy relayed an upstream provider 4xx
+    ├── TensorCostProxyError      proxy responded with 5xx                 │ back to the provider,
+    ├── TensorCostQuotaError      proxy 429, or 402 plan ceiling           ┘ and only when
+    │                                          may_have_reached_provider is False
+    ├── TensorCostProviderError   proxy relayed an upstream provider error
     │                             (re-raised as the provider SDK's own error
     │                             type when the client can build one)
     ├── TensorCostGatewayRejectedError  non-JSON 4xx from in front of TensorCost
@@ -36,6 +37,10 @@ All subclasses carry:
 * ``status``      — HTTP status code (None when the request never completed)
 * ``request_id``  — value of the X-TC-Request-ID header the proxy stamps
 * ``attempt``     — 1-based attempt number at the time the error occurred
+* ``may_have_reached_provider`` — True when the call may already have reached
+                    the provider (and been billed): the SDK neither retries it
+                    nor falls back to the provider for it, and a caller
+                    resending it should know it may pay twice
 """
 
 from __future__ import annotations
@@ -45,6 +50,18 @@ from typing import Any, Optional
 
 class TensorCostError(Exception):
     """Base class for all TensorCost SDK errors."""
+
+    #: True when the call may already have reached the provider: the request
+    #: was written to the proxy and what came back (a timeout, a reset, a 5xx
+    #: the proxy did not prove it produced before forwarding, an
+    #: ``x-should-retry: false``) can't rule out that the provider ran and
+    #: billed it. The SDK never retries such a call or sends it to the
+    #: provider directly; it raises instead, as the provider's own SDK would.
+    #: False when the call provably never left: the proxy was unreachable,
+    #: the circuit was open, or TensorCost answered before forwarding. Set
+    #: only by the proxy request path; errors from the admit check and the
+    #: token exchange come before the call is sent at all.
+    may_have_reached_provider: bool = False
 
     def __init__(
         self,
@@ -136,9 +153,12 @@ class TensorCostQuotaError(TensorCostError):
 
 class TensorCostProviderError(TensorCostError):
     """The proxy reached the upstream provider and relayed the provider's own
-    4xx (OpenAI 400 invalid request, Anthropic 401, ...). ``status`` is the
-    provider's status and ``body`` what it sent, parsed when it was JSON.
-    Never falls back: the provider would only answer the same way again."""
+    error: a 4xx (OpenAI 400 invalid request, Anthropic 401, ...), or since
+    1.8.0 any status marked ``x-tc-error-origin: provider`` (a provider 5xx or
+    429, or the proxy's 504 about a provider that did not answer in time).
+    ``status`` is that status and ``body`` what came back, parsed when it was
+    JSON. Never retried and never falls back: the provider would only answer
+    the same way again, or has already run the call."""
 
     def __init__(
         self,

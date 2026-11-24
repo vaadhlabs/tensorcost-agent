@@ -68,7 +68,7 @@ class TestCircuitBreakerClosedToOpen:
 
 class TestCircuitBreakerOpenToHalfOpen:
     def test_should_probe_transitions_to_half_open(self):
-        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1))
+        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1, probe_interval_s=0.0))
         cb.record_failure()
         assert cb.state == "OPEN"
         result = cb.should_probe()
@@ -81,7 +81,7 @@ class TestCircuitBreakerOpenToHalfOpen:
         assert cb.state == "CLOSED"
 
     def test_probe_failure_goes_back_to_open(self):
-        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1))
+        cb = CircuitBreaker(CircuitBreakerConfig(probe_interval_s=0.0, open_threshold=1))
         cb.record_failure()
         cb.should_probe()  # transitions to HALF_OPEN
         cb.record_failure()
@@ -90,7 +90,7 @@ class TestCircuitBreakerOpenToHalfOpen:
 
 class TestCircuitBreakerHalfOpenToClose:
     def test_closes_after_close_threshold_probe_successes(self):
-        cfg = CircuitBreakerConfig(open_threshold=1, close_threshold=3)
+        cfg = CircuitBreakerConfig(probe_interval_s=0.0, open_threshold=1, close_threshold=3)
         cb = CircuitBreaker(cfg)
         cb.record_failure()
         cb.should_probe()  # OPEN → HALF_OPEN
@@ -107,7 +107,7 @@ class TestCircuitBreakerHalfOpenToClose:
             seen.append(f"{frm}->{to}")
 
         cb = CircuitBreaker(
-            CircuitBreakerConfig(open_threshold=1, close_threshold=1),
+            CircuitBreakerConfig(probe_interval_s=0.0, open_threshold=1, close_threshold=1),
             on_transition=listener,
         )
         cb.record_failure()
@@ -116,7 +116,7 @@ class TestCircuitBreakerHalfOpenToClose:
         assert seen == ["CLOSED->OPEN", "OPEN->HALF_OPEN", "HALF_OPEN->CLOSED"]
 
     def test_release_stuck_probe_returns_to_open(self):
-        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1, close_threshold=3))
+        cb = CircuitBreaker(CircuitBreakerConfig(probe_interval_s=0.0, open_threshold=1, close_threshold=3))
         cb.record_failure()
         cb.should_probe()
         assert cb.state == "HALF_OPEN"
@@ -124,7 +124,7 @@ class TestCircuitBreakerHalfOpenToClose:
         assert cb.state == "OPEN"
 
     def test_after_close_failures_count_reset(self):
-        cfg = CircuitBreakerConfig(open_threshold=1, close_threshold=2)
+        cfg = CircuitBreakerConfig(probe_interval_s=0.0, open_threshold=1, close_threshold=2)
         cb = CircuitBreaker(cfg)
         cb.record_failure()
         cb.should_probe()
@@ -132,3 +132,38 @@ class TestCircuitBreakerHalfOpenToClose:
         cb.record_success()
         assert cb.state == "CLOSED"
         assert cb.failures == 0
+
+
+class TestProbeInterval:
+    """An open circuit lets one call probe the proxy at most once per interval.
+
+    Since 1.8.0 a probe that times out surfaces its error instead of going
+    direct, so probing on every call would fail every call while the proxy
+    hangs.
+    """
+
+    def test_no_probe_inside_the_interval(self):
+        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1, probe_interval_s=60.0))
+        cb.record_failure()
+        assert cb.state == "OPEN"
+        assert cb.should_probe() is False
+        assert cb.should_bypass() is True
+
+    def test_probe_after_the_interval(self, monkeypatch):
+        import tensorcost._circuit as circuit_mod
+
+        now = [1000.0]
+        monkeypatch.setattr(circuit_mod.time, "monotonic", lambda: now[0])
+        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1, probe_interval_s=5.0))
+        cb.record_failure()
+        now[0] += 4.9
+        assert cb.should_probe() is False
+        now[0] += 0.2
+        assert cb.should_probe() is True
+        # A failed probe reopens the circuit and restarts the wait.
+        cb.record_failure()
+        assert cb.state == "OPEN"
+        assert cb.should_probe() is False
+
+    def test_default_interval_is_five_seconds(self):
+        assert CircuitBreakerConfig().probe_interval_s == 5.0

@@ -452,8 +452,23 @@ def _timeout(request: httpx.Request) -> httpx.Response:
 
 OUTAGES = [
     pytest.param(_network, id="network-error"),
-    pytest.param(_timeout, id="timeout"),
-    pytest.param(lambda _r: httpx.Response(503, json={"error": "unavailable"}), id="proxy-503"),
+    pytest.param(_timeout, id="connect-timeout"),
+    pytest.param(
+        lambda _r: httpx.Response(
+            503,
+            json={"statusCode": 503, "message": "TensorCost could not check the SDK token; try again"},
+            headers={"x-tc-error-origin": "proxy"},
+        ),
+        id="proxy-503",
+    ),
+    pytest.param(
+        lambda _r: httpx.Response(
+            503,
+            json={"error": {"code": "UPSTREAM_UNAVAILABLE"}},
+            headers={"x-tc-error-origin": "gateway", "retry-after": "1"},
+        ),
+        id="gateway-503-circuit-open",
+    ),
     pytest.param(
         lambda _r: httpx.Response(
             402,
@@ -495,6 +510,72 @@ def test_outage_does_not_fall_back_when_disabled(tensorcost_api, recording_trans
         _call(client, stream)
     assert should_fall_back_to_provider(info.value) or isinstance(info.value, TensorCostProxyError)
     direct.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Failures after the call may have reached the provider: never resent.
+# Through 1.7.0 every one of these fell back (after five retries for the
+# 5xx), so a call the provider had already billed could run six times.
+
+
+def _read_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("timed out", request=request)
+
+
+def _reset(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadError("[Errno 54] Connection reset by peer", request=request)
+
+
+MAYBE_SENT = [
+    pytest.param(_read_timeout, id="timeout-after-send"),
+    pytest.param(_reset, id="connection-reset"),
+    pytest.param(lambda _r: httpx.Response(503, json={"error": "unavailable"}), id="5xx-no-origin"),
+    pytest.param(
+        lambda _r: httpx.Response(500, json={"statusCode": 500}, headers={"x-tc-error-origin": "proxy"}),
+        id="proxy-500-after-forward",
+    ),
+    pytest.param(
+        lambda _r: httpx.Response(
+            502,
+            json={"error": {"code": "UPSTREAM_PROXY_ERROR", "message": "socket hang up"}},
+            headers={"x-tc-error-origin": "gateway"},
+        ),
+        id="gateway-502-proxy-reset",
+    ),
+    pytest.param(
+        lambda _r: httpx.Response(
+            503, json={"error": "unavailable"}, headers={"x-tc-error-origin": "proxy", "x-should-retry": "false"}
+        ),
+        id="x-should-retry-false",
+    ),
+]
+
+
+@pytest.mark.parametrize("layer,stream,path", [p for p in PATHS if p.id != "admit"])
+@pytest.mark.parametrize("respond", MAYBE_SENT)
+def test_maybe_sent_failure_surfaces_and_never_reaches_the_provider(
+    tensorcost_api, recording_transport, layer, stream, path, respond
+):
+    client, direct = _install(recording_transport, layer, fail_open_enabled=True)
+    tensorcost_api["handler"] = respond
+    with pytest.raises(Exception) as info:
+        _call(client, stream)
+    direct.assert_not_called()
+    assert should_fall_back_to_provider(info.value) is False
+    assert getattr(info.value, "may_have_reached_provider", None) is True
+    # Sent to the proxy once: not retried either.
+    assert len([u for u in tensorcost_api["calls"] if u.endswith(path)]) == 1
+
+
+@pytest.mark.parametrize("respond", MAYBE_SENT)
+def test_admit_outage_still_falls_back(tensorcost_api, recording_transport, respond):
+    # The admit check runs before the call is sent at all, so any admit
+    # outage may fall back, a timeout or an unmarked 5xx included.
+    client, direct = _install(recording_transport, "govern", fail_open_enabled=True)
+    tensorcost_api["handler"] = respond
+    result = _call(client, False)
+    assert result["id"] == "direct"
+    direct.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

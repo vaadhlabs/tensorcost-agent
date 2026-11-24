@@ -8,7 +8,8 @@ the provider instead of through the proxy.  The circuit closes again after
 State machine::
 
     CLOSED ──(failures >= open_threshold)──> OPEN
-    OPEN   ──(single-flight probe)─────────> HALF_OPEN
+    OPEN   ──(single-flight probe, at most
+              once per probe_interval_s)──> HALF_OPEN
     HALF_OPEN ──(proxy 2xx)────────────────> probe_successes++
                ──(proxy 5xx/err)───────────> back to OPEN
     HALF_OPEN ──(probe_successes >= close_threshold)──> CLOSED
@@ -21,6 +22,7 @@ A per-circuit lock makes HALF_OPEN single-flight safe under threaded servers
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Literal, Optional
 
@@ -36,6 +38,12 @@ class CircuitBreakerConfig:
     open_threshold: int = 3
     #: Consecutive probe successes before the circuit closes again.
     close_threshold: int = 5
+    #: Seconds an open circuit waits before letting one call probe the proxy.
+    #: Since 1.8.0 a probe that times out or is reset surfaces its error
+    #: instead of going direct (it may have reached the provider), so probing
+    #: on every call would fail every call while the proxy hangs. Same 5 s as
+    #: the Node SDK.
+    probe_interval_s: float = 5.0
 
 
 DEFAULT_CIRCUIT_CONFIG = CircuitBreakerConfig()
@@ -58,6 +66,7 @@ class CircuitBreaker:
         self._consecutive_failures: int = 0
         self._probe_successes: int = 0
         self._probe_in_flight: bool = False
+        self._opened_at: float = 0.0
         self._lock = threading.Lock()
 
     def _transition(self, to: CircuitState) -> None:
@@ -65,6 +74,8 @@ class CircuitBreaker:
             return
         prev = self._state
         self._state = to
+        if to == "OPEN":
+            self._opened_at = time.monotonic()
         if self._on_transition is not None:
             self._on_transition(prev, to)
 
@@ -88,7 +99,11 @@ class CircuitBreaker:
     def should_probe(self) -> bool:
         """Return True when this caller should run the single-flight probe."""
         with self._lock:
-            if self._state == "OPEN" and not self._probe_in_flight:
+            if (
+                self._state == "OPEN"
+                and not self._probe_in_flight
+                and time.monotonic() - self._opened_at >= self.config.probe_interval_s
+            ):
                 self._probe_in_flight = True
                 self._transition("HALF_OPEN")
                 return True

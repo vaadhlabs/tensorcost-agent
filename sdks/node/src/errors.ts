@@ -8,11 +8,12 @@
  * Hierarchy:
  *
  *   TensorCostError (base)
- *   ├── TensorCostNetworkError    couldn't reach the proxy at all          ┐
- *   ├── TensorCostTimeoutError    request or idle window exceeded limit    │ outages: the only
- *   ├── TensorCostProxyError      proxy responded with 5xx                 │ errors that may fall
- *   ├── TensorCostQuotaError      proxy 429, or 402 plan ceiling           ┘ back to the provider
- *   ├── TensorCostProviderError   proxy relayed an upstream provider 4xx
+ *   ├── TensorCostNetworkError    couldn't reach the proxy at all          ┐ outages: the only
+ *   ├── TensorCostTimeoutError    request or idle window exceeded limit    │ errors that may fall
+ *   ├── TensorCostProxyError      proxy responded with 5xx                 │ back to the provider,
+ *   ├── TensorCostQuotaError      proxy 429, or 402 plan ceiling           ┘ and only when
+ *   │                                                     mayHaveReachedProvider is false
+ *   ├── TensorCostProviderError   proxy relayed an upstream provider error
  *   │                             (rethrown as the provider SDK's own error
  *   │                             type when the client can build one)
  *   ├── TensorCostGatewayRejectedError  non-JSON 4xx from in front of TensorCost
@@ -35,6 +36,10 @@
  *   - `status`      HTTP status code (null when the request never completed)
  *   - `requestId`   value of the X-TC-Request-ID header the proxy stamps
  *   - `attempt`     1-based attempt number at the time the error occurred
+ *   - `mayHaveReachedProvider`  true when the call may already have reached
+ *                   the provider (and been billed): the SDK will neither
+ *                   retry it nor fall back to the provider for it, and a
+ *                   caller resending it should know it may pay twice
  */
 
 export interface TensorCostErrorOptions {
@@ -42,6 +47,8 @@ export interface TensorCostErrorOptions {
   status?: number | null;
   requestId?: string | null;
   attempt?: number;
+  /** See TensorCostError.mayHaveReachedProvider. Default false. */
+  mayHaveReachedProvider?: boolean;
 }
 
 export abstract class TensorCostError extends Error {
@@ -50,6 +57,19 @@ export abstract class TensorCostError extends Error {
   readonly status: number | null;
   readonly requestId: string | null;
   readonly attempt: number;
+  /**
+   * True when the call may already have reached the provider: the request
+   * was written to the proxy and what came back (a timeout, a reset, a 5xx
+   * the proxy did not prove it produced before forwarding, an
+   * `x-should-retry: false`) can't rule out that the provider ran and
+   * billed it. The SDK never retries such a call or sends it to the
+   * provider directly; it surfaces the error instead, as the provider's
+   * own SDK would. False when the call provably never left: the proxy was
+   * unreachable, the circuit was open, or TensorCost answered before
+   * forwarding. Set only by the proxy request path; errors from the admit
+   * check and the token exchange come before the call is sent at all.
+   */
+  readonly mayHaveReachedProvider: boolean;
 
   constructor(message: string, opts: TensorCostErrorOptions = {}) {
     super(message);
@@ -66,6 +86,7 @@ export abstract class TensorCostError extends Error {
     this.status = opts.status ?? null;
     this.requestId = opts.requestId ?? null;
     this.attempt = opts.attempt ?? 1;
+    this.mayHaveReachedProvider = opts.mayHaveReachedProvider ?? false;
 
     // Keep stack traces clean in V8 environments.
     if (Error.captureStackTrace) {
@@ -124,10 +145,13 @@ export class TensorCostQuotaError extends TensorCostError {
 
 /**
  * The proxy reached the upstream provider and relayed the provider's own
- * 4xx (OpenAI 400 invalid request, Anthropic 401, and so on). `status` is
- * the provider's status and `body` is what the provider sent, parsed as
- * JSON when it was JSON. Never falls back: the provider would only answer
- * the same way again.
+ * error: a 4xx (OpenAI 400 invalid request, Anthropic 401, and so on), or
+ * since 1.8.0 any status the proxy marks `x-tc-error-origin: provider` (a
+ * provider 5xx or 429, or the proxy's 504 about a provider that did not
+ * answer in time). `status` is that status and `body` is what came back,
+ * parsed as JSON when it was JSON. Never retried and never falls back: the
+ * provider would only answer the same way again, or has already run the
+ * call.
  */
 export class TensorCostProviderError extends TensorCostError {
   readonly body: unknown;

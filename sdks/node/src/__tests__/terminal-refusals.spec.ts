@@ -503,8 +503,16 @@ const OUTAGES: { name: string; respond: (url: string, init?: RequestInit) => Pro
       throw new TypeError("fetch failed: ECONNREFUSED");
     },
   },
-  { name: "timeout", respond: abortable },
-  { name: "proxy 503", respond: async () => json(503, { error: "unavailable" }) },
+  {
+    name: "proxy 503 (its own, before forwarding)",
+    respond: async () =>
+      json(503, { statusCode: 503, message: "TensorCost could not check the SDK token; try again" }, { "x-tc-error-origin": "proxy" }),
+  },
+  {
+    name: "gateway 503 (circuit open)",
+    respond: async () =>
+      json(503, { error: { code: "UPSTREAM_UNAVAILABLE" } }, { "x-tc-error-origin": "gateway", "retry-after": "1" }),
+  },
   {
     name: "proxy 402 (plan request ceiling, no refusal body)",
     respond: async () =>
@@ -546,6 +554,62 @@ describe.each(PATHS)("outages on the $name path", ({ layer, stream }) => {
       .catch((e: unknown) => e);
     expect(direct).not.toHaveBeenCalled();
     expect(shouldFallBackToProvider(err) || err instanceof TensorCostProxyError).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Failures after the call may have reached the provider: never resent.
+// Through 1.7.0 every one of these fell back (after five retries for the
+// 5xx), so a call the provider had already billed could run six times.
+
+const MAYBE_SENT: { name: string; respond: (url: string, init?: RequestInit) => Promise<Response> }[] = [
+  { name: "timeout after the request was sent", respond: abortable },
+  {
+    name: "connection reset",
+    respond: async () => {
+      throw new TypeError("fetch failed", { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" }) });
+    },
+  },
+  { name: "5xx with no origin header", respond: async () => json(503, { error: "unavailable" }) },
+  {
+    name: "proxy 500 (an error after the forward)",
+    respond: async () => json(500, { statusCode: 500, message: "Internal server error" }, { "x-tc-error-origin": "proxy" }),
+  },
+  {
+    name: "gateway 502 (the proxy reset mid-call)",
+    respond: async () =>
+      json(502, { error: { code: "UPSTREAM_PROXY_ERROR", message: "socket hang up" } }, { "x-tc-error-origin": "gateway" }),
+  },
+  {
+    name: "proxy 503 with x-should-retry: false",
+    respond: async () => json(503, { error: "unavailable" }, { "x-tc-error-origin": "proxy", "x-should-retry": "false" }),
+  },
+];
+
+// The admit check is not here: it runs before the call is sent at all, so
+// any admit outage may fall back, a timeout or an unmarked 5xx included.
+describe("admit outages that would be maybe-sent on the proxy path", () => {
+  it.each(MAYBE_SENT)("$name at admit still falls back", async (o) => {
+    const { client, direct } = install("govern", true, 30);
+    stubTensorCost(o.respond);
+    const resp = await client.chat.completions.create({ model: "gpt-4o", messages: [] });
+    expect((resp as { id: string }).id).toBe("direct");
+    expect(direct).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe.each(PATHS.filter((p) => p.name !== "admit"))("maybe-sent failures on the $name path", ({ layer, stream }) => {
+  it.each(MAYBE_SENT)("$name surfaces, and never reaches the provider directly", async (o) => {
+    const { client, direct } = install(layer, true, 30);
+    const calls = stubTensorCost(o.respond);
+    const err = await client.chat.completions
+      .create({ model: "gpt-4o", messages: [], ...(stream ? { stream: true } : {}) })
+      .catch((e: unknown) => e);
+    expect(direct).not.toHaveBeenCalled();
+    expect(shouldFallBackToProvider(err)).toBe(false);
+    expect((err as { mayHaveReachedProvider?: boolean }).mayHaveReachedProvider).toBe(true);
+    // Sent to the proxy once: not retried either.
+    expect(calls.filter((u) => u.includes("/chat/completions"))).toHaveLength(1);
   });
 });
 
