@@ -37,6 +37,7 @@ from typing import Any, Optional
 import httpx
 
 from ._config import MissingConfigError
+from ._observation_limits import bound_observation
 from ._errors import (
     TensorCostKeyRejectedError,
     TensorCostNetworkError,
@@ -136,6 +137,9 @@ class ObservationTransport:
         # so once already; failing every POST would only repeat it per call.
         if not self._tenant_id and self._fail_open:
             return
+        # A long provider error must not cost the call its row
+        # (_observation_limits.py).
+        observation = bound_observation(observation)
         parked: list[dict] = []
         with self._pending_lock:
             self._reap_locked()
