@@ -3,9 +3,62 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 1.8.0 — unreleased
 
-Fixes from a field test of 1.7.0 (openai 3.57.0) against a self-hosted install.
+**A call that may already have reached the provider is never sent again.**
+Through 1.7.0 the SDK retried every 5xx, timeout and network error from the
+proxy up to five times and then called the provider directly, ignoring
+`x-should-retry`. A call the provider had answered and billed, which then
+failed or timed out at the proxy or lost its response on the way back, could
+run six times and be billed six times. Now the SDK retries, or falls back to
+the provider, only when the attempt provably never got there: TensorCost
+couldn't be reached at all (connection refused, DNS, a TLS handshake
+failure), the circuit is open, or TensorCost answered before forwarding (its
+own 429 or 402, the proxy's or the gateway's own 503, the gateway's 502 for
+its own connect failure to the proxy). The proxy and gateway say which with
+`x-tc-error-origin`. Everything else reaches your code as the error, with the
+new `may_have_reached_provider` set to true: a timeout once the request was
+sent, a reset connection, a 5xx with no origin header, a 500 or 502 from the
+proxy, a gateway 502 or 504 for a proxy that failed mid-call, and anything
+with `x-should-retry: false`. A status marked `x-tc-error-origin: provider`
+(the provider's 5xx or 429, or the proxy's 504 for a provider that didn't
+answer in time) is the provider's answer and is raised as the provider SDK's
+own error type, like a relayed 4xx, and no longer counts against the
+circuit. Retries that remain keep the same bound and backoff.
+
+What changes for you: when the proxy hangs (it accepts the connection and
+never answers), the calls that hit it now fail with `TensorCostTimeoutError`
+instead of going direct after the timeout. Each still counts against the
+circuit, so after three the circuit opens and calls go straight to the
+provider before anything is sent; one call in five seconds probes the proxy,
+and that call surfaces its error if the proxy is still hung. The five-second
+wait between probes is new in this SDK (`CircuitBreakerConfig.probe_interval_s`,
+default 5.0): an open circuit used to let the very next call probe, which
+under the new rule would have failed every call while the proxy hangs. The same holds
+for a 5xx from something in front of TensorCost that doesn't say where it
+came from (a load balancer's own 503 page, say).
+
+**Observations carry the provider's response id.** OpenAI's `response.id`
+(plain, `with_raw_response` and streamed calls), Anthropic's
+`message.id`, Bedrock's AWS request id and Vertex's `response_id` go on the
+observation as `provider_response_id`, so an SDK row can be matched to the
+same call seen by the proxy or a cost import. A value over 200 characters is
+left off rather than losing the observation.
+
+**Observations name the model the provider served.** An Azure deployment
+named for its job ("support-bot") was recorded under that name, which no
+price list has, so the call was stored at $0. The response's model now goes
+on the observation as `response_model`, beside `model`: from `response.model` on a
+plain call and under `with_raw_response`, from `message.model` on Anthropic, and on a stream from the last chunk that names one. An older
+server ignores the field.
+
+**A long provider error no longer loses the call's spend row.** The proxy
+capped `error_message` at 200 characters and answered a longer one with 400,
+which the SDK treats as final, so the observation was dropped. The SDK now
+shortens `error_message` to 199 UTF-16 units plus an ellipsis, and
+`sdk_version` to 120, before posting. Identifiers are sent as you set them.
+
+Also fixes from a field test of 1.7.0 (openai 3.57.0) against a self-hosted install.
 
 **Route mode returns openai's own types.** `create()` returned the proxy's
 JSON as a dict and a streamed call yielded dicts. The proxy's response is now
