@@ -30,6 +30,7 @@ import {
 import { MissingConfigError } from "./config.js";
 import type { Observation } from "./types.js";
 import { SDK_VERSION } from "./version.js";
+import { boundObservation } from "./observation-limits.js";
 const TOKEN_REFRESH_LEEWAY_MS = 60_000;
 /** A token this close to expiry is not handed out; the caller waits for a new one. */
 const TOKEN_EXPIRY_MARGIN_MS = 5_000;
@@ -108,8 +109,10 @@ export class ObservationTransport {
       return;
     }
     this.pending += 1;
+    // A long provider error must not cost the call its row (observation-limits.ts).
+    const bounded = boundObservation(observation);
     queueMicrotask(() => {
-      void this.deliver(observation).finally(() => {
+      void this.deliver(bounded).finally(() => {
         this.pending -= 1;
       });
     });
