@@ -16,13 +16,18 @@
  * maximums. This matches the posture used by the OpenAI Node SDK.
  *
  * Rules:
- *   - Never retry 4xx responses (except 429).
- *   - Always retry 5xx responses and network errors.
+ *   - Retry only an attempt that provably never reached the provider
+ *     (delivery.ts): a connect-phase network error, TensorCost's own 429,
+ *     402 or 503, the gateway's 502 for its own connect failure. A timeout,
+ *     a reset, or a 5xx the proxy may have sent after forwarding is never
+ *     retried: the provider may already have run and billed the call, and a
+ *     proxied call is not idempotent at the provider. Through 1.7.0 every
+ *     5xx and network error was retried, on the belief that the stateless
+ *     proxy made a resend harmless.
+ *   - Never retry a response with `x-should-retry: false`.
+ *   - Never retry other 4xx responses.
  *   - On 429: honour the `Retry-After` response header when present
  *     (overrides the backoff delay).
- *   - Non-idempotent verbs (POST without `stream:false` is still idempotent
- *     at the proxy level — the proxy is stateless) default to idempotent for
- *     all chat/completions calls.
  */
 
 export interface RetryConfig {
@@ -60,7 +65,11 @@ export function computeDelay(
   return capped * (0.5 + Math.random() * 0.5);
 }
 
-/** True for HTTP status codes the SDK should retry on. */
+/**
+ * True for HTTP status codes that may be retryable. A status alone is not
+ * enough since 1.8.0: the proxy client also asks classifyErrorAnswer()
+ * whether the attempt reached the provider.
+ */
 export function isRetryableStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }

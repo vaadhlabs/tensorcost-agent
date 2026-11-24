@@ -156,9 +156,11 @@ await client
 
 ## Reliability
 
-If TensorCost is slow or down, your call still reaches the provider. The SDK only goes around TensorCost when it can't get an answer: a network error, a timeout, a 5xx, or a 429 or 402 with no refusal in it, and only while `failOpenEnabled` is on (the default). Anything TensorCost actually answers reaches your code as an error, and is never retried or sent around it.
+If TensorCost is down, your call still reaches the provider. The SDK goes around TensorCost only when the call provably never reached the provider: TensorCost couldn't be reached at all (connection refused, DNS, a TLS handshake failure), the circuit is open, or TensorCost answered before forwarding (a 429 or 402 with no refusal in it, the proxy's or the gateway's own 503), and only while `failOpenEnabled` is on (the default). Anything TensorCost actually answers as a decision reaches your code as an error, and is never retried or sent around it.
 
-- **Retries.** 5xx, network errors and 429s are retried with jittered backoff, honouring `Retry-After`.
+A failure after the call may have reached the provider is never sent again, through TensorCost or around it: a timeout once the request was sent, a dropped connection, a 5xx the provider sent (marked `x-tc-error-origin: provider`, raised as the provider SDK's own error), any other 5xx TensorCost can't prove it sent before forwarding, and anything with `x-should-retry: false`. Those reach your code as the error, with `mayHaveReachedProvider` set to true, because resending could bill the call twice. Through 1.7.0 the SDK retried those and then called the provider directly, so one call could run up to six times.
+
+- **Retries.** Only calls that provably never reached the provider are retried, with jittered backoff, honouring `Retry-After` on a 429.
 - **Timeouts.** The check before a call is capped at 500 ms. Through the proxy, a buffered call waits up to `timeoutMs` (60 s); a streamed one waits `headersTimeoutMs` (2 s) for the stream to start and ends after `idleTimeoutMs` (30 s) without data. With TensorCost unreachable, only the first calls of a process wait for the published layer (250 ms at most); the token exchange counts against the budget of whatever waits on it, and after it fails calls stop waiting on it for 5 s.
 - **Circuit breaker.** After three proxy failures in a row, calls go straight to the provider. Every 5 s one call probes the proxy, and once probes succeed calls go through it again. Transitions reach `onLifecycleEvent` as `on_circuit_state`; they are not sent to TensorCost.
 
@@ -172,7 +174,7 @@ const client = wrap(new OpenAI(), {
 });
 ```
 
-One honest caveat: if the proxy forwarded a call to the provider and then failed, going around it can bill the call twice. Where calls must never go around TensorCost (a proxy inside your VPC, say), set `failOpenEnabled: false` and proxy failures surface as `TensorCostProxyError`.
+Where calls must never go around TensorCost (a proxy inside your VPC, say), set `failOpenEnabled: false` and proxy failures surface as `TensorCostProxyError`.
 
 ## Errors
 

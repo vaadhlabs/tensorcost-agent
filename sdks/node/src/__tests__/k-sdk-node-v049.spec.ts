@@ -21,6 +21,7 @@ import { prewarm } from "../prewarm.js";
 import { __test__ as runtimeTest } from "../runtime.js";
 import { __test__ as anthropicTest } from "../providers/anthropic.js";
 import { providerTarget } from "../applied.js";
+import { TensorCostTimeoutError } from "../errors.js";
 import {
   TensorCostGatewayRejectedError,
   TensorCostProxyStatusError,
@@ -343,7 +344,12 @@ describe("govern and route: create() still has withResponse() and asResponse()",
   });
 
   it("route fail-open: the direct call's withResponse() works", async () => {
-    const r = route({ proxy: () => new Response("<html>503</html>", { status: 503 }) });
+    // The gateway's own 503 (its breaker is open): provably never forwarded.
+    // An unmarked 503 (a load balancer's HTML page, say) no longer falls
+    // back: something in front of TensorCost may have reset mid-call.
+    const r = route({
+      proxy: () => new Response("{}", { status: 503, headers: { "x-tc-error-origin": "gateway" } }),
+    });
     globalThis.fetch = r.f;
     const fake = fakeApiClient(() => jsonResponse(200, chatOk));
     wrap(fake.client, routeOptions());
@@ -464,7 +470,7 @@ describe("streams are recorded with the usage they carry, when they end", () => 
 
 describe("circuit-breaker transitions are not observations", () => {
   it("an outage that opens the circuit posts only the calls, and tells onLifecycleEvent", async () => {
-    const r = route({ proxy: () => new Response(null, { status: 503 }) });
+    const r = route({ proxy: () => new Response(null, { status: 503, headers: { "x-tc-error-origin": "proxy" } }) });
     globalThis.fetch = r.f;
     const events: Record<string, unknown>[] = [];
     const fake = fakeApiClient(() => jsonResponse(200, chatOk));
@@ -557,11 +563,16 @@ describe("TensorCost blackholed: the call path pays a bounded wait, once", () =>
     const fake = fakeApiClient(() => jsonResponse(200, chatOk));
     wrap(fake.client, routeOptions({ headersTimeoutMs: 150, timeoutMs: 150 }));
     await prewarm(routeOptions());
-    // Three timeouts open the circuit.
-    for (let i = 0; i < 3; i += 1) await fake.client.chat.completions.create(ask);
+    // Three timeouts open the circuit. Each surfaces: the proxy took the
+    // request and may have forwarded it, so going direct could bill it twice.
+    for (let i = 0; i < 3; i += 1) {
+      await expect(fake.client.chat.completions.create(ask)).rejects.toBeInstanceOf(TensorCostTimeoutError);
+    }
+    expect(fake.requests).toHaveLength(0);
+    // Once open, calls go direct before anything is sent to the proxy.
     const times: number[] = [];
     for (let i = 0; i < 4; i += 1) times.push(await time(() => fake.client.chat.completions.create(ask)));
     expect(Math.max(...times)).toBeLessThan(60);
-    expect(fake.requests).toHaveLength(7);
+    expect(fake.requests).toHaveLength(4);
   });
 });

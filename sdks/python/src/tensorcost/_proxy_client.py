@@ -12,6 +12,16 @@ Timeout handling:
 * ``headers_timeout_s`` (default 2s): abort if response headers never arrive.
 * ``timeout_s`` (default 60s): wall-clock budget for the full response body.
 
+Retries and fallback (1.8.0, ``_delivery``): only an attempt that provably
+never reached the provider is retried, or may fall back: a connect failure, a
+429 or 402 from TensorCost, a 503 from the gateway or the proxy, a gateway 502
+that says it couldn't connect to the proxy. A timeout once the request was
+sent, a reset, a 5xx the proxy didn't prove was its own pre-forward answer,
+and anything with ``x-should-retry: false`` raise with
+``may_have_reached_provider`` set. Through 1.7.0 every 5xx, timeout and
+network error was retried five times and then fell back, so one call the
+provider had already billed could run six times.
+
 How a non-2xx response is classified (unchanged split from 1.4.0, plus the
 refusal check in front of it):
 
@@ -22,6 +32,8 @@ refusal check in front of it):
 * 402 otherwise → ``TensorCostQuotaError``, status 402 (the plan's monthly
   proxy-request ceiling). Not retried.
 * 5xx → ``TensorCostProxyError`` (proxy or upstream unavailable).
+* 429, 402 or 5xx marked ``x-tc-error-origin: provider`` →
+  ``TensorCostProviderError``: the provider's answer, never resent.
 * any other 4xx with a JSON body → ``TensorCostProviderError``: the
   provider's own error, relayed verbatim by the proxy. The wrappers re-raise
   it as the provider SDK's own error type when they can.
@@ -39,6 +51,7 @@ from typing import Any, Optional
 import httpx
 
 from ._circuit import CircuitBreaker
+from ._delivery import classify_error_answer, send_error_sent_nothing
 from ._errors import (
     TensorCostError,
     TensorCostGatewayRejectedError,
@@ -74,6 +87,12 @@ from ._telemetry import (
     emit_event,
 )
 from ._version import SDK_VERSION, sdk_capability_header
+
+
+def _mark(err: TensorCostError, may_have_reached_provider: bool) -> TensorCostError:
+    """Set whether ``err``'s call may already have reached the provider."""
+    err.may_have_reached_provider = may_have_reached_provider
+    return err
 
 def _post_with_headers_timeout(
     client: httpx.Client,
@@ -112,10 +131,14 @@ def _post_with_headers_timeout(
             chunks: list[bytes] = []
             for chunk in resp.iter_bytes():
                 if time.monotonic() > body_deadline:
-                    raise TensorCostTimeoutError(
-                        "tensorcost: proxy response body timed out",
-                        "total",
-                        attempt=attempt,
+                    # The proxy has answered: never a reason to resend.
+                    raise _mark(
+                        TensorCostTimeoutError(
+                            "tensorcost: proxy response body timed out",
+                            "total",
+                            attempt=attempt,
+                        ),
+                        True,
                     )
                 chunks.append(chunk)
             content = b"".join(chunks)
@@ -137,11 +160,17 @@ def _post_with_headers_timeout(
             message = f"tensorcost: proxy did not respond with headers within {short_headers_timeout_s:.0f}s"
         else:
             message = f"tensorcost: proxy request timed out after {body_timeout_s:.0f}s"
-        raise TensorCostTimeoutError(
-            message,
-            kind,
-            root_cause=exc,
-            attempt=attempt,
+        # Only a connect or pool timeout comes before the request is written.
+        # A read or write timeout may follow a forward the provider is
+        # running right now, so it must never be sent again.
+        raise _mark(
+            TensorCostTimeoutError(
+                message,
+                kind,
+                root_cause=exc,
+                attempt=attempt,
+            ),
+            not send_error_sent_nothing(exc),
         ) from exc
 
 
@@ -259,7 +288,11 @@ def proxy_request(
                 client.close()
             if circuit is not None:
                 circuit.record_failure()
-            if exc.timeout_kind == "headers":
+            # A timeout after the request was written is never retried and
+            # never falls back (the provider may be running it); the circuit
+            # counts it, so the calls after it go direct once a wedged proxy
+            # opens the circuit. Only a connect timeout may be retried.
+            if exc.may_have_reached_provider or exc.timeout_kind == "headers":
                 emit_event(
                     on_lifecycle_event,
                     OnErrorEvent(
@@ -310,16 +343,20 @@ def proxy_request(
         except httpx.TimeoutException as exc:
             if close_client:
                 client.close()
-            tc_err = TensorCostTimeoutError(
-                f"tensorcost: proxy request timed out after {timeout_s:.0f}s",
-                "total",
-                root_cause=exc,
-                attempt=attempt + 1,
+            sent_nothing = send_error_sent_nothing(exc)
+            tc_err = _mark(
+                TensorCostTimeoutError(
+                    f"tensorcost: proxy request timed out after {timeout_s:.0f}s",
+                    "total",
+                    root_cause=exc,
+                    attempt=attempt + 1,
+                ),
+                not sent_nothing,
             )
             last_error = tc_err
             if circuit is not None:
                 circuit.record_failure()
-            if not fail_open_fast and attempt + 1 < retry.max_attempts:
+            if sent_nothing and not fail_open_fast and attempt + 1 < retry.max_attempts:
                 delay = compute_delay(attempt, retry)
                 emit_event(
                     on_lifecycle_event,
@@ -354,15 +391,23 @@ def proxy_request(
         except (httpx.NetworkError, httpx.RemoteProtocolError, OSError) as exc:
             if close_client:
                 client.close()
-            tc_err = TensorCostNetworkError(
-                f"tensorcost: network error reaching proxy: {exc}",
-                root_cause=exc,
-                attempt=attempt + 1,
+            # Only a connect failure (refused, DNS, TLS handshake) proves
+            # nothing was written: TensorCost unreachable, where fail-open is
+            # the product's promise. A reset or a protocol error may come
+            # after the proxy forwarded the call, so it raises instead.
+            sent_nothing = send_error_sent_nothing(exc)
+            tc_err = _mark(
+                TensorCostNetworkError(
+                    f"tensorcost: network error reaching proxy: {exc}",
+                    root_cause=exc,
+                    attempt=attempt + 1,
+                ),
+                not sent_nothing,
             )
             last_error = tc_err
             if circuit is not None:
                 circuit.record_failure()
-            if not fail_open_fast and attempt + 1 < retry.max_attempts:
+            if sent_nothing and not fail_open_fast and attempt + 1 < retry.max_attempts:
                 delay = compute_delay(attempt, retry)
                 emit_event(
                     on_lifecycle_event,
@@ -397,32 +442,18 @@ def proxy_request(
         except Exception as exc:  # noqa: BLE001
             if close_client:
                 client.close()
-            tc_err = TensorCostNetworkError(
-                f"tensorcost: unexpected error during proxy request: {exc}",
-                root_cause=exc,
-                attempt=attempt + 1,
+            # An error the SDK can't place: it may have come after the send.
+            tc_err = _mark(
+                TensorCostNetworkError(
+                    f"tensorcost: unexpected error during proxy request: {exc}",
+                    root_cause=exc,
+                    attempt=attempt + 1,
+                ),
+                True,
             )
             last_error = tc_err
             if circuit is not None:
                 circuit.record_failure()
-            if not fail_open_fast and attempt + 1 < retry.max_attempts:
-                delay = compute_delay(attempt, retry)
-                emit_event(
-                    on_lifecycle_event,
-                    OnRetryEvent(
-                        kind="on_retry",
-                        provider=provider,
-                        model=model,
-                        operation=operation,
-                        attempt_number=attempt + 1,
-                        elapsed_ms=(time.monotonic() - call_start) * 1000.0,
-                        reason="network_error",
-                        status=None,
-                        delay_ms=delay,
-                    ),
-                )
-                sleep_sync(delay)
-                continue
             emit_event(
                 on_lifecycle_event,
                 OnErrorEvent(
@@ -466,12 +497,11 @@ def proxy_request(
                 response_sink.append(resp)
             return json.loads(resp.content), resp.headers.get("x-tc-decision")
 
-        error_body: Any = None
+        error_body: Any = parse_body(resp.content) if resp.status_code >= 400 else None
         if 400 <= resp.status_code < 500:
             # A TensorCost refusal is terminal whatever its status (a 429
             # refusal included): checked before the quota arm, never
             # retried, never counted against the circuit.
-            error_body = parse_body(resp.content)
             refusal = parse_refusal_body(error_body)
             if refusal is not None or decision_says_refuse(resp.headers.get("x-tc-decision")):
                 tc_refusal = refusal_error(
@@ -496,18 +526,47 @@ def proxy_request(
                 )
                 raise tc_refusal
 
+        # Where did the call get to? (_delivery) Only "unsent" may be retried
+        # or fall back; "provider" is the provider's own answer.
+        answer = (
+            classify_error_answer(resp.status_code, resp.headers, error_body)
+            if resp.status_code in (402, 429) or resp.status_code >= 500
+            else None
+        )
+        unsent = answer == "unsent"
+        if answer == "provider":
+            # The proxy is healthy and relayed the provider: not a circuit failure.
+            tc_err = _provider_answer_error(resp, error_body, request_id, attempt + 1)
+            emit_event(
+                on_lifecycle_event,
+                OnErrorEvent(
+                    kind="on_error",
+                    provider=provider,
+                    model=model,
+                    operation=operation,
+                    attempt_number=attempt + 1,
+                    elapsed_ms=(time.monotonic() - call_start) * 1000.0,
+                    error_class=tc_err.__class__.__name__,
+                    status=resp.status_code,
+                ),
+            )
+            raise tc_err
+
         if resp.status_code == 402:
             # No refusal body: the plan's monthly proxy-request ceiling (Scale
             # COGS gate). TensorCost declining to carry the call is not a
             # refusal of the call, and the server means for it to go direct,
             # so it counts as an outage. Not retried: it won't clear soon.
             ra_ms = parse_retry_after_ms(resp.headers.get("retry-after"))
-            tc_err = TensorCostQuotaError(
-                "tensorcost: proxy returned 402 (plan request ceiling reached)",
-                retry_after_ms=int(ra_ms) if ra_ms is not None else None,
-                status=402,
-                request_id=request_id,
-                attempt=attempt + 1,
+            tc_err = _mark(
+                TensorCostQuotaError(
+                    "tensorcost: proxy returned 402 (plan request ceiling reached)",
+                    retry_after_ms=int(ra_ms) if ra_ms is not None else None,
+                    status=402,
+                    request_id=request_id,
+                    attempt=attempt + 1,
+                ),
+                not unsent,
             )
             emit_event(
                 on_lifecycle_event,
@@ -528,15 +587,18 @@ def proxy_request(
             ra_header = resp.headers.get("retry-after")
             ra_ms = parse_retry_after_ms(ra_header)
             ra_ms_int = int(ra_ms) if ra_ms is not None else None
-            tc_err = TensorCostQuotaError(
-                "tensorcost: proxy returned 429 Too Many Requests",
-                retry_after_ms=ra_ms_int,
-                status=429,
-                request_id=request_id,
-                attempt=attempt + 1,
+            tc_err = _mark(
+                TensorCostQuotaError(
+                    "tensorcost: proxy returned 429 Too Many Requests",
+                    retry_after_ms=ra_ms_int,
+                    status=429,
+                    request_id=request_id,
+                    attempt=attempt + 1,
+                ),
+                not unsent,
             )
             last_error = tc_err
-            if attempt + 1 < retry.max_attempts:
+            if unsent and attempt + 1 < retry.max_attempts:
                 delay = compute_delay(attempt, retry, ra_ms)
                 emit_event(
                     on_lifecycle_event,
@@ -570,16 +632,27 @@ def proxy_request(
             raise tc_err
 
         if resp.status_code >= 500:
-            tc_err = TensorCostProxyError(
-                f"tensorcost: proxy returned {resp.status_code}",
-                status=resp.status_code,
-                request_id=request_id,
-                attempt=attempt + 1,
+            # TensorCost's own failure (the provider's was handled above).
+            # Retried, and allowed to fall back, only when TensorCost proves
+            # it answered before forwarding. Any other 5xx (a 500 or 502 the
+            # proxy sent after the forward, a gateway 502/504 for a proxy that
+            # reset or timed out mid-call, a 5xx with no origin header) may
+            # follow a call the provider already ran and billed, so it is
+            # raised to the caller instead, as the provider's SDK would raise
+            # a 5xx it was told not to retry.
+            tc_err = _mark(
+                TensorCostProxyError(
+                    f"tensorcost: proxy returned {resp.status_code}",
+                    status=resp.status_code,
+                    request_id=request_id,
+                    attempt=attempt + 1,
+                ),
+                not unsent,
             )
             last_error = tc_err
             if circuit is not None:
                 circuit.record_failure()
-            if attempt + 1 < retry.max_attempts:
+            if unsent and attempt + 1 < retry.max_attempts:
                 delay = compute_delay(attempt, retry)
                 emit_event(
                     on_lifecycle_event,
@@ -666,8 +739,18 @@ def _non_refusal_4xx(
             request_id=request_id,
             attempt=attempt,
         )
+    return _provider_answer_error(resp, error_body, request_id, attempt)
+
+
+def _provider_answer_error(
+    resp: httpx.Response, error_body: Any, request_id: Optional[str], attempt: int
+) -> TensorCostProviderError:
+    """The provider's own answer, relayed by the proxy: a 4xx with a JSON body,
+    or any status marked ``x-tc-error-origin: provider``. The call reached the
+    provider, so it is never resent; the wrappers re-raise it as the provider
+    SDK's own error type when they can."""
     provider_msg = provider_message_from(error_body)
-    return TensorCostProviderError(
+    err = TensorCostProviderError(
         f"tensorcost: upstream provider returned {resp.status_code}"
         + (f": {provider_msg}" if provider_msg else ""),
         body=error_body,
@@ -676,6 +759,8 @@ def _non_refusal_4xx(
         request_id=request_id,
         attempt=attempt,
     )
+    err.may_have_reached_provider = True
+    return err
 
 
 def _terminal_proxy_refusal_error(
@@ -780,26 +865,35 @@ def proxy_request_stream(
     # allow-list since 1.5.0) recognises them as outages.
     try:
         resp = stream_ctx.__enter__()
+    # Not retried at all; whether it may fall back depends on whether the
+    # request can have been written (_delivery): a connect failure or connect
+    # timeout can, a reset or a wait for headers after the send cannot.
     except httpx.TimeoutException as exc:
         if close_client:
             client.close()
         if circuit is not None:
             circuit.record_failure()
-        raise TensorCostTimeoutError(
-            f"tensorcost: proxy did not respond with headers within {headers_timeout_s:.0f}s",
-            "headers",
-            root_cause=exc,
-            attempt=1,
+        raise _mark(
+            TensorCostTimeoutError(
+                f"tensorcost: proxy did not respond with headers within {headers_timeout_s:.0f}s",
+                "headers",
+                root_cause=exc,
+                attempt=1,
+            ),
+            not send_error_sent_nothing(exc),
         ) from exc
     except (httpx.TransportError, OSError) as exc:
         if close_client:
             client.close()
         if circuit is not None:
             circuit.record_failure()
-        raise TensorCostNetworkError(
-            f"tensorcost: network error reaching proxy: {exc}",
-            root_cause=exc,
-            attempt=1,
+        raise _mark(
+            TensorCostNetworkError(
+                f"tensorcost: network error reaching proxy: {exc}",
+                root_cause=exc,
+                attempt=1,
+            ),
+            not send_error_sent_nothing(exc),
         ) from exc
     request_id = resp.headers.get("x-tc-request-id")
     try:
@@ -831,25 +925,39 @@ def proxy_request_stream(
                         ),
                     )
                     raise tc_refusal
+            answer = (
+                classify_error_answer(resp.status_code, resp.headers, error_body)
+                if resp.status_code in (402, 429) or resp.status_code >= 500
+                else None
+            )
+            if answer == "provider":
+                raise _provider_answer_error(resp, error_body, request_id, 1)
             if resp.status_code in (402, 429):
                 ra_ms = parse_retry_after_ms(resp.headers.get("retry-after"))
-                raise TensorCostQuotaError(
-                    "tensorcost: proxy returned 429 Too Many Requests"
-                    if resp.status_code == 429
-                    else "tensorcost: proxy returned 402 (plan request ceiling reached)",
-                    retry_after_ms=int(ra_ms) if ra_ms is not None else None,
-                    status=resp.status_code,
-                    request_id=request_id,
-                    attempt=1,
+                raise _mark(
+                    TensorCostQuotaError(
+                        "tensorcost: proxy returned 429 Too Many Requests"
+                        if resp.status_code == 429
+                        else "tensorcost: proxy returned 402 (plan request ceiling reached)",
+                        retry_after_ms=int(ra_ms) if ra_ms is not None else None,
+                        status=resp.status_code,
+                        request_id=request_id,
+                        attempt=1,
+                    ),
+                    answer != "unsent",
                 )
             if resp.status_code >= 500:
+                # See proxy_request: a 5xx not proven pre-forward is raised, never resent.
                 if circuit is not None:
                     circuit.record_failure()
-                raise TensorCostProxyError(
-                    f"tensorcost: proxy returned {resp.status_code}",
-                    status=resp.status_code,
-                    request_id=request_id,
-                    attempt=1,
+                raise _mark(
+                    TensorCostProxyError(
+                        f"tensorcost: proxy returned {resp.status_code}",
+                        status=resp.status_code,
+                        request_id=request_id,
+                        attempt=1,
+                    ),
+                    answer != "unsent",
                 )
             raise _non_refusal_4xx(resp, error_body, request_id, 1)
         if circuit is not None:
@@ -955,8 +1063,13 @@ def should_fall_back_to_provider(err: BaseException) -> bool:
     heard of is terminal, a relayed provider 4xx surfaces as itself, and an
     error the SDK didn't classify at all is surfaced rather than retried
     against the provider.
+
+    Since 1.8.0 an outage falls back only when the call provably never
+    reached the provider (``may_have_reached_provider`` false, ``_delivery``).
+    A timeout, a reset, or a 5xx the proxy may have sent after forwarding is
+    raised instead: calling the provider again would bill the call twice.
     """
-    return isinstance(
+    outage = isinstance(
         err,
         (
             TensorCostNetworkError,
@@ -965,3 +1078,4 @@ def should_fall_back_to_provider(err: BaseException) -> bool:
             TensorCostQuotaError,
         ),
     )
+    return outage and not getattr(err, "may_have_reached_provider", False)

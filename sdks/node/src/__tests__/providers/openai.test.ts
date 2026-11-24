@@ -298,9 +298,9 @@ describe("openai provider — applied mode via wrapMethod", () => {
     openaiProvider.install(client, transport, null, null, null, hardening);
     (transport as any).getToken = async () => "test-jwt";
 
-    // Proxy returns 503.
+    // Proxy returns its own 503, before forwarding.
     const proxyFetch: typeof fetch = async () =>
-      new Response("{}", { status: 503 });
+      new Response("{}", { status: 503, headers: { "x-tc-error-origin": "proxy" } });
     const savedFetch = globalThis.fetch;
     (globalThis as any).fetch = proxyFetch;
     try {

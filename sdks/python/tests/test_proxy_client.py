@@ -17,7 +17,7 @@ from tensorcost._errors import (
     TensorCostQuotaError,
     TensorCostTimeoutError,
 )
-from tensorcost._proxy_client import proxy_request
+from tensorcost._proxy_client import proxy_request, proxy_request_stream, should_fall_back_to_provider
 from tensorcost._retry import RetryConfig
 from tensorcost._telemetry import (
     AfterResponseEvent,
@@ -52,10 +52,10 @@ def _make_client(responses: list) -> httpx.Client:
     return httpx.Client(transport=transport)
 
 
-def _json_resp(body: dict, status: int = 200) -> httpx.Response:
+def _json_resp(body: dict, status: int = 200, headers: Optional[dict] = None) -> httpx.Response:
     return httpx.Response(
         status_code=status,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
         content=json.dumps(body).encode(),
     )
 
@@ -180,7 +180,7 @@ class TestProxyError:
 
     def test_5xx_retried_until_success(self):
         client = _make_client([
-            _json_resp({}, status=503),
+            _json_resp({}, status=503, headers={"x-tc-error-origin": "proxy"}),
             _json_resp({"id": "ok"}, status=200),
         ])
         body_out, _ = proxy_request(**_base_kwargs(
@@ -199,8 +199,8 @@ class TestProxyError:
     def test_5xx_emits_on_retry_then_on_error(self):
         events = []
         client = _make_client([
-            _json_resp({}, status=500),
-            _json_resp({}, status=500),
+            _json_resp({}, status=503, headers={"x-tc-error-origin": "gateway"}),
+            _json_resp({}, status=503, headers={"x-tc-error-origin": "gateway"}),
         ])
         with pytest.raises(TensorCostProxyError):
             proxy_request(**_base_kwargs(
@@ -404,7 +404,7 @@ class TestTimeoutErrors:
 
 class TestCircuitBreakerOpen:
     def test_half_open_probe_still_reaches_http(self):
-        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1))
+        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1, probe_interval_s=0.0))
         cb.record_failure()
         assert cb.should_probe()
         assert cb.state == "HALF_OPEN"
@@ -416,7 +416,7 @@ class TestCircuitBreakerOpen:
         assert body["id"] == "ok"
 
     def test_attempt_count_in_network_error(self):
-        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1))
+        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1, probe_interval_s=0.0))
         cb.record_failure()
         cb.should_probe()
         client = _make_client([httpx.ConnectError("refused")])
@@ -430,3 +430,177 @@ class TestCircuitBreakerOpen:
                 ),
             )
         assert exc_info.value.attempt == 1
+
+
+# ---------------------------------------------------------------------------
+# Never resend a call that may have reached the provider (1.8.0).
+#
+# Through 1.7.0 every 5xx, timeout and network error was retried, then fell
+# back to the provider, so one call the provider had already billed could
+# run six times. Retry and fallback now need proof the attempt never left.
+# ---------------------------------------------------------------------------
+
+_FAST = RetryConfig(max_attempts=3, base_delay_ms=0.0, max_delay_ms=0.0)
+
+
+def _counting(respond):
+    calls = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls[0] += 1
+        return respond(request)
+
+    return httpx.Client(transport=httpx.MockTransport(handler)), calls
+
+
+def _send(fn, client, **kw):
+    kwargs = _base_kwargs(http_client=client, **kw)
+    if fn is proxy_request_stream:
+        kwargs["body"] = {**kwargs["body"], "stream": True}
+    try:
+        fn(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        return exc
+    raise AssertionError("expected the call to fail")
+
+
+def _resp(status: int, body=None, headers=None):
+    return lambda _r: httpx.Response(status, json=body if body is not None else {}, headers=headers or {})
+
+
+SENDERS = [pytest.param(proxy_request, id="buffered"), pytest.param(proxy_request_stream, id="stream")]
+
+
+@pytest.mark.parametrize("fn", SENDERS)
+class TestWhereTheCallGotTo:
+    def test_proxy_origin_503_retried_then_falls_back(self, fn):
+        client, calls = _counting(_resp(503, {"statusCode": 503}, {"x-tc-error-origin": "proxy"}))
+        err = _send(fn, client, retry=_FAST)
+        assert isinstance(err, TensorCostProxyError)
+        # The streaming path does not retry at all (unchanged); it may fall back.
+        assert calls[0] == (3 if fn is proxy_request else 1)
+        assert err.may_have_reached_provider is False
+        assert should_fall_back_to_provider(err) is True
+
+    def test_gateway_503_circuit_open_retried_then_falls_back(self, fn):
+        client, calls = _counting(_resp(503, {"error": {"code": "UPSTREAM_UNAVAILABLE"}}, {"x-tc-error-origin": "gateway"}))
+        err = _send(fn, client, retry=_FAST)
+        assert calls[0] == (3 if fn is proxy_request else 1)
+        assert should_fall_back_to_provider(err) is True
+
+    def test_gateway_502_connect_failure_falls_back(self, fn):
+        client, calls = _counting(
+            _resp(
+                502,
+                {"error": {"code": "UPSTREAM_PROXY_ERROR", "message": "connect ECONNREFUSED 10.0.3.7:4115"}},
+                {"x-tc-error-origin": "gateway"},
+            )
+        )
+        err = _send(fn, client, retry=_FAST)
+        assert should_fall_back_to_provider(err) is True
+
+    def test_provider_origin_502_not_retried_and_raised_as_provider_error(self, fn):
+        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1))
+        client, calls = _counting(
+            _resp(502, {"error": {"message": "Bad gateway", "type": "server_error"}}, {"x-tc-error-origin": "provider"})
+        )
+        err = _send(fn, client, retry=_FAST, circuit=cb)
+        assert calls[0] == 1
+        assert isinstance(err, TensorCostProviderError)
+        assert err.status == 502
+        assert err.body == {"error": {"message": "Bad gateway", "type": "server_error"}}
+        assert err.may_have_reached_provider is True
+        assert should_fall_back_to_provider(err) is False
+        assert cb.failures == 0
+
+    def test_provider_origin_429_raised_as_provider_error(self, fn):
+        client, calls = _counting(_resp(429, {"error": {"message": "Rate limit"}}, {"x-tc-error-origin": "provider"}))
+        err = _send(fn, client, retry=_FAST)
+        assert calls[0] == 1
+        assert isinstance(err, TensorCostProviderError)
+        assert should_fall_back_to_provider(err) is False
+
+    def test_x_should_retry_false_not_retried_no_fallback(self, fn):
+        client, calls = _counting(_resp(503, {}, {"x-tc-error-origin": "proxy", "x-should-retry": "false"}))
+        err = _send(fn, client, retry=_FAST)
+        assert calls[0] == 1
+        assert err.may_have_reached_provider is True
+        assert should_fall_back_to_provider(err) is False
+
+    def test_x_should_retry_false_on_429(self, fn):
+        client, calls = _counting(_resp(429, {}, {"x-tc-error-origin": "proxy", "x-should-retry": "false"}))
+        err = _send(fn, client, retry=_FAST)
+        assert calls[0] == 1
+        assert isinstance(err, TensorCostQuotaError)
+        assert should_fall_back_to_provider(err) is False
+
+    def test_x_should_retry_true_503_retried(self, fn):
+        client, calls = _counting(_resp(503, {}, {"x-should-retry": "true"}))
+        err = _send(fn, client, retry=_FAST)
+        assert calls[0] == (3 if fn is proxy_request else 1)
+        assert should_fall_back_to_provider(err) is True
+
+    def test_proxy_origin_500_not_retried_no_fallback(self, fn):
+        client, calls = _counting(_resp(500, {}, {"x-tc-error-origin": "proxy"}))
+        err = _send(fn, client, retry=_FAST)
+        assert calls[0] == 1
+        assert should_fall_back_to_provider(err) is False
+
+    def test_5xx_without_origin_not_retried_no_fallback(self, fn):
+        client, calls = _counting(_resp(503))
+        err = _send(fn, client, retry=_FAST)
+        assert calls[0] == 1
+        assert isinstance(err, TensorCostProxyError)
+        assert should_fall_back_to_provider(err) is False
+
+    def test_timeout_after_send_not_retried_no_fallback(self, fn):
+        cb = CircuitBreaker(CircuitBreakerConfig(open_threshold=1))
+
+        def read_timeout(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("timed out", request=request)
+
+        client, calls = _counting(read_timeout)
+        err = _send(fn, client, retry=_FAST, circuit=cb)
+        assert calls[0] == 1
+        assert isinstance(err, TensorCostTimeoutError)
+        assert err.may_have_reached_provider is True
+        assert should_fall_back_to_provider(err) is False
+        assert cb.failures == 1
+
+    def test_connection_reset_not_retried_no_fallback(self, fn):
+        def reset(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadError("[Errno 54] Connection reset by peer", request=request)
+
+        client, calls = _counting(reset)
+        err = _send(fn, client, retry=_FAST)
+        assert calls[0] == 1
+        assert isinstance(err, TensorCostNetworkError)
+        assert should_fall_back_to_provider(err) is False
+
+    def test_connection_refused_retried_then_falls_back(self, fn):
+        def refused(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("[Errno 61] Connection refused", request=request)
+
+        client, calls = _counting(refused)
+        err = _send(fn, client, retry=_FAST)
+        assert calls[0] == (3 if fn is proxy_request else 1)
+        assert err.may_have_reached_provider is False
+        assert should_fall_back_to_provider(err) is True
+
+    def test_connect_timeout_falls_back(self, fn):
+        def connect_timeout(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectTimeout("timed out", request=request)
+
+        client, _calls = _counting(connect_timeout)
+        err = _send(fn, client, retry=_FAST)
+        assert isinstance(err, TensorCostTimeoutError)
+        assert should_fall_back_to_provider(err) is True
+
+    def test_connection_refused_with_fail_open_falls_back_at_once(self, fn):
+        def refused(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("[Errno 61] Connection refused", request=request)
+
+        client, calls = _counting(refused)
+        err = _send(fn, client, retry=_FAST, fail_open_fast=True)
+        assert calls[0] == 1
+        assert should_fall_back_to_provider(err) is True

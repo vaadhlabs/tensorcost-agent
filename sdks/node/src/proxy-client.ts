@@ -21,11 +21,18 @@
  *   - Streaming through steer is refused at the provider wrapper; proxy
  *     server supports SSE but the SDK client does not consume streams yet.
  *
- * Retry logic:
- *   - Retries on 5xx + network errors + 429.
- *   - Respects Retry-After on 429.
- *   - Stops at maxAttempts.
- *   - Does not retry on 4xx (except 429).
+ * Retry logic (1.8.0, delivery.ts):
+ *   - Retries, and lets the wrapper fall back, only when the attempt
+ *     provably never reached the provider: a connect-phase network error,
+ *     a 429 or 402 from TensorCost, a 503 from the gateway or the proxy, a
+ *     gateway 502 that says it couldn't connect to the proxy.
+ *   - Never resends a call that may have reached the provider: a timeout,
+ *     a reset, a 5xx the proxy didn't prove was its own pre-forward answer,
+ *     anything with `x-should-retry: false`. Those surface with
+ *     `mayHaveReachedProvider: true`. Through 1.7.0 every 5xx, timeout and
+ *     network error was retried five times and then fell back, so one call
+ *     the provider had already billed could run six times.
+ *   - Respects Retry-After on 429. Stops at maxAttempts, with backoff.
  *   - Never retries a TensorCost refusal, whatever its status.
  *
  * How a non-2xx response is classified (unchanged split from 1.4.0, plus
@@ -37,6 +44,8 @@
  *   - 402 otherwise → TensorCostQuotaError, status 402 (the plan's monthly
  *     proxy-request ceiling). Not retried.
  *   - 5xx → TensorCostProxyError (proxy or upstream unavailable).
+ *   - 429, 402 or 5xx marked `x-tc-error-origin: provider` →
+ *     TensorCostProviderError: the provider's answer, never resent.
  *   - any other 4xx with a JSON body → TensorCostProviderError: the
  *     provider's own error, relayed verbatim by the proxy. The wrappers
  *     rethrow it as the provider SDK's own error type when they can.
@@ -79,6 +88,8 @@ import {
   sleep,
 } from "./retry.js";
 import type { RetryConfig } from "./retry.js";
+import { classifyErrorAnswer, fetchErrorSentNothing } from "./delivery.js";
+import type { ErrorAnswer } from "./delivery.js";
 import type { CircuitBreaker } from "./circuit.js";
 import { emitEvent } from "./telemetry.js";
 import type { LifecycleEventCallback } from "./telemetry.js";
@@ -130,9 +141,9 @@ export interface ProxyRequestOptions {
   circuit: CircuitBreaker;
   maxLayer?: ControlLayer;
   /**
-   * When true (steer fail-open), do not retry proxy *network* errors —
-   * fail immediately so the wrapper can go direct. 429/5xx still retry.
-   * Timeouts still retry: a timeout usually means the upstream model is slow.
+   * When true (steer fail-open), do not retry a connect failure to the
+   * proxy: fail at once so the wrapper can go direct. TensorCost's own
+   * 429/503 still retry. Timeouts are never retried (delivery.ts).
    */
   failOpenFast?: boolean;
 
@@ -157,9 +168,11 @@ async function readJsonWithDeadline(
     throw new TensorCostTimeoutError(
       "tensorcost: proxy response body timed out",
       "total",
-      { attempt },
+      { attempt, mayHaveReachedProvider: true },
     );
   }
+  // The proxy answered 2xx: the provider has run the call. A body that
+  // doesn't arrive in time is never a reason to send it again.
   const jsonPromise = resp.json() as Promise<unknown>;
   void jsonPromise.catch(() => undefined);
   return Promise.race([
@@ -169,7 +182,7 @@ async function readJsonWithDeadline(
       throw new TensorCostTimeoutError(
         "tensorcost: proxy response body timed out",
         "total",
-        { attempt },
+        { attempt, mayHaveReachedProvider: true },
       );
     }),
   ]);
@@ -189,9 +202,9 @@ export async function proxyRequest(
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const headersTimeoutMs = opts.headersTimeoutMs ?? PROXY_HEADERS_TIMEOUT_MS;
   // Buffered JSON responses: the proxy may not send headers until upstream
-  // completes. Use the full body budget for TTFB so we do not fail-open
-  // (and double-bill) while the proxy is still working. Streaming uses the
-  // short headers budget once SSE client support lands.
+  // completes. Use the full body budget for TTFB so a slow model isn't cut
+  // off while the proxy is still working; since 1.8.0 a timeout never fails
+  // open either way (delivery.ts). Streaming uses the short headers budget.
   const isBufferedJson = opts.body.stream !== true;
   const effectiveHeadersTimeoutMs = isBufferedJson
     ? timeoutMs
@@ -274,14 +287,18 @@ export async function proxyRequest(
     } catch (err) {
       clearTimeout(headersTimer);
 
-      // Headers never arrived — proxy wedged; fail-open without retry.
+      // A timeout once fetch began. The body may already have been written
+      // and forwarded, and the provider may be running the call right now,
+      // so this is never retried and never falls back: a slow model would
+      // otherwise be billed once per attempt and once more direct. The
+      // circuit still counts it, so a wedged proxy opens the circuit and
+      // the calls after this one go direct before anything is sent.
       if (
-        headersTimedOut &&
         err instanceof Error &&
         (err.name === "AbortError" || err.name === "TimeoutError")
       ) {
         const headersKind: "headers" | "total" =
-          effectiveHeadersTimeoutMs === headersTimeoutMs
+          headersTimedOut && effectiveHeadersTimeoutMs === headersTimeoutMs
             ? "headers"
             : "total";
         const tcErr = new TensorCostTimeoutError(
@@ -289,7 +306,7 @@ export async function proxyRequest(
             ? `tensorcost: proxy did not respond with headers within ${headersTimeoutMs}ms`
             : `tensorcost: proxy request timed out after ${timeoutMs}ms`,
           headersKind,
-          { cause: err, attempt: attempt + 1 },
+          { cause: err, attempt: attempt + 1, mayHaveReachedProvider: true },
         );
         lastError = tcErr;
         opts.circuit.recordFailure();
@@ -306,59 +323,20 @@ export async function proxyRequest(
         throw tcErr;
       }
 
-      // AbortController fired → timeout.
-      if (
-        err instanceof Error &&
-        (err.name === "AbortError" || err.name === "TimeoutError")
-      ) {
-        const tcErr = new TensorCostTimeoutError(
-          `tensorcost: proxy request timed out after ${timeoutMs}ms`,
-          "total",
-          { cause: err, attempt: attempt + 1 },
-        );
-        lastError = tcErr;
-        opts.circuit.recordFailure();
-
-        // Total timeouts may be slow model — retriable unless fail-open-fast.
-        if (!opts.failOpenFast && attempt + 1 < retryConfig.maxAttempts) {
-          const delay = computeDelay(attempt, retryConfig);
-          emitEvent(opts.onLifecycleEvent, {
-            kind: "on_retry",
-            provider: opts.provider,
-            model: opts.model,
-            operation: opts.operation,
-            attemptNumber: attempt + 1,
-            elapsedMs: Date.now() - callStart,
-            reason: "network_error",
-            status: null,
-            delayMs: delay,
-          });
-          await sleep(delay);
-          continue;
-        }
-
-        emitEvent(opts.onLifecycleEvent, {
-          kind: "on_error",
-          provider: opts.provider,
-          model: opts.model,
-          operation: opts.operation,
-          attemptNumber: attempt + 1,
-          elapsedMs: Date.now() - callStart,
-          errorClass: tcErr.constructor.name,
-          status: null,
-        });
-        throw tcErr;
-      }
-
-      // Network error (ECONNREFUSED, DNS failure, etc.)
+      // Network error. Only a connect-phase failure (refused, DNS, TLS
+      // handshake) proves nothing was written; that is TensorCost being
+      // unreachable, and fail-open is the product's promise for it. A reset
+      // or a closed socket may come after the proxy forwarded the call, so
+      // it surfaces instead (delivery.ts fetchErrorSentNothing).
+      const sentNothing = fetchErrorSentNothing(err);
       const tcErr = new TensorCostNetworkError(
         `tensorcost: network error reaching proxy: ${(err as Error).message}`,
-        { cause: err as Error, attempt: attempt + 1 },
+        { cause: err as Error, attempt: attempt + 1, mayHaveReachedProvider: !sentNothing },
       );
       lastError = tcErr;
       opts.circuit.recordFailure();
 
-      if (!opts.failOpenFast && attempt + 1 < retryConfig.maxAttempts) {
+      if (sentNothing && !opts.failOpenFast && attempt + 1 < retryConfig.maxAttempts) {
         const delay = computeDelay(attempt, retryConfig);
         emitEvent(opts.onLifecycleEvent, {
           kind: "on_retry",
@@ -419,8 +397,10 @@ export async function proxyRequest(
     // proxy is healthy and answered. Counting it would eventually trip the
     // breaker and route the customer straight past their own cap.
     let errorBody: unknown = null;
-    if (resp.status >= 400 && resp.status < 500) {
+    if (resp.status >= 400) {
       errorBody = await readErrorBody(resp, bodyDeadline);
+    }
+    if (resp.status >= 400 && resp.status < 500) {
       const refusal = parseRefusalBody(errorBody);
       if (refusal !== null || decisionSaysRefuse(resp.headers.get("x-tc-decision"))) {
         const tcErr = refusalError(refusal, {
@@ -443,6 +423,28 @@ export async function proxyRequest(
       }
     }
 
+    // Where did the call get to? (delivery.ts) Only "unsent" may be
+    // retried or fall back; "provider" is the provider's own answer.
+    const answer: ErrorAnswer | null =
+      resp.status === 402 || resp.status === 429 || resp.status >= 500
+        ? classifyErrorAnswer(resp.status, resp.headers, errorBody)
+        : null;
+    if (answer === "provider") {
+      // The proxy is healthy and relayed the provider: not a circuit failure.
+      const tcErr = providerAnswerError(resp, errorBody, requestId, attempt + 1);
+      emitEvent(opts.onLifecycleEvent, {
+        kind: "on_error",
+        provider: opts.provider,
+        model: opts.model,
+        operation: opts.operation,
+        attemptNumber: attempt + 1,
+        elapsedMs: Date.now() - callStart,
+        errorClass: tcErr.constructor.name,
+        status: resp.status,
+      });
+      throw tcErr;
+    }
+
     // 402 without a refusal body — the plan's monthly proxy-request ceiling
     // (Scale COGS gate). TensorCost declining to carry the call is not a
     // refusal of the call, and the server means for it to go direct, so it
@@ -451,7 +453,7 @@ export async function proxyRequest(
       const tcErr = new TensorCostQuotaError(
         "tensorcost: proxy returned 402 (plan request ceiling reached)",
         retryAfterMs(resp) ?? null,
-        { status: 402, requestId, attempt: attempt + 1 },
+        { status: 402, requestId, attempt: attempt + 1, mayHaveReachedProvider: answer !== "unsent" },
       );
       emitEvent(opts.onLifecycleEvent, {
         kind: "on_error",
@@ -472,12 +474,12 @@ export async function proxyRequest(
       const tcErr = new TensorCostQuotaError(
         `tensorcost: proxy returned 429 Too Many Requests`,
         raMs ?? null,
-        { status: 429, requestId, attempt: attempt + 1 },
+        { status: 429, requestId, attempt: attempt + 1, mayHaveReachedProvider: answer !== "unsent" },
       );
       lastError = tcErr;
       // Don't count quota errors against the circuit (the proxy is healthy).
 
-      if (attempt + 1 < retryConfig.maxAttempts) {
+      if (answer === "unsent" && attempt + 1 < retryConfig.maxAttempts) {
         const delay = computeDelay(attempt, retryConfig, raMs);
         emitEvent(opts.onLifecycleEvent, {
           kind: "on_retry",
@@ -507,16 +509,23 @@ export async function proxyRequest(
       throw tcErr;
     }
 
-    // 5xx — proxy infrastructure error.
+    // 5xx — TensorCost's own failure (the provider's was handled above).
+    // Retried, and allowed to fall back, only when TensorCost proves it
+    // answered before forwarding. Any other 5xx (a 500 or 502 the proxy
+    // sent after the forward, a gateway 502/504 for a proxy that reset or
+    // timed out mid-call, a 5xx with no origin header) may follow a call
+    // the provider already ran and billed, so it is surfaced to the caller
+    // instead, as the provider's SDK would surface a 5xx it was told not to
+    // retry.
     if (resp.status >= 500) {
       const tcErr = new TensorCostProxyError(
         `tensorcost: proxy returned ${resp.status}`,
-        { status: resp.status, requestId, attempt: attempt + 1 },
+        { status: resp.status, requestId, attempt: attempt + 1, mayHaveReachedProvider: answer !== "unsent" },
       );
       lastError = tcErr;
       opts.circuit.recordFailure();
 
-      if (attempt + 1 < retryConfig.maxAttempts) {
+      if (answer === "unsent" && attempt + 1 < retryConfig.maxAttempts) {
         const delay = computeDelay(attempt, retryConfig);
         emitEvent(opts.onLifecycleEvent, {
           kind: "on_retry",
@@ -604,6 +613,21 @@ function nonRefusal4xx(
       { status: resp.status, requestId, attempt },
     );
   }
+  return providerAnswerError(resp, errorBody, requestId, attempt);
+}
+
+/**
+ * The provider's own answer, relayed by the proxy: a 4xx with a JSON body,
+ * or any status marked `x-tc-error-origin: provider`. The call reached the
+ * provider, so it is never resent; the wrappers rethrow it as the provider
+ * SDK's own error type when they can.
+ */
+function providerAnswerError(
+  resp: Response,
+  errorBody: unknown,
+  requestId: string | null,
+  attempt: number,
+): TensorCostProviderError {
   const providerMsg = providerMessageFrom(errorBody);
   const headers: Record<string, string> = {};
   resp.headers.forEach((v, k) => {
@@ -612,7 +636,14 @@ function nonRefusal4xx(
   return new TensorCostProviderError(
     `tensorcost: upstream provider returned ${resp.status}` +
       (providerMsg !== null ? `: ${providerMsg}` : ""),
-    { status: resp.status, requestId, attempt, body: errorBody, headers },
+    {
+      status: resp.status,
+      requestId,
+      attempt,
+      body: errorBody,
+      headers,
+      mayHaveReachedProvider: true,
+    },
   );
 }
 
@@ -662,14 +693,19 @@ async function readErrorBody(resp: Response, deadlineMs: number): Promise<unknow
  * heard of is terminal, a relayed provider 4xx surfaces as itself, and an
  * error the SDK didn't classify at all is surfaced rather than retried
  * against the provider.
+ *
+ * Since 1.8.0 an outage falls back only when the call provably never
+ * reached the provider (`mayHaveReachedProvider` false, delivery.ts). A
+ * timeout, a reset, or a 5xx the proxy may have sent after forwarding is
+ * surfaced instead: calling the provider again would bill the call twice.
  */
 export function shouldFallBackToProvider(err: unknown): boolean {
-  return (
+  const outage =
     err instanceof TensorCostNetworkError ||
     err instanceof TensorCostTimeoutError ||
     err instanceof TensorCostProxyError ||
-    err instanceof TensorCostQuotaError
-  );
+    err instanceof TensorCostQuotaError;
+  return outage && !err.mayHaveReachedProvider;
 }
 
 export interface ProxyStreamResult {
@@ -742,8 +778,9 @@ export function wrapStreamWithIdleTimeout(
 /**
  * Steer/route a streaming request through the inference proxy.
  * Uses the short headers timeout; no JSON body read. Retries only before
- * headers arrive (5xx/429/network). Once SSE starts, the stream is returned
- * as-is for the provider wrapper to consume.
+ * headers arrive, and only when the attempt provably never reached the
+ * provider (same rules as proxyRequest, delivery.ts). Once SSE starts, the
+ * stream is returned as-is for the provider wrapper to consume.
  */
 export async function proxyRequestStream(
   opts: ProxyRequestOptions & { idleTimeoutMs?: number },
@@ -808,26 +845,33 @@ export async function proxyRequestStream(
       });
     } catch (err) {
       clearTimeout(headersTimer);
+      // No headers in time. The request was written and the proxy may have
+      // forwarded it (a stream's headers wait on the provider's), so this is
+      // never retried and never falls back; the circuit counts it, so the
+      // calls after it go direct once a wedged proxy opens the circuit.
       if (
-        headersTimedOut &&
         err instanceof Error &&
         (err.name === "AbortError" || err.name === "TimeoutError")
       ) {
         const tcErr = new TensorCostTimeoutError(
-          `tensorcost: proxy did not respond with headers within ${headersTimeoutMs}ms`,
-          "headers",
-          { cause: err, attempt: attempt + 1 },
+          headersTimedOut
+            ? `tensorcost: proxy did not respond with headers within ${headersTimeoutMs}ms`
+            : `tensorcost: proxy request timed out after ${timeoutMs}ms`,
+          headersTimedOut ? "headers" : "total",
+          { cause: err, attempt: attempt + 1, mayHaveReachedProvider: true },
         );
         opts.circuit.recordFailure();
         throw tcErr;
       }
+      // Only a connect-phase failure proves nothing was written.
+      const sentNothing = fetchErrorSentNothing(err);
       const tcErr = new TensorCostNetworkError(
         `tensorcost: network error reaching proxy: ${(err as Error).message}`,
-        { cause: err as Error, attempt: attempt + 1 },
+        { cause: err as Error, attempt: attempt + 1, mayHaveReachedProvider: !sentNothing },
       );
       lastError = tcErr;
       opts.circuit.recordFailure();
-      if (!opts.failOpenFast && attempt + 1 < retryConfig.maxAttempts) {
+      if (sentNothing && !opts.failOpenFast && attempt + 1 < retryConfig.maxAttempts) {
         await sleep(computeDelay(attempt, retryConfig));
         continue;
       }
@@ -840,10 +884,12 @@ export async function proxyRequestStream(
 
     if (resp.ok) {
       if (!resp.body) {
+        // A 2xx: the provider answered. An empty body is no reason to resend.
         throw new TensorCostProxyError("tensorcost: proxy returned empty stream body", {
           status: resp.status,
           requestId,
           attempt: attempt + 1,
+          mayHaveReachedProvider: true,
         });
       }
       opts.circuit.recordSuccess();
@@ -865,11 +911,14 @@ export async function proxyRequestStream(
     }
 
     // Same classification as proxyRequest: refusal first (terminal, never
-    // retried), then 429 / 5xx (outages, retried), then the provider's
-    // own relayed error.
+    // retried), then the provider's own answer, then 402 / 429 / 5xx
+    // (outages, retried only when provably unsent), then the provider's
+    // relayed 4xx.
     let errorBody: unknown = null;
-    if (resp.status >= 400 && resp.status < 500) {
+    if (resp.status >= 400) {
       errorBody = await readErrorBody(resp, callStart + timeoutMs);
+    }
+    if (resp.status >= 400 && resp.status < 500) {
       const refusal = parseRefusalBody(errorBody);
       if (refusal !== null || decisionSaysRefuse(resp.headers.get("x-tc-decision"))) {
         const tcErr = refusalError(refusal, {
@@ -892,29 +941,37 @@ export async function proxyRequestStream(
       }
     }
 
+    const answer: ErrorAnswer | null =
+      resp.status === 402 || resp.status === 429 || resp.status >= 500
+        ? classifyErrorAnswer(resp.status, resp.headers, errorBody)
+        : null;
+    if (answer === "provider") {
+      throw providerAnswerError(resp, errorBody, requestId, attempt + 1);
+    }
+    const unsent = answer === "unsent";
     if (resp.status === 402) {
       throw new TensorCostQuotaError(
         "tensorcost: proxy returned 402 (plan request ceiling reached)",
         retryAfterMs(resp) ?? null,
-        { status: 402, requestId, attempt: attempt + 1 },
+        { status: 402, requestId, attempt: attempt + 1, mayHaveReachedProvider: !unsent },
       );
     }
     if (resp.status === 429) {
       const raMs = retryAfterMs(resp);
-      if (attempt + 1 < retryConfig.maxAttempts) {
+      if (unsent && attempt + 1 < retryConfig.maxAttempts) {
         await sleep(computeDelay(attempt, retryConfig, raMs));
         continue;
       }
       throw new TensorCostQuotaError(
         "tensorcost: proxy returned 429 Too Many Requests",
         raMs ?? null,
-        { status: 429, requestId, attempt: attempt + 1 },
+        { status: 429, requestId, attempt: attempt + 1, mayHaveReachedProvider: !unsent },
       );
     }
     if (resp.status >= 500) {
+      // See proxyRequest: a 5xx not proven pre-forward is surfaced, never resent.
       opts.circuit.recordFailure();
-      void resp.body?.cancel().catch(() => undefined);
-      if (attempt + 1 < retryConfig.maxAttempts) {
+      if (unsent && attempt + 1 < retryConfig.maxAttempts) {
         await sleep(computeDelay(attempt, retryConfig));
         continue;
       }
@@ -922,6 +979,7 @@ export async function proxyRequestStream(
         status: resp.status,
         requestId,
         attempt: attempt + 1,
+        mayHaveReachedProvider: !unsent,
       });
     }
 

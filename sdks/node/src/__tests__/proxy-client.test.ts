@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { proxyRequest } from "../proxy-client.js";
+import { proxyRequest, proxyRequestStream, shouldFallBackToProvider } from "../proxy-client.js";
 import {
   TensorCostNetworkError,
   TensorCostTimeoutError,
@@ -226,7 +226,19 @@ describe("proxyRequest — 5xx", () => {
     ).rejects.toBeInstanceOf(TensorCostProxyError);
   });
 
-  it("retries on 5xx until maxAttempts then throws", async () => {
+  it("retries the proxy's own 503 until maxAttempts then throws", async () => {
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls++;
+      return new Response("{}", { status: 503, headers: { "x-tc-error-origin": "proxy" } });
+    };
+    await expect(
+      proxyRequest(makeOpts(fetchImpl, { retry: FAST_RETRY })),
+    ).rejects.toBeInstanceOf(TensorCostProxyError);
+    expect(calls).toBe(3);
+  });
+
+  it("does not retry a 502 with no origin header", async () => {
     let calls = 0;
     const fetchImpl: typeof fetch = async () => {
       calls++;
@@ -235,12 +247,13 @@ describe("proxyRequest — 5xx", () => {
     await expect(
       proxyRequest(makeOpts(fetchImpl, { retry: FAST_RETRY })),
     ).rejects.toBeInstanceOf(TensorCostProxyError);
-    expect(calls).toBe(3);
+    expect(calls).toBe(1);
   });
 
   it("fires on_retry with reason='5xx' on each retry", async () => {
     const events: LifecycleEvent[] = [];
-    const fetchImpl: typeof fetch = async () => new Response("{}", { status: 503 });
+    const fetchImpl: typeof fetch = async () =>
+      new Response("{}", { status: 503, headers: { "x-tc-error-origin": "gateway" } });
     await expect(
       proxyRequest(makeOpts(fetchImpl, {
         retry: FAST_RETRY,
@@ -351,7 +364,8 @@ describe("proxyRequest — circuit breaker", () => {
 describe("proxyRequest — telemetry attempt numbers", () => {
   it("increments attemptNumber across retries", async () => {
     const events: LifecycleEvent[] = [];
-    const fetchImpl: typeof fetch = async () => new Response("{}", { status: 503 });
+    const fetchImpl: typeof fetch = async () =>
+      new Response("{}", { status: 503, headers: { "x-tc-error-origin": "proxy" } });
     await expect(
       proxyRequest(makeOpts(fetchImpl, {
         retry: FAST_RETRY,
@@ -360,5 +374,242 @@ describe("proxyRequest — telemetry attempt numbers", () => {
     ).rejects.toBeDefined();
     const before = events.filter((e) => e.kind === "before_request");
     expect(before.map((e) => e.attemptNumber)).toEqual([1, 2, 3]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Never resend a call that may have reached the provider (1.8.0).
+//
+// Through 1.7.0 every 5xx, timeout and network error was retried, then fell
+// back to the provider, so one call the provider had already billed could
+// run six times. Retry and fallback now need proof the attempt never left.
+
+function counting(respond: () => Promise<Response>): { fetchImpl: typeof fetch; calls: () => number } {
+  let n = 0;
+  return {
+    fetchImpl: (async () => {
+      n++;
+      return respond();
+    }) as typeof fetch,
+    calls: () => n,
+  };
+}
+
+const errOf = async (p: Promise<unknown>): Promise<unknown> => p.then(() => null, (e: unknown) => e);
+
+describe.each([
+  { name: "proxyRequest", send: proxyRequest },
+  { name: "proxyRequestStream", send: proxyRequestStream },
+])("$name — where did the call get to", ({ send }) => {
+  it("proxy-origin 503: retried with backoff, then allowed to fall back", async () => {
+    const f = counting(async () =>
+      new Response(JSON.stringify({ statusCode: 503, message: "TensorCost could not check the SDK token" }), {
+        status: 503,
+        headers: { "x-tc-error-origin": "proxy" },
+      }),
+    );
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(err).toBeInstanceOf(TensorCostProxyError);
+    expect(f.calls()).toBe(3);
+    expect((err as TensorCostProxyError).mayHaveReachedProvider).toBe(false);
+    expect(shouldFallBackToProvider(err)).toBe(true);
+  });
+
+  it("gateway 503 (its breaker is open, nothing forwarded): retried, then allowed to fall back", async () => {
+    const f = counting(async () =>
+      new Response(JSON.stringify({ error: { code: "UPSTREAM_UNAVAILABLE" } }), {
+        status: 503,
+        headers: { "x-tc-error-origin": "gateway", "retry-after": "1" },
+      }),
+    );
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(f.calls()).toBe(3);
+    expect(shouldFallBackToProvider(err)).toBe(true);
+  });
+
+  it("gateway 502 for its own connect failure to the proxy: retried, then allowed to fall back", async () => {
+    const f = counting(async () =>
+      new Response(
+        JSON.stringify({ error: { code: "UPSTREAM_PROXY_ERROR", message: "connect ECONNREFUSED 10.0.3.7:4115" } }),
+        { status: 502, headers: { "x-tc-error-origin": "gateway" } },
+      ),
+    );
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(f.calls()).toBe(3);
+    expect(shouldFallBackToProvider(err)).toBe(true);
+  });
+
+  it("503 with x-should-retry: true: retried", async () => {
+    const f = counting(async () => new Response("{}", { status: 503, headers: { "x-should-retry": "true" } }));
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(f.calls()).toBe(3);
+    expect(shouldFallBackToProvider(err)).toBe(true);
+  });
+
+  it("provider-origin 502: not retried, surfaced as the provider's error, not a circuit failure", async () => {
+    const circuit = new CircuitBreaker({ openThreshold: 1, closeThreshold: 5 });
+    const f = counting(async () =>
+      new Response(JSON.stringify({ error: { message: "Bad gateway", type: "server_error" } }), {
+        status: 502,
+        headers: { "content-type": "application/json", "x-tc-error-origin": "provider" },
+      }),
+    );
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY, circuit })));
+    expect(f.calls()).toBe(1);
+    expect(err).toBeInstanceOf(TensorCostProviderError);
+    expect((err as TensorCostProviderError).status).toBe(502);
+    expect((err as TensorCostProviderError).body).toEqual({ error: { message: "Bad gateway", type: "server_error" } });
+    expect((err as TensorCostProviderError).mayHaveReachedProvider).toBe(true);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+    expect(circuit.currentState).toBe("CLOSED");
+  });
+
+  it("provider-origin 504 (the provider did not answer in time): not retried, no fallback", async () => {
+    const f = counting(async () =>
+      new Response(JSON.stringify({ error: { message: "the provider did not answer in time" } }), {
+        status: 504,
+        headers: { "x-tc-error-origin": "provider", "x-should-retry": "false" },
+      }),
+    );
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(f.calls()).toBe(1);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+  });
+
+  it("provider-origin 429: the provider's rate limit, surfaced as its error", async () => {
+    const f = counting(async () =>
+      new Response(JSON.stringify({ error: { message: "Rate limit reached", type: "requests" } }), {
+        status: 429,
+        headers: { "x-tc-error-origin": "provider", "retry-after": "0" },
+      }),
+    );
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(f.calls()).toBe(1);
+    expect(err).toBeInstanceOf(TensorCostProviderError);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+  });
+
+  it("x-should-retry: false: not retried and no fallback, even on the proxy's own 503", async () => {
+    const f = counting(async () =>
+      new Response("{}", { status: 503, headers: { "x-tc-error-origin": "proxy", "x-should-retry": "false" } }),
+    );
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(f.calls()).toBe(1);
+    expect((err as TensorCostProxyError).mayHaveReachedProvider).toBe(true);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+  });
+
+  it("x-should-retry: false on a 429: not retried and no fallback", async () => {
+    const f = counting(async () =>
+      new Response("{}", { status: 429, headers: { "x-tc-error-origin": "proxy", "x-should-retry": "false" } }),
+    );
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(f.calls()).toBe(1);
+    expect(err).toBeInstanceOf(TensorCostQuotaError);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+  });
+
+  it("proxy-origin 500 (an error after the forward): not retried, no fallback", async () => {
+    const f = counting(async () => new Response("{}", { status: 500, headers: { "x-tc-error-origin": "proxy" } }));
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(f.calls()).toBe(1);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+  });
+
+  it("gateway 502 for a proxy that reset mid-call: not retried, no fallback", async () => {
+    const f = counting(async () =>
+      new Response(JSON.stringify({ error: { code: "UPSTREAM_PROXY_ERROR", message: "socket hang up" } }), {
+        status: 502,
+        headers: { "x-tc-error-origin": "gateway" },
+      }),
+    );
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(f.calls()).toBe(1);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+  });
+
+  it("5xx with no origin header: not retried, no fallback", async () => {
+    const f = counting(async () => new Response("{}", { status: 503 }));
+    const err = await errOf(send(makeOpts(f.fetchImpl, { retry: FAST_RETRY })));
+    expect(f.calls()).toBe(1);
+    expect(err).toBeInstanceOf(TensorCostProxyError);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+  });
+
+  it("timeout after the request was sent: not retried, no fallback, still a circuit failure", async () => {
+    const circuit = new CircuitBreaker({ openThreshold: 1, closeThreshold: 5 });
+    let calls = 0;
+    const fetchImpl: typeof fetch = (_url, init) =>
+      new Promise((_resolve, reject) => {
+        calls++;
+        init?.signal?.addEventListener("abort", () =>
+          reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+        );
+      });
+    const err = await errOf(
+      send(makeOpts(fetchImpl, { retry: FAST_RETRY, timeoutMs: 20, headersTimeoutMs: 20, circuit })),
+    );
+    expect(calls).toBe(1);
+    expect(err).toBeInstanceOf(TensorCostTimeoutError);
+    expect((err as TensorCostTimeoutError).mayHaveReachedProvider).toBe(true);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+    expect(circuit.currentState).toBe("OPEN");
+  });
+
+  it("connection reset: not retried, no fallback", async () => {
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls++;
+      throw new TypeError("fetch failed", {
+        cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" }),
+      });
+    };
+    const err = await errOf(send(makeOpts(fetchImpl, { retry: FAST_RETRY })));
+    expect(calls).toBe(1);
+    expect(err).toBeInstanceOf(TensorCostNetworkError);
+    expect((err as TensorCostNetworkError).mayHaveReachedProvider).toBe(true);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+  });
+
+  it("connection refused before send: retried with backoff, then allowed to fall back", async () => {
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls++;
+      throw new TypeError("fetch failed", {
+        cause: Object.assign(new Error("connect ECONNREFUSED 10.0.3.7:443"), { code: "ECONNREFUSED", syscall: "connect" }),
+      });
+    };
+    const err = await errOf(send(makeOpts(fetchImpl, { retry: FAST_RETRY })));
+    expect(calls).toBe(3);
+    expect((err as TensorCostNetworkError).mayHaveReachedProvider).toBe(false);
+    expect(shouldFallBackToProvider(err)).toBe(true);
+  });
+
+  it("connection refused with fail-open: falls back at once, without retrying", async () => {
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls++;
+      throw new TypeError("fetch failed", {
+        cause: Object.assign(new Error("getaddrinfo ENOTFOUND proxy.local"), { code: "ENOTFOUND", syscall: "getaddrinfo" }),
+      });
+    };
+    const err = await errOf(send(makeOpts(fetchImpl, { retry: FAST_RETRY, failOpenFast: true })));
+    expect(calls).toBe(1);
+    expect(shouldFallBackToProvider(err)).toBe(true);
+  });
+});
+
+describe("proxyRequest — a 2xx whose body doesn't arrive", () => {
+  it("is never resent: the provider has already answered", async () => {
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls++;
+      const body = new ReadableStream<Uint8Array>({ start() {} }); // never sends a byte
+      return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const err = await errOf(proxyRequest(makeOpts(fetchImpl, { retry: FAST_RETRY, timeoutMs: 30 })));
+    expect(calls).toBe(1);
+    expect(err).toBeInstanceOf(TensorCostTimeoutError);
+    expect(shouldFallBackToProvider(err)).toBe(false);
   });
 });
