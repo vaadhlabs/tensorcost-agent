@@ -94,6 +94,10 @@ class OnErrorEvent:
     elapsed_ms: float
     error_class: str
     status: Optional[int]
+    #: Set when the status alone doesn't say why. ``provider_unreachable``:
+    #: the proxy answered 502 because it could not connect to the provider,
+    #: so nothing was sent and the wrapper may call the provider directly.
+    reason: Optional[Literal["provider_unreachable"]] = None
 
 
 @dataclass(frozen=True)

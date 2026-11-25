@@ -43,6 +43,10 @@ import httpx
 ERROR_ORIGIN_HEADER = "x-tc-error-origin"
 #: OpenAI/Anthropic SDK convention; "false" means do not send this again.
 SHOULD_RETRY_HEADER = "x-should-retry"
+#: Set by inference-proxy-service on its answer for a provider send that got
+#: no answer (unanswered-send.ts): ``provider_unreachable``,
+#: ``provider_connection_lost`` or ``provider_timeout``.
+UPSTREAM_ERROR_HEADER = "x-tc-upstream-error"
 
 #: "unsent": TensorCost answered before forwarding, safe to retry and to fall
 #: back. "provider": the provider's own answer, relayed. "maybe_sent": can't
@@ -77,6 +81,13 @@ def classify_error_answer(status: int, headers: Mapping[str, str], body: Any) ->
 
     In order:
 
+    0. The proxy's 502 ``x-tc-upstream-error: provider_unreachable`` without
+       ``x-should-retry: false`` (``is_provider_unreachable``): the proxy
+       could not connect to the provider (connect, DNS or TLS, after its own
+       one retry), so nothing of the call left it and nothing was billed.
+       The proxy marks it origin ``provider``, so it has to come before
+       rule 1. A routed call's answer carries ``x-should-retry: false`` (an
+       earlier route may have run) and stays "maybe_sent".
     1. origin ``provider``: the provider's answer. Never resent: it would
        answer the same, or (a 5xx, the proxy's 504) it may already have run.
     2. ``x-should-retry: false``: whoever sent it says don't. Always honoured.
@@ -98,6 +109,8 @@ def classify_error_answer(status: int, headers: Mapping[str, str], body: Any) ->
     origin = (headers.get(ERROR_ORIGIN_HEADER) or "").strip().lower() or None
     should_retry = (headers.get(SHOULD_RETRY_HEADER) or "").strip().lower() or None
 
+    if is_provider_unreachable(status, headers):
+        return "unsent"
     if origin == "provider":
         return "provider"
     if should_retry == "false":
@@ -109,6 +122,23 @@ def classify_error_answer(status: int, headers: Mapping[str, str], body: Any) ->
     if status == 502 and origin == "gateway" and _gateway_could_not_connect(body):
         return "unsent"
     return "maybe_sent"
+
+
+def is_provider_unreachable(status: int, headers: Mapping[str, str]) -> bool:
+    """The proxy's 502 for a provider it could not connect to, nothing sent.
+
+    "unsent" to ``classify_error_answer``, but not an outage of TensorCost:
+    the proxy is healthy and already retried the provider once, so the proxy
+    client neither retries it nor counts it against the circuit, and the
+    wrapper calls the provider directly when fail-open is on.
+    ``provider_connection_lost`` and ``provider_timeout`` may have run, carry
+    ``x-should-retry: false``, and never match.
+    """
+    if status != 502:
+        return False
+    kind = (headers.get(UPSTREAM_ERROR_HEADER) or "").strip().lower()
+    should_retry = (headers.get(SHOULD_RETRY_HEADER) or "").strip().lower()
+    return kind == "provider_unreachable" and should_retry != "false"
 
 
 def _gateway_could_not_connect(body: Any) -> bool:

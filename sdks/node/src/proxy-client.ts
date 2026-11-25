@@ -32,6 +32,10 @@
  *     `mayHaveReachedProvider: true`. Through 1.7.0 every 5xx, timeout and
  *     network error was retried five times and then fell back, so one call
  *     the provider had already billed could run six times.
+ *   - 1.8.2: the proxy's 502 `x-tc-upstream-error: provider_unreachable`
+ *     (it couldn't connect to the provider, nothing was sent) is neither
+ *     retried nor a circuit failure, and surfaces with
+ *     `mayHaveReachedProvider: false` so fail-open goes direct.
  *   - Respects Retry-After on 429. Stops at maxAttempts, with backoff.
  *   - Never retries the circuit's half-open probe, or once the circuit has
  *     opened during the call: those fail over to the provider at once.
@@ -90,7 +94,7 @@ import {
   sleep,
 } from "./retry.js";
 import type { RetryConfig } from "./retry.js";
-import { classifyErrorAnswer, fetchErrorSentNothing } from "./delivery.js";
+import { classifyErrorAnswer, fetchErrorSentNothing, isProviderUnreachable } from "./delivery.js";
 import type { ErrorAnswer } from "./delivery.js";
 import type { CircuitBreaker } from "./circuit.js";
 import { emitEvent } from "./telemetry.js";
@@ -469,6 +473,26 @@ export async function proxyRequest(
       throw tcErr;
     }
 
+    // The proxy couldn't connect to the provider and nothing was sent
+    // (delivery.ts isProviderUnreachable). Not retried through the proxy,
+    // which already retried the provider once, and not a circuit failure:
+    // the proxy is fine. Surfaced as unsent so the wrapper can go direct.
+    if (answer === "unsent" && isProviderUnreachable(resp.status, resp.headers)) {
+      const tcErr = providerUnreachableError(resp, requestId, attempt + 1);
+      emitEvent(opts.onLifecycleEvent, {
+        kind: "on_error",
+        provider: opts.provider,
+        model: opts.model,
+        operation: opts.operation,
+        attemptNumber: attempt + 1,
+        elapsedMs: Date.now() - callStart,
+        errorClass: tcErr.constructor.name,
+        status: resp.status,
+        reason: "provider_unreachable",
+      });
+      throw tcErr;
+    }
+
     // 402 without a refusal body — the plan's monthly proxy-request ceiling
     // (Scale COGS gate). TensorCost declining to carry the call is not a
     // refusal of the call, and the server means for it to go direct, so it
@@ -599,6 +623,14 @@ export async function proxyRequest(
 
   // Should be unreachable — every loop arm either returns or throws.
   throw lastError ?? new TensorCostProxyError("tensorcost: max attempts reached");
+}
+
+/** The proxy's 502 for a provider it could not connect to: unsent, so fail-open may go direct. */
+function providerUnreachableError(resp: Response, requestId: string | null, attempt: number): TensorCostProxyError {
+  return new TensorCostProxyError(
+    `tensorcost: proxy returned ${resp.status} (it could not reach the provider; nothing was sent)`,
+    { status: resp.status, requestId, attempt, mayHaveReachedProvider: false },
+  );
 }
 
 /**
@@ -973,6 +1005,22 @@ export async function proxyRequestStream(
         : null;
     if (answer === "provider") {
       throw providerAnswerError(resp, errorBody, requestId, attempt + 1);
+    }
+    // See proxyRequest: unreachable provider, nothing sent, proxy healthy.
+    if (answer === "unsent" && isProviderUnreachable(resp.status, resp.headers)) {
+      const tcErr = providerUnreachableError(resp, requestId, attempt + 1);
+      emitEvent(opts.onLifecycleEvent, {
+        kind: "on_error",
+        provider: opts.provider,
+        model: opts.model,
+        operation: opts.operation,
+        attemptNumber: attempt + 1,
+        elapsedMs: Date.now() - callStart,
+        errorClass: tcErr.constructor.name,
+        status: resp.status,
+        reason: "provider_unreachable",
+      });
+      throw tcErr;
     }
     const unsent = answer === "unsent";
     if (resp.status === 402) {

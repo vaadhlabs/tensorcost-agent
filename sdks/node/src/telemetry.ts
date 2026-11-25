@@ -74,6 +74,12 @@ export interface OnErrorEvent extends TelemetryBase {
   kind: "on_error";
   errorClass: string;
   status: number | null;
+  /**
+   * Set when the status alone doesn't say why. `provider_unreachable`: the
+   * proxy answered 502 because it could not connect to the provider, so
+   * nothing was sent and the wrapper may call the provider directly.
+   */
+  reason?: "provider_unreachable";
 }
 
 export interface OnFallbackEvent extends TelemetryBase {
