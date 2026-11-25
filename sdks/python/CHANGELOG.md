@@ -20,8 +20,14 @@ network could reach it.
 Now that answer surfaces as a `TensorCostProxyError` with
 `may_have_reached_provider` False, and with `fail_open_enabled` on (the
 default) the wrapper calls the provider directly. It is not retried through
-the proxy, which has already retried the provider once, and it doesn't count
-as a circuit failure, because the proxy itself is working. The `on_error`
+the proxy, which has already retried the provider once. It does count as a
+circuit failure: when the proxy's own network can't reach the provider,
+every call gets this answer after the proxy's two connect attempts, and the
+open circuit then sends calls straight to the provider instead of making
+each one wait out those attempts first. The rule needs all of the 502,
+`x-tc-error-origin: provider` and `x-tc-upstream-error:
+provider_unreachable`; the header with any other origin, or none, is
+handled as before. The `on_error`
 lifecycle event for it carries `reason="provider_unreachable"`. With
 `fail_open_enabled=False` the error is raised.
 

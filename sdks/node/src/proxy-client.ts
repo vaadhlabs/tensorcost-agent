@@ -33,8 +33,8 @@
  *     network error was retried five times and then fell back, so one call
  *     the provider had already billed could run six times.
  *   - 1.8.2: the proxy's 502 `x-tc-upstream-error: provider_unreachable`
- *     (it couldn't connect to the provider, nothing was sent) is neither
- *     retried nor a circuit failure, and surfaces with
+ *     (it couldn't connect to the provider, nothing was sent) is not
+ *     retried, counts as a circuit failure, and surfaces with
  *     `mayHaveReachedProvider: false` so fail-open goes direct.
  *   - Respects Retry-After on 429. Stops at maxAttempts, with backoff.
  *   - Never retries the circuit's half-open probe, or once the circuit has
@@ -475,10 +475,12 @@ export async function proxyRequest(
 
     // The proxy couldn't connect to the provider and nothing was sent
     // (delivery.ts isProviderUnreachable). Not retried through the proxy,
-    // which already retried the provider once, and not a circuit failure:
-    // the proxy is fine. Surfaced as unsent so the wrapper can go direct.
+    // which already retried the provider once. A circuit failure, so a proxy
+    // whose egress is broken gets bypassed instead of costing every call
+    // its connect timeouts. Surfaced as unsent so the wrapper can go direct.
     if (answer === "unsent" && isProviderUnreachable(resp.status, resp.headers)) {
       const tcErr = providerUnreachableError(resp, requestId, attempt + 1);
+      opts.circuit.recordFailure();
       emitEvent(opts.onLifecycleEvent, {
         kind: "on_error",
         provider: opts.provider,
@@ -1006,9 +1008,10 @@ export async function proxyRequestStream(
     if (answer === "provider") {
       throw providerAnswerError(resp, errorBody, requestId, attempt + 1);
     }
-    // See proxyRequest: unreachable provider, nothing sent, proxy healthy.
+    // See proxyRequest: unreachable provider, nothing sent, not retried, a circuit failure.
     if (answer === "unsent" && isProviderUnreachable(resp.status, resp.headers)) {
       const tcErr = providerUnreachableError(resp, requestId, attempt + 1);
+      opts.circuit.recordFailure();
       emitEvent(opts.onLifecycleEvent, {
         kind: "on_error",
         provider: opts.provider,

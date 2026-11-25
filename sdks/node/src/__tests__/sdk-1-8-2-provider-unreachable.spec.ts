@@ -13,8 +13,10 @@
  * All three carry `x-tc-error-origin: provider`. Through 1.8.1 the SDK
  * surfaced all three as the provider's error and never fell open. The first
  * is proven unsent, so going to the provider directly is safe: 1.8.2 does,
- * when fail-open is on, without retrying through the proxy or counting a
- * circuit failure (the proxy is healthy).
+ * when fail-open is on, without retrying through the proxy. It still counts
+ * against the circuit: a proxy whose egress is broken answers every call
+ * this way, and an open circuit is what stops each call waiting out the
+ * proxy's connect attempts first.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -53,14 +55,19 @@ function unanswered(kind: Kind, extra: Record<string, string> = {}): Response {
 describe("classifyErrorAnswer: x-tc-upstream-error", () => {
   const h = (o: Record<string, string>) => new Headers(o);
 
-  it("502 provider_unreachable with no x-should-retry is unsent, origin provider or not", () => {
-    for (const origin of ["provider", "proxy", null]) {
-      const headers = h({
-        "x-tc-upstream-error": "provider_unreachable",
-        ...(origin ? { "x-tc-error-origin": origin } : {}),
-      });
-      expect(classifyErrorAnswer(502, headers, null)).toBe("unsent");
-    }
+  it("502 provider_unreachable, origin provider, no x-should-retry: unsent", () => {
+    const headers = h({ "x-tc-error-origin": "provider", "x-tc-upstream-error": "provider_unreachable" });
+    expect(classifyErrorAnswer(502, headers, null)).toBe("unsent");
+  });
+
+  it("502 provider_unreachable with another origin or none: maybe_sent, as before", () => {
+    expect(
+      classifyErrorAnswer(502, h({ "x-tc-error-origin": "proxy", "x-tc-upstream-error": "provider_unreachable" }), null),
+    ).toBe("maybe_sent");
+    expect(
+      classifyErrorAnswer(502, h({ "x-tc-error-origin": "gateway", "x-tc-upstream-error": "provider_unreachable" }), null),
+    ).toBe("maybe_sent");
+    expect(classifyErrorAnswer(502, h({ "x-tc-upstream-error": "provider_unreachable" }), null)).toBe("maybe_sent");
   });
 
   it("x-should-retry: false still wins over provider_unreachable", () => {
@@ -133,9 +140,9 @@ describe.each([
   { name: "proxyRequest", send: proxyRequest },
   { name: "proxyRequestStream", send: proxyRequestStream },
 ])("$name: the proxy couldn't reach the provider", ({ send }) => {
-  it("provider_unreachable: one attempt, no circuit failure, unsent so it may fall back", async () => {
+  it("provider_unreachable: one attempt, one circuit failure, unsent so it may fall back", async () => {
     const f = counting(() => unanswered("provider_unreachable"));
-    const circuit = new CircuitBreaker({ openThreshold: 1, closeThreshold: 5 });
+    const circuit = new CircuitBreaker({ openThreshold: 3, closeThreshold: 5 });
     const events: LifecycleEvent[] = [];
     const err = await errOf(send(opts(f.fetchImpl, circuit, events)));
 
@@ -144,7 +151,7 @@ describe.each([
     expect((err as TensorCostProxyError).mayHaveReachedProvider).toBe(false);
     expect(shouldFallBackToProvider(err)).toBe(true);
     expect(f.calls()).toBe(1);
-    expect(circuit.failures).toBe(0);
+    expect(circuit.failures).toBe(1);
     expect(circuit.currentState).toBe("CLOSED");
     expect(events.filter((e) => e.kind === "on_retry")).toHaveLength(0);
     expect(events.find((e) => e.kind === "on_error")).toMatchObject({
@@ -168,6 +175,14 @@ describe.each([
       expect(circuit.failures).toBe(0);
     },
   );
+
+  it("provider_unreachable marked origin proxy: may have been sent, no fallback, as before", async () => {
+    const f = counting(() => unanswered("provider_unreachable", { "x-tc-error-origin": "proxy" }));
+    const err = await errOf(send(opts(f.fetchImpl, new CircuitBreaker(), [])));
+    expect((err as TensorCostError).mayHaveReachedProvider).toBe(true);
+    expect(shouldFallBackToProvider(err)).toBe(false);
+    expect(f.calls()).toBe(1);
+  });
 
   it("provider_unreachable with x-should-retry: false (a routed call): may have been sent, no fallback", async () => {
     const f = counting(() => unanswered("provider_unreachable", { "x-should-retry": "false" }));
@@ -235,26 +250,42 @@ describe("wrap(): provider_unreachable", () => {
     // The shipped defaults: 5 attempts, circuit opens at 3 failures.
   };
 
-  it("fail-open on: one proxy request, then the provider directly; the circuit counts nothing", async () => {
+  it("fail-open on: one proxy request, then the provider directly", async () => {
     const tc = tensorcost("provider_unreachable");
     globalThis.fetch = tc.f;
     const events: LifecycleEvent[] = [];
     const fake = fakeApiClient(() => jsonResponse(200, chatOk));
     wrap(fake.client, { ...base, onLifecycleEvent: (e) => events.push(e) });
 
-    for (let i = 1; i <= 4; i++) {
-      const out = (await fake.client.chat.completions.create(ask)) as { id: string };
-      expect(out.id).toBe("chatcmpl-1");
+    const out = (await fake.client.chat.completions.create(ask)) as { id: string };
+    expect(out.id).toBe("chatcmpl-1");
+    expect(tc.state.proxyRequests).toBe(1);
+    expect(fake.requests).toHaveLength(1);
+    expect(events.filter((e) => e.kind === "on_retry")).toHaveLength(0);
+    expect(events.find((e) => e.kind === "on_fallback")).toMatchObject({ consecutiveFailures: 1 });
+  });
+
+  it("three in a row open the circuit, and the next call goes direct without trying the proxy", async () => {
+    const tc = tensorcost("provider_unreachable");
+    globalThis.fetch = tc.f;
+    const events: LifecycleEvent[] = [];
+    const fake = fakeApiClient(() => jsonResponse(200, chatOk));
+    wrap(fake.client, { ...base, onLifecycleEvent: (e) => events.push(e) });
+
+    // The shipped openThreshold is 3: each call is one proxy request, then direct.
+    for (let i = 1; i <= 3; i++) {
+      await fake.client.chat.completions.create(ask);
       expect(tc.state.proxyRequests).toBe(i);
       expect(fake.requests).toHaveLength(i);
     }
-    // Four calls, more than the three failures that open the circuit: every
-    // one still went through the proxy first, and no fallback saw a failure.
-    const fallbacks = events.filter((e) => e.kind === "on_fallback");
-    expect(fallbacks).toHaveLength(4);
-    for (const e of fallbacks) expect(e).toMatchObject({ consecutiveFailures: 0 });
-    expect(events.filter((e) => e.kind === "on_retry")).toHaveLength(0);
-    expect(events.filter((e) => e.kind === "on_circuit_state")).toHaveLength(0);
+    expect(events.filter((e) => e.kind === "on_circuit_state")).toMatchObject([
+      { from: "CLOSED", to: "OPEN", consecutiveFailures: 3 },
+    ]);
+
+    // Inside the probe window: straight to the provider, no proxy request.
+    await fake.client.chat.completions.create(ask);
+    expect(tc.state.proxyRequests).toBe(3);
+    expect(fake.requests).toHaveLength(4);
   });
 
   it("fail-open off: throws the proxy error with mayHaveReachedProvider false, provider never called", async () => {

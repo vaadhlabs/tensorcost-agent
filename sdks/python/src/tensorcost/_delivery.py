@@ -81,12 +81,14 @@ def classify_error_answer(status: int, headers: Mapping[str, str], body: Any) ->
 
     In order:
 
-    0. The proxy's 502 ``x-tc-upstream-error: provider_unreachable`` without
-       ``x-should-retry: false`` (``is_provider_unreachable``): the proxy
+    0. The proxy's 502 ``x-tc-upstream-error: provider_unreachable``, marked
+       origin ``provider``, without ``x-should-retry: false``
+       (``is_provider_unreachable``): the proxy
        could not connect to the provider (connect, DNS or TLS, after its own
        one retry), so nothing of the call left it and nothing was billed.
-       The proxy marks it origin ``provider``, so it has to come before
-       rule 1. A routed call's answer carries ``x-should-retry: false`` (an
+       The origin is ``provider``, so it has to come before rule 1. The
+       same header with another origin or none is not the proxy's answer as
+       unanswered-send.ts writes it, and stays "maybe_sent". A routed call's answer carries ``x-should-retry: false`` (an
        earlier route may have run) and stays "maybe_sent".
     1. origin ``provider``: the provider's answer. Never resent: it would
        answer the same, or (a 5xx, the proxy's 504) it may already have run.
@@ -127,18 +129,23 @@ def classify_error_answer(status: int, headers: Mapping[str, str], body: Any) ->
 def is_provider_unreachable(status: int, headers: Mapping[str, str]) -> bool:
     """The proxy's 502 for a provider it could not connect to, nothing sent.
 
-    "unsent" to ``classify_error_answer``, but not an outage of TensorCost:
-    the proxy is healthy and already retried the provider once, so the proxy
-    client neither retries it nor counts it against the circuit, and the
-    wrapper calls the provider directly when fail-open is on.
-    ``provider_connection_lost`` and ``provider_timeout`` may have run, carry
+    Origin ``provider``, ``x-tc-upstream-error: provider_unreachable``, no
+    ``x-should-retry: false``. Nothing was sent, so it is "unsent" to
+    ``classify_error_answer``. The proxy already retried the provider once,
+    so the proxy client doesn't retry it, but it does count it against the
+    circuit: when the proxy's own egress is broken every call gets this
+    answer after the proxy's two connect attempts (about 20 s at a 10 s
+    connect timeout), and an open circuit is what stops each call paying
+    that before going direct. The wrapper calls the provider directly when
+    fail-open is on. ``provider_connection_lost`` and ``provider_timeout`` may have run, carry
     ``x-should-retry: false``, and never match.
     """
     if status != 502:
         return False
+    origin = (headers.get(ERROR_ORIGIN_HEADER) or "").strip().lower()
     kind = (headers.get(UPSTREAM_ERROR_HEADER) or "").strip().lower()
     should_retry = (headers.get(SHOULD_RETRY_HEADER) or "").strip().lower()
-    return kind == "provider_unreachable" and should_retry != "false"
+    return origin == "provider" and kind == "provider_unreachable" and should_retry != "false"
 
 
 def _gateway_could_not_connect(body: Any) -> bool:

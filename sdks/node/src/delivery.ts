@@ -130,11 +130,14 @@ export function fetchErrorSentNothing(err: unknown): boolean {
  * front of it). `body` is the parsed error body when the caller read it.
  *
  * In order:
- *   0. The proxy's 502 `x-tc-upstream-error: provider_unreachable` without
- *      `x-should-retry: false` (isProviderUnreachable): the proxy could not
+ *   0. The proxy's 502 `x-tc-upstream-error: provider_unreachable`, marked
+ *      origin `provider`, without `x-should-retry: false`
+ *      (isProviderUnreachable): the proxy could not
  *      connect to the provider (connect, DNS or TLS, after its own one
  *      retry), so nothing of the call left it and nothing was billed. The
- *      proxy marks it origin `provider`, so it has to come before rule 1.
+ *      origin is `provider`, so it has to come before rule 1. The same
+ *      header with another origin or none is not the proxy's answer as
+ *      unanswered-send.ts writes it, and stays "maybe_sent".
  *      A routed call's answer carries `x-should-retry: false` (an earlier
  *      route may have run) and stays "maybe_sent".
  *   1. origin `provider`: the provider's answer. Never resent: it would
@@ -174,19 +177,24 @@ export function classifyErrorAnswer(status: number, headers: Headers, body: unkn
 }
 
 /**
- * The proxy's 502 for a provider it could not connect to, with nothing sent
- * and no `x-should-retry: false`. "unsent" to classifyErrorAnswer, but not
- * an outage of TensorCost: the proxy is healthy and already retried the
- * provider once, so the proxy client neither retries it nor counts it
- * against the circuit, and the wrapper calls the provider directly when
- * fail-open is on. `provider_connection_lost` and `provider_timeout` may
- * have run, carry `x-should-retry: false`, and never match.
+ * The proxy's 502 for a provider it could not connect to: origin
+ * `provider`, `x-tc-upstream-error: provider_unreachable`, no
+ * `x-should-retry: false`. Nothing was sent, so it is "unsent" to
+ * classifyErrorAnswer. The proxy already retried the provider once, so the
+ * proxy client doesn't retry it, but it does count it against the circuit:
+ * when the proxy's own egress is broken every call gets this answer after
+ * the proxy's two connect attempts (about 20 s at a 10 s connect timeout),
+ * and an open circuit is what stops each call paying that before going
+ * direct. The wrapper calls the provider directly when fail-open is on.
+ * `provider_connection_lost` and `provider_timeout` may have run, carry
+ * `x-should-retry: false`, and never match.
  */
 export function isProviderUnreachable(status: number, headers: Headers): boolean {
   if (status !== 502) return false;
+  const origin = headers.get(ERROR_ORIGIN_HEADER)?.trim().toLowerCase();
   const kind = headers.get(UPSTREAM_ERROR_HEADER)?.trim().toLowerCase();
   const shouldRetry = headers.get(SHOULD_RETRY_HEADER)?.trim().toLowerCase();
-  return kind === "provider_unreachable" && shouldRetry !== "false";
+  return origin === "provider" && kind === "provider_unreachable" && shouldRetry !== "false";
 }
 
 /** The gateway's 502 body for a connect failure to the proxy. */

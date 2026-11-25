@@ -12,8 +12,10 @@ provider_timeout          504, x-should-retry: false. May have run.
 All three carry ``x-tc-error-origin: provider``. Through 1.8.1 the SDK raised
 all three as the provider's error and never fell open. The first is proven
 unsent, so going to the provider directly is safe: 1.8.2 does, when fail-open
-is on, without retrying through the proxy or counting a circuit failure (the
-proxy is healthy).
+is on, without retrying through the proxy. It still counts against the
+circuit: a proxy whose egress is broken answers every call this way, and an
+open circuit is what stops each call waiting out the proxy's connect attempts
+first.
 """
 
 from __future__ import annotations
@@ -58,12 +60,17 @@ def _unanswered(kind: str, **extra: str) -> httpx.Response:
 # --- the classifier ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("origin", ["provider", "proxy", None])
-def test_502_provider_unreachable_without_should_retry_is_unsent_whatever_the_origin(origin):
+def test_502_provider_unreachable_origin_provider_without_should_retry_is_unsent():
+    headers = httpx.Headers({"x-tc-error-origin": "provider", "x-tc-upstream-error": "provider_unreachable"})
+    assert classify_error_answer(502, headers, None) == "unsent"
+
+
+@pytest.mark.parametrize("origin", ["proxy", "gateway", None])
+def test_502_provider_unreachable_with_another_origin_or_none_is_maybe_sent_as_before(origin):
     headers = httpx.Headers({"x-tc-upstream-error": "provider_unreachable"})
     if origin:
         headers["x-tc-error-origin"] = origin
-    assert classify_error_answer(502, headers, None) == "unsent"
+    assert classify_error_answer(502, headers, None) == "maybe_sent"
 
 
 def test_should_retry_false_still_wins_over_provider_unreachable():
@@ -125,8 +132,8 @@ SENDS = [pytest.param(proxy_request, id="proxy_request"), pytest.param(proxy_req
 
 
 @pytest.mark.parametrize("send", SENDS)
-def test_provider_unreachable_is_one_attempt_no_circuit_failure_and_may_fall_back(send, no_sleep):
-    circuit = CircuitBreaker(CircuitBreakerConfig(open_threshold=1))
+def test_provider_unreachable_is_one_attempt_one_circuit_failure_and_may_fall_back(send, no_sleep):
+    circuit = CircuitBreaker(CircuitBreakerConfig(open_threshold=3))
     events: list = []
     err, hits = _send(send, lambda: _unanswered("provider_unreachable"), circuit, events)
 
@@ -135,7 +142,7 @@ def test_provider_unreachable_is_one_attempt_no_circuit_failure_and_may_fall_bac
     assert err.may_have_reached_provider is False
     assert should_fall_back_to_provider(err)
     assert hits == 1 and no_sleep == []
-    assert circuit.failures == 0 and circuit.state == "CLOSED"
+    assert circuit.failures == 1 and circuit.state == "CLOSED"
     assert [e for e in events if e.kind == "on_retry"] == []
     errors = [e for e in events if e.kind == "on_error"]
     assert len(errors) == 1
@@ -155,6 +162,16 @@ def test_connection_lost_and_timeout_are_as_in_1_8_1_never_retried_never_a_fallb
     assert not should_fall_back_to_provider(err)
     assert hits == 1 and no_sleep == []
     assert circuit.failures == 0
+
+
+@pytest.mark.parametrize("send", SENDS)
+def test_provider_unreachable_marked_origin_proxy_may_have_been_sent_as_before(send, no_sleep):
+    err, hits = _send(
+        send, lambda: _unanswered("provider_unreachable", x_tc_error_origin="proxy"), CircuitBreaker(), []
+    )
+    assert err.may_have_reached_provider is True
+    assert not should_fall_back_to_provider(err)
+    assert hits == 1
 
 
 @pytest.mark.parametrize("send", SENDS)
@@ -200,21 +217,31 @@ def _install(monkeypatch, recording_transport, kind: str, **kw: Any):
     return types.SimpleNamespace(client=client, direct=direct, circuit=circuit, events=events, hits=hits)
 
 
-def test_fail_open_on_one_proxy_request_then_the_provider_and_the_circuit_counts_nothing(
+def test_fail_open_on_one_proxy_request_then_the_provider(recording_transport, monkeypatch, no_sleep):
+    w = _install(monkeypatch, recording_transport, "provider_unreachable")
+    w.client.chat.completions.create(model="gpt-4o-mini", messages=MSGS)
+    assert w.hits["n"] == 1 and w.direct.call_count == 1
+    assert no_sleep == []
+    assert w.circuit.failures == 1 and w.circuit.state == "CLOSED"
+    fallbacks = [e for e in w.events if e.kind == "on_fallback"]
+    assert len(fallbacks) == 1 and fallbacks[0].reason == "proxy_unavailable"
+
+
+def test_three_in_a_row_open_the_circuit_and_the_next_call_goes_direct_without_the_proxy(
     recording_transport, monkeypatch, no_sleep
 ):
     w = _install(monkeypatch, recording_transport, "provider_unreachable")
-    # Four calls, more than the three failures that open the circuit: each
-    # still goes through the proxy first, once, then direct.
-    for i in range(1, 5):
+    # The shipped open_threshold is 3: each call is one proxy request, then direct.
+    for i in range(1, 4):
         w.client.chat.completions.create(model="gpt-4o-mini", messages=MSGS)
-        assert w.hits["n"] == i
-        assert w.direct.call_count == i
-    assert w.circuit.failures == 0 and w.circuit.state == "CLOSED"
+        assert w.hits["n"] == i and w.direct.call_count == i
+    assert w.circuit.state == "OPEN"
     assert no_sleep == []
-    fallbacks = [e for e in w.events if e.kind == "on_fallback"]
-    assert len(fallbacks) == 4
-    assert all(e.consecutive_failures == 0 for e in fallbacks)
+
+    # Inside the probe window: straight to the provider, no proxy request.
+    w.client.chat.completions.create(model="gpt-4o-mini", messages=MSGS)
+    assert w.hits["n"] == 3 and w.direct.call_count == 4
+    assert [e.reason for e in w.events if e.kind == "on_fallback"][-1] == "circuit_open"
 
 
 def test_fail_open_off_raises_the_proxy_error_unsent_and_never_calls_the_provider(

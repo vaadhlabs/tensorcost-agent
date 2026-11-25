@@ -23,8 +23,8 @@ network error was retried five times and then fell back, so one call the
 provider had already billed could run six times.
 
 Since 1.8.2 the proxy's 502 ``x-tc-upstream-error: provider_unreachable`` (it
-couldn't connect to the provider, nothing was sent) is neither retried nor a
-circuit failure, and raises with ``may_have_reached_provider`` false so
+couldn't connect to the provider, nothing was sent) is not retried, counts as
+a circuit failure, and raises with ``may_have_reached_provider`` false so
 fail-open goes direct.
 
 How a non-2xx response is classified (unchanged split from 1.4.0, plus the
@@ -585,10 +585,13 @@ def proxy_request(
         if unsent and is_provider_unreachable(resp.status_code, resp.headers):
             # The proxy couldn't connect to the provider and nothing was sent
             # (_delivery.is_provider_unreachable). Not retried through the
-            # proxy, which already retried the provider once, and not a
-            # circuit failure: the proxy is fine. Raised as unsent so the
-            # wrapper can go direct.
+            # proxy, which already retried the provider once. A circuit
+            # failure, so a proxy whose egress is broken gets bypassed instead
+            # of costing every call its connect timeouts. Raised as unsent so
+            # the wrapper can go direct.
             tc_err = _provider_unreachable_error(resp, request_id, attempt + 1)
+            if circuit is not None:
+                circuit.record_failure()
             emit_event(
                 on_lifecycle_event,
                 OnErrorEvent(
@@ -1002,8 +1005,11 @@ def proxy_request_stream(
             if answer == "provider":
                 raise _provider_answer_error(resp, error_body, request_id, 1)
             if answer == "unsent" and is_provider_unreachable(resp.status_code, resp.headers):
-                # See proxy_request: unreachable provider, nothing sent, proxy healthy.
+                # See proxy_request: unreachable provider, nothing sent, not
+                # retried, a circuit failure.
                 tc_err = _provider_unreachable_error(resp, request_id, 1)
+                if circuit is not None:
+                    circuit.record_failure()
                 emit_event(
                     on_lifecycle_event,
                     OnErrorEvent(
