@@ -79,8 +79,29 @@ def wrap(
     on_lifecycle_event: Optional[LifecycleEventCallback] = None,
     fail_open_enabled: bool = True,
     provider_api_key: Optional[str] = None,
+    max_buffered_observations: Optional[int] = None,
+    max_buffered_bytes: Optional[int] = None,
+    flush_on_exit: Optional[bool] = None,
+    spool_dir: Optional[str] = None,
+    spool_max_bytes: Optional[int] = None,
 ) -> T:
-    """Wrap an OpenAI, Anthropic, Bedrock-runtime, or Vertex AI client."""
+    """Wrap an OpenAI, Anthropic, Bedrock-runtime, or Vertex AI client.
+
+    Observation delivery (shared by every wrap() with the same base_url,
+    tenant_id and api_key; the first to create the transport decides):
+
+    * ``max_buffered_observations`` / ``max_buffered_bytes``: how many
+      failed observations wait in memory to be retried (default 10 000 /
+      32 MiB). Past that the oldest is dropped, or spooled, and counted in
+      ``observation_stats().dropped``. Each is retried for up to an hour.
+    * ``flush_on_exit``: drain for up to 2 s at interpreter exit (default
+      True; ``TENSORCOST_FLUSH_ON_EXIT=0`` turns it off). Serverless
+      functions are frozen rather than exited: call ``flush_observations()``.
+    * ``spool_dir`` / ``spool_max_bytes``: opt-in disk spool (falls back to
+      ``TENSORCOST_SPOOL_DIR``; 64 MiB cap). Observations that would be
+      dropped, or are still undelivered at exit, are written there as JSONL
+      and replayed on the next start.
+    """
     config = resolve_config(
         api_key=api_key,
         base_url=base_url,
@@ -105,6 +126,11 @@ def wrap(
         on_lifecycle_event=on_lifecycle_event,
         fail_open_enabled=fail_open_enabled,
         provider_api_key=provider_api_key,
+        max_buffered_observations=max_buffered_observations,
+        max_buffered_bytes=max_buffered_bytes,
+        flush_on_exit=flush_on_exit,
+        spool_dir=spool_dir,
+        spool_max_bytes=spool_max_bytes,
     )
 
     if config.max_layer == "off":

@@ -29,6 +29,7 @@ from typing import Any, Optional
 import httpx
 
 from ._errors import (
+    format_seconds,
     TensorCostError,
     TensorCostGatewayRejectedError,
     TensorCostKeyRejectedError,
@@ -138,7 +139,7 @@ def admit_call(
             resp = client.post(url, headers=headers, json=metadata)
         except httpx.TimeoutException as exc:
             raise TensorCostTimeoutError(
-                f"tensorcost: admit timed out after {timeout_s}s", "total", root_cause=exc
+                f"tensorcost: admit timed out after {format_seconds(timeout_s)}", "total", root_cause=exc
             ) from exc
         except (httpx.TransportError, OSError) as exc:
             raise TensorCostNetworkError(

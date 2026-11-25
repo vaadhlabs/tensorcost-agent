@@ -80,6 +80,8 @@ Arguments passed to `wrap()` win over environment variables, which win over defa
 | `TENSORCOST_AGENT_ID` / `TENSORCOST_WORKFLOW_ID` | Default agent and run | No |
 | `TENSORCOST_AUTO_WORKFLOW_ID` | Set to `1` to give each wrapped client with an agent a fresh run id | No |
 | `TENSORCOST_CUSTOMER` / `TENSORCOST_FEATURE` | Default customer and feature, for chargeback | No |
+| `TENSORCOST_FLUSH_ON_EXIT` | Set to `0` to skip the drain at interpreter exit | No |
+| `TENSORCOST_SPOOL_DIR` | Directory for the disk spool (off when unset) | No |
 
 ```python
 client = wrap(
@@ -152,7 +154,7 @@ A failure after the call may have reached the provider is never sent again, thro
 
 - **Retries.** Only calls that provably never reached the provider are retried, with jittered backoff, honouring `Retry-After` on a 429.
 - **Timeouts.** The check before a call is capped at 500 ms. Through the proxy, a call waits up to `timeout_s` (60 s).
-- **Circuit breaker.** After three proxy failures in a row, calls go straight to the provider. Every 5 s one call probes the proxy, and once probes succeed calls go through it again.
+- **Circuit breaker.** After three proxy failures in a row, calls go straight to the provider. Every 5 s one call probes the proxy with a single attempt, never retried: if it fails, that call goes to the provider at once and the circuit stays open for another 5 s. Once probes succeed calls go through the proxy again. A call never retries through a circuit that opened while it was running.
 - **Streaming.** At `steer` and `route`, `stream=True` calls go straight to the provider (with `fail_open_enabled=False` they raise `MissingConfigError` instead).
 
 ```python
@@ -171,6 +173,25 @@ client = wrap(
 Where calls must never go around TensorCost (a proxy inside your VPC, say), set `fail_open_enabled=False` and proxy failures raise instead.
 
 Warnings go to the `tensorcost` logger.
+
+### Observation delivery
+
+Observations are sent from background threads and never slow your call down. One that fails to send (a network error, a timeout, a 5xx, a 408 or a 429) waits in memory and is retried with backoff: 1 s, doubling to 60 s, with jitter, and `Retry-After` honoured on a 429. While TensorCost is unreachable only one request at a time probes it. Each retry resends the same body with the same `correlation_id`, and ingestion dedupes on it, so nothing is counted twice. A 4xx other than 408 and 429 (a 400, 401, 403 or 422, say) is not retried, since the same body would get the same answer: it is counted in `observation_stats().rejected` and logged once, then at most once a minute. An observation is given up on after an hour. When delivery recovers after an outage the SDK logs it once, and `observation_stats().delivered_after_retry` counts what was held back and then delivered.
+
+Up to `max_buffered_observations` (10 000) or `max_buffered_bytes` (32 MiB) wait at once. Past that the oldest goes, with at most one warning a minute, and `observation_stats().dropped` counts it.
+
+At interpreter exit an `atexit` hook spends up to 2 s sending what is queued. `atexit` runs on a normal exit and under servers that turn SIGTERM into a clean shutdown (gunicorn, uvicorn); a bare SIGTERM or SIGKILL skips it. Set `flush_on_exit=False` to turn the hook off.
+
+With `spool_dir` set, observations that would otherwise be lost (the buffer was full, or they were still undelivered at exit) are written there as JSONL and sent on the next start. The directory is capped at `spool_max_bytes` (64 MiB) by deleting the oldest files. Processes can share one directory, and the format is the same as the Node SDK's.
+
+```python
+from tensorcost import observation_stats, wrap
+
+client = wrap(OpenAI(), spool_dir="/var/lib/myapp/tensorcost")
+# later, from a health check
+stats = observation_stats()
+print(stats.buffered, stats.dropped, stats.spooled)
+```
 
 ## Errors
 
@@ -200,7 +221,7 @@ A provider's own error (a bad request, say) reaches you as the provider SDK's er
 
 ## Serverless
 
-`prewarm()` at import time fetches the token and the console's layer before the first request arrives, so the first call doesn't wait for them. Before a Lambda handler returns, `flush_observations()` sends anything still queued.
+`prewarm()` at import time fetches the token and the console's layer before the first request arrives, so the first call doesn't wait for them. A Lambda is frozen between invocations rather than exited, so the `atexit` drain never runs there: before the handler returns, call `flush_observations()`, which sends anything queued or waiting to retry. If TensorCost is unreachable it gives up after one attempt instead of using the whole timeout, and what is left goes out on a later invocation. It returns how many observations are still waiting (0 when everything landed).
 
 ```python
 from tensorcost import flush_observations, prewarm, wrap

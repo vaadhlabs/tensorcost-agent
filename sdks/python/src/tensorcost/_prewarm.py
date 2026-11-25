@@ -6,7 +6,8 @@ from typing import Optional
 
 from ._config import resolve_config
 from ._layer import ControlLayer
-from ._runtime import get_shared_runtime
+from ._runtime import get_shared_runtime, shared_transports
+from ._transport import TransportStats
 
 
 def prewarm(
@@ -53,8 +54,12 @@ def flush_observations(
     tenant_id: Optional[str] = None,
     max_layer: Optional[ControlLayer] = None,
     timeout_s: float = 5.0,
-) -> None:
-    """Best-effort drain of queued observations before Lambda freeze."""
+) -> int:
+    """Best-effort drain before a Lambda freeze: sends what is queued and
+    what is waiting to retry. If TensorCost is still unreachable it returns
+    after one attempt rather than waiting out the timeout; the rest stays
+    buffered and keeps retrying. Returns how many observations are still
+    undelivered (0 when everything landed)."""
     config = resolve_config(
         api_key=api_key,
         base_url=base_url,
@@ -62,6 +67,22 @@ def flush_observations(
         max_layer=max_layer,
     )
     if config.max_layer == "off":
-        return
+        return 0
     transport, _ = get_shared_runtime(config)
-    transport.flush(timeout_s=timeout_s)
+    return transport.flush(timeout_s=timeout_s)
+
+
+def observation_stats() -> TransportStats:
+    """Delivery counters summed over every transport wrap() has created in
+    this process: in flight, waiting in memory, written to the disk spool,
+    and lost for good (``dropped``)."""
+    totals = [t.stats() for t in shared_transports()]
+    return TransportStats(
+        in_flight=sum(s.in_flight for s in totals),
+        buffered=sum(s.buffered for s in totals),
+        buffered_bytes=sum(s.buffered_bytes for s in totals),
+        dropped=sum(s.dropped for s in totals),
+        spooled=sum(s.spooled for s in totals),
+        delivered_after_retry=sum(s.delivered_after_retry for s in totals),
+        rejected=sum(s.rejected for s in totals),
+    )

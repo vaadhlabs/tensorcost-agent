@@ -33,6 +33,8 @@
  *     network error was retried five times and then fell back, so one call
  *     the provider had already billed could run six times.
  *   - Respects Retry-After on 429. Stops at maxAttempts, with backoff.
+ *   - Never retries the circuit's half-open probe, or once the circuit has
+ *     opened during the call: those fail over to the provider at once.
  *   - Never retries a TensorCost refusal, whatever its status.
  *
  * How a non-2xx response is classified (unchanged split from 1.4.0, plus
@@ -189,6 +191,26 @@ async function readJsonWithDeadline(
 }
 
 /**
+ * Whether a failed attempt that never reached the provider may be followed
+ * by another. Never for the half-open probe: it is one attempt, and when it
+ * fails the call falls back to the provider at once and the circuit stays
+ * open for the next probe window. Never once failures have opened the
+ * circuit mid-call either, since every attempt after that is a wait on a
+ * proxy the breaker has already given up on. Through 1.8.0 a probe retried
+ * up to maxAttempts times through a dead proxy (5-7.6 s per call) before
+ * falling back.
+ */
+function mayRetry(
+  attempt: number,
+  config: RetryConfig,
+  circuit: CircuitBreaker,
+  probe: boolean,
+): boolean {
+  if (probe || circuit.currentState !== "CLOSED") return false;
+  return attempt + 1 < config.maxAttempts;
+}
+
+/**
  * Execute a single proxied request with retries, timeouts, telemetry,
  * and circuit-breaker integration.
  *
@@ -211,6 +233,8 @@ export async function proxyRequest(
     : Math.min(headersTimeoutMs, timeoutMs);
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const callStart = Date.now();
+  // The circuit was not CLOSED as this call began: it is the half-open probe.
+  const probe = opts.circuit.currentState !== "CLOSED";
 
   // Circuit bypass is decided in the provider wrapper (shouldProbe / shouldBypass).
   // Do not re-check here — the single-flight probe runs while HALF_OPEN +
@@ -336,7 +360,7 @@ export async function proxyRequest(
       lastError = tcErr;
       opts.circuit.recordFailure();
 
-      if (sentNothing && !opts.failOpenFast && attempt + 1 < retryConfig.maxAttempts) {
+      if (sentNothing && !opts.failOpenFast && mayRetry(attempt, retryConfig, opts.circuit, probe)) {
         const delay = computeDelay(attempt, retryConfig);
         emitEvent(opts.onLifecycleEvent, {
           kind: "on_retry",
@@ -479,7 +503,7 @@ export async function proxyRequest(
       lastError = tcErr;
       // Don't count quota errors against the circuit (the proxy is healthy).
 
-      if (answer === "unsent" && attempt + 1 < retryConfig.maxAttempts) {
+      if (answer === "unsent" && mayRetry(attempt, retryConfig, opts.circuit, probe)) {
         const delay = computeDelay(attempt, retryConfig, raMs);
         emitEvent(opts.onLifecycleEvent, {
           kind: "on_retry",
@@ -525,7 +549,7 @@ export async function proxyRequest(
       lastError = tcErr;
       opts.circuit.recordFailure();
 
-      if (answer === "unsent" && attempt + 1 < retryConfig.maxAttempts) {
+      if (answer === "unsent" && mayRetry(attempt, retryConfig, opts.circuit, probe)) {
         const delay = computeDelay(attempt, retryConfig);
         emitEvent(opts.onLifecycleEvent, {
           kind: "on_retry",
@@ -791,6 +815,8 @@ export async function proxyRequestStream(
   const idleTimeoutMs = opts.idleTimeoutMs ?? 30_000;
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const callStart = Date.now();
+  // The circuit was not CLOSED as this call began: it is the half-open probe.
+  const probe = opts.circuit.currentState !== "CLOSED";
 
   const path =
     proxyPathForOperation(opts.operation) ??
@@ -871,7 +897,7 @@ export async function proxyRequestStream(
       );
       lastError = tcErr;
       opts.circuit.recordFailure();
-      if (sentNothing && !opts.failOpenFast && attempt + 1 < retryConfig.maxAttempts) {
+      if (sentNothing && !opts.failOpenFast && mayRetry(attempt, retryConfig, opts.circuit, probe)) {
         await sleep(computeDelay(attempt, retryConfig));
         continue;
       }
@@ -958,7 +984,7 @@ export async function proxyRequestStream(
     }
     if (resp.status === 429) {
       const raMs = retryAfterMs(resp);
-      if (unsent && attempt + 1 < retryConfig.maxAttempts) {
+      if (unsent && mayRetry(attempt, retryConfig, opts.circuit, probe)) {
         await sleep(computeDelay(attempt, retryConfig, raMs));
         continue;
       }
@@ -971,7 +997,7 @@ export async function proxyRequestStream(
     if (resp.status >= 500) {
       // See proxyRequest: a 5xx not proven pre-forward is surfaced, never resent.
       opts.circuit.recordFailure();
-      if (unsent && attempt + 1 < retryConfig.maxAttempts) {
+      if (unsent && mayRetry(attempt, retryConfig, opts.circuit, probe)) {
         await sleep(computeDelay(attempt, retryConfig));
         continue;
       }

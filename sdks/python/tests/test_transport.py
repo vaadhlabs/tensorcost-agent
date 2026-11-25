@@ -37,13 +37,7 @@ def _build_transport(handler, **kwargs) -> ObservationTransport:
 
 
 def _drain(transport: ObservationTransport, timeout_s: float = 2.0) -> None:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        with transport._pending_lock:
-            pending = [f for f in transport._pending if not f.done()]
-        if not pending:
-            return
-        time.sleep(0.01)
+    transport.flush(timeout_s=timeout_s)
 
 
 def test_post_hits_observation_url_with_bearer_token():

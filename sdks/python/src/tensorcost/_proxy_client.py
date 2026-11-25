@@ -53,6 +53,7 @@ import httpx
 from ._circuit import CircuitBreaker
 from ._delivery import classify_error_answer, send_error_sent_nothing
 from ._errors import (
+    format_seconds,
     TensorCostError,
     TensorCostGatewayRejectedError,
     TensorCostKeyRejectedError,
@@ -155,11 +156,11 @@ def _post_with_headers_timeout(
             else "total"
         )
         if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
-            message = f"tensorcost: could not connect to the proxy within {connect_budget:g}s"
+            message = f"tensorcost: could not connect to the proxy within {format_seconds(connect_budget)}"
         elif kind == "headers":
-            message = f"tensorcost: proxy did not respond with headers within {short_headers_timeout_s:.0f}s"
+            message = f"tensorcost: proxy did not respond with headers within {format_seconds(short_headers_timeout_s)}"
         else:
-            message = f"tensorcost: proxy request timed out after {body_timeout_s:.0f}s"
+            message = f"tensorcost: proxy request timed out after {format_seconds(body_timeout_s)}"
         # Only a connect or pool timeout comes before the request is written.
         # A read or write timeout may follow a forward the provider is
         # running right now, so it must never be sent again.
@@ -172,6 +173,28 @@ def _post_with_headers_timeout(
             ),
             not send_error_sent_nothing(exc),
         ) from exc
+
+
+def _may_retry(
+    attempt: int,
+    retry: RetryConfig,
+    circuit: Optional[CircuitBreaker],
+    probe: bool,
+) -> bool:
+    """Whether a failed attempt that never reached the provider may be
+    followed by another.
+
+    Never for the half-open probe: it is one attempt, and when it fails the
+    call falls back to the provider at once and the circuit stays open for
+    the next probe window. Never once failures have opened the circuit
+    mid-call either, since every attempt after that is a wait on a proxy the
+    breaker has already given up on. Through 1.8.0 a probe retried up to
+    max_attempts times through a dead proxy (5-7.6 s per call) before
+    falling back.
+    """
+    if probe or (circuit is not None and circuit.state != "CLOSED"):
+        return False
+    return attempt + 1 < retry.max_attempts
 
 
 def proxy_request(
@@ -212,6 +235,8 @@ def proxy_request(
     response is appended to ``response_sink`` when one is given.
     """
     call_start = time.monotonic()
+    # The circuit was not CLOSED as this call began: it is the half-open probe.
+    probe = circuit is not None and circuit.state != "CLOSED"
 
     # Circuit bypass is decided in the provider wrapper — do not re-check here.
 
@@ -308,7 +333,7 @@ def proxy_request(
                 )
                 raise exc
             last_error = exc
-            if not fail_open_fast and attempt + 1 < retry.max_attempts:
+            if not fail_open_fast and _may_retry(attempt, retry, circuit, probe):
                 delay = compute_delay(attempt, retry)
                 emit_event(
                     on_lifecycle_event,
@@ -346,7 +371,7 @@ def proxy_request(
             sent_nothing = send_error_sent_nothing(exc)
             tc_err = _mark(
                 TensorCostTimeoutError(
-                    f"tensorcost: proxy request timed out after {timeout_s:.0f}s",
+                    f"tensorcost: proxy request timed out after {format_seconds(timeout_s)}",
                     "total",
                     root_cause=exc,
                     attempt=attempt + 1,
@@ -356,7 +381,7 @@ def proxy_request(
             last_error = tc_err
             if circuit is not None:
                 circuit.record_failure()
-            if sent_nothing and not fail_open_fast and attempt + 1 < retry.max_attempts:
+            if sent_nothing and not fail_open_fast and _may_retry(attempt, retry, circuit, probe):
                 delay = compute_delay(attempt, retry)
                 emit_event(
                     on_lifecycle_event,
@@ -407,7 +432,7 @@ def proxy_request(
             last_error = tc_err
             if circuit is not None:
                 circuit.record_failure()
-            if sent_nothing and not fail_open_fast and attempt + 1 < retry.max_attempts:
+            if sent_nothing and not fail_open_fast and _may_retry(attempt, retry, circuit, probe):
                 delay = compute_delay(attempt, retry)
                 emit_event(
                     on_lifecycle_event,
@@ -598,7 +623,7 @@ def proxy_request(
                 not unsent,
             )
             last_error = tc_err
-            if unsent and attempt + 1 < retry.max_attempts:
+            if unsent and _may_retry(attempt, retry, circuit, probe):
                 delay = compute_delay(attempt, retry, ra_ms)
                 emit_event(
                     on_lifecycle_event,
@@ -652,7 +677,7 @@ def proxy_request(
             last_error = tc_err
             if circuit is not None:
                 circuit.record_failure()
-            if unsent and attempt + 1 < retry.max_attempts:
+            if unsent and _may_retry(attempt, retry, circuit, probe):
                 delay = compute_delay(attempt, retry)
                 emit_event(
                     on_lifecycle_event,
@@ -875,7 +900,7 @@ def proxy_request_stream(
             circuit.record_failure()
         raise _mark(
             TensorCostTimeoutError(
-                f"tensorcost: proxy did not respond with headers within {headers_timeout_s:.0f}s",
+                f"tensorcost: proxy did not respond with headers within {format_seconds(headers_timeout_s)}",
                 "headers",
                 root_cause=exc,
                 attempt=1,

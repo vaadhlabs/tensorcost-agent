@@ -81,6 +81,8 @@ Options passed to `wrap()` win over environment variables, which win over defaul
 | `TENSORCOST_CUSTOMER` / `TENSORCOST_FEATURE` | Default customer and feature, for chargeback | No |
 | `TENSORCOST_DEPLOYMENT` | Release or git SHA | No |
 | `TENSORCOST_PROMPT_TEMPLATE_ID` | Default prompt template | No |
+| `TENSORCOST_FLUSH_ON_EXIT` | Set to `0` to skip the drain at process exit | No |
+| `TENSORCOST_SPOOL_DIR` | Directory for the disk spool (off when unset) | No |
 
 ```ts
 const client = wrap(new OpenAI(), {
@@ -162,7 +164,7 @@ A failure after the call may have reached the provider is never sent again, thro
 
 - **Retries.** Only calls that provably never reached the provider are retried, with jittered backoff, honouring `Retry-After` on a 429.
 - **Timeouts.** The check before a call is capped at 500 ms. Through the proxy, a buffered call waits up to `timeoutMs` (60 s); a streamed one waits `headersTimeoutMs` (2 s) for the stream to start and ends after `idleTimeoutMs` (30 s) without data. With TensorCost unreachable, only the first calls of a process wait for the published layer (250 ms at most); the token exchange counts against the budget of whatever waits on it, and after it fails calls stop waiting on it for 5 s.
-- **Circuit breaker.** After three proxy failures in a row, calls go straight to the provider. Every 5 s one call probes the proxy, and once probes succeed calls go through it again. Transitions reach `onLifecycleEvent` as `on_circuit_state`; they are not sent to TensorCost.
+- **Circuit breaker.** After three proxy failures in a row, calls go straight to the provider. Every 5 s one call probes the proxy with a single attempt, never retried: if it fails, that call goes to the provider at once and the circuit stays open for another 5 s. Once probes succeed calls go through the proxy again. A call never retries through a circuit that opened while it was running. Transitions reach `onLifecycleEvent` as `on_circuit_state`; they are not sent to TensorCost.
 
 ```ts
 const client = wrap(new OpenAI(), {
@@ -175,6 +177,24 @@ const client = wrap(new OpenAI(), {
 ```
 
 Where calls must never go around TensorCost (a proxy inside your VPC, say), set `failOpenEnabled: false` and proxy failures surface as `TensorCostProxyError`.
+
+### Observation delivery
+
+Observations are sent in the background and never slow your call down. One that fails to send (a network error, a timeout, a 5xx, a 408 or a 429) waits in memory and is retried with backoff: 1 s, doubling to 60 s, with jitter, and `Retry-After` honoured on a 429. While TensorCost is unreachable only one request at a time probes it. Each retry resends the same body with the same `correlation_id`, and ingestion dedupes on it, so nothing is counted twice. A 4xx other than 408 and 429 (a 400, 401, 403 or 422, say) is not retried, since the same body would get the same answer: it is counted in `observationStats().rejected` and logged once, then at most once a minute. An observation is given up on after an hour. When delivery recovers after an outage the SDK logs it once, and `observationStats().deliveredAfterRetry` counts what was held back and then delivered.
+
+Up to `maxBufferedObservations` (10 000) or `maxBufferedBytes` (32 MiB) wait at once. Past that the oldest goes, with at most one warning a minute, and `observationStats().dropped` counts it.
+
+When the process exits normally, or gets SIGTERM, the SDK spends up to 2 s sending what is queued. It never calls `process.exit()`: if your app handles SIGTERM itself, the SDK only drains alongside your handler, and if nothing else handles it, the SDK re-sends SIGTERM once the drain is done, so the process still dies by the signal. Set `flushOnExit: false` to skip all of this.
+
+With `spoolDir` set, observations that would otherwise be lost (the buffer was full, or they were still undelivered at exit) are written there as JSONL and sent on the next start. The directory is capped at `spoolMaxBytes` (64 MiB) by deleting the oldest files. Processes can share one directory.
+
+```ts
+import { observationStats, wrap } from "@tensorcost/sdk";
+
+const client = wrap(new OpenAI(), { spoolDir: "/var/lib/myapp/tensorcost" });
+// later, from a health check
+const { buffered, dropped, spooled } = observationStats();
+```
 
 ## Errors
 
@@ -207,7 +227,7 @@ A provider's own error (a bad request, say) reaches you as the provider SDK's er
 
 ## Serverless
 
-`prewarm()` at module scope fetches the token and the console's layer before the first request arrives, so the first call doesn't wait for them. Before a Lambda handler returns, `flushObservations()` sends anything still queued.
+`prewarm()` at module scope fetches the token and the console's layer before the first request arrives, so the first call doesn't wait for them. A Lambda is frozen between invocations rather than exited, so the exit drain never runs there: before the handler returns, call `flushObservations()`, which sends anything queued or waiting to retry. If TensorCost is unreachable it gives up after one attempt instead of using the whole timeout, and what is left goes out on a later invocation. It returns how many observations are still waiting (0 when everything landed).
 
 ```ts
 import { flushObservations, prewarm, wrap } from "@tensorcost/sdk";

@@ -546,3 +546,10 @@ class TensorCostComplianceTeamMismatchError(TensorCostRefusedError):
     """Client team_id does not match token-bound team scope."""
 
     _default_code = "COMPLIANCE_TEAM_MISMATCH"
+
+
+def format_seconds(seconds: float) -> str:
+    """A timeout for a message: ``0.4s``, ``2s``, ``250ms`` for under 0.1 s."""
+    if seconds < 0.1:
+        return f"{seconds * 1000:.0f}ms"
+    return f"{seconds:.3g}s" if seconds < 100 else f"{seconds:.0f}s"
