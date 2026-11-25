@@ -18,6 +18,22 @@ def _runtime_key(config: ResolvedConfig) -> str:
     )
 
 
+def new_transport(config: ResolvedConfig) -> ObservationTransport:
+    """The observation transport for a resolved config."""
+    return ObservationTransport(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        tenant_id=config.tenant_id,
+        team_id=config.team_id,
+        fail_open=config.fail_open,
+        max_buffered_observations=config.max_buffered_observations,
+        max_buffered_bytes=config.max_buffered_bytes,
+        flush_on_exit=config.flush_on_exit,
+        spool_dir=config.spool_dir,
+        spool_max_bytes=config.spool_max_bytes,
+    )
+
+
 def get_shared_runtime(
     config: ResolvedConfig,
 ) -> tuple[ObservationTransport, SdkLayerClient]:
@@ -26,13 +42,7 @@ def get_shared_runtime(
     if existing is not None:
         return existing
 
-    transport = ObservationTransport(
-        base_url=config.base_url,
-        api_key=config.api_key,
-        tenant_id=config.tenant_id,
-        team_id=config.team_id,
-        fail_open=config.fail_open,
-    )
+    transport = new_transport(config)
     sdk_layer = SdkLayerClient(
         base_url=config.base_url,
         get_token=transport.get_token,
@@ -60,3 +70,8 @@ def warmup_shared_runtime(config: ResolvedConfig) -> None:
             pass
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+def shared_transports() -> list[ObservationTransport]:
+    """Every shared transport, for process-wide stats."""
+    return [t for t, _ in list(_runtimes.values())]

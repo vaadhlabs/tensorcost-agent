@@ -262,11 +262,42 @@ export interface WrapOptions {
   proxyUrl?: string;
 
   // -------------------------------------------------------------------------
+  // Observation delivery. These belong to the transport shared by every
+  // wrap() with the same baseUrl, tenantId and apiKey; the first one to
+  // create it decides.
+
+  /**
+   * Observations that failed to send (network error, timeout, 408, 429,
+   * 5xx) wait in memory and are retried with backoff for up to an hour.
+   * Cap on how many wait; past it the oldest is dropped (or spooled) and
+   * counted in `observationStats().dropped`. Default 10 000.
+   */
+  maxBufferedObservations?: number;
+  /** The same cap by approximate serialised size. Default 32 MiB. */
+  maxBufferedBytes?: number;
+  /**
+   * Drain queued and retrying observations for up to 2 s when the process
+   * exits normally (`beforeExit`) or gets SIGTERM. Default true;
+   * `TENSORCOST_FLUSH_ON_EXIT=0` also turns it off. Serverless functions
+   * are frozen rather than exited, so call `flushObservations()` there.
+   */
+  flushOnExit?: boolean;
+  /**
+   * Opt-in disk spool. Observations that would otherwise be dropped (buffer
+   * full, or still undelivered at exit) are appended here as JSONL and
+   * replayed on the next start. Falls back to `TENSORCOST_SPOOL_DIR`.
+   */
+  spoolDir?: string;
+  /** Size cap for the spool directory; the oldest segments go first. Default 64 MiB. */
+  spoolMaxBytes?: number;
+
+  // -------------------------------------------------------------------------
   // Hardening options (applied-mode only; all optional)
 
   /**
    * Retry configuration. Applies to applied-mode proxy requests only.
-   * Observe-only telemetry posts do not retry (they are fire-and-forget).
+   * Observation posts have their own retry buffer (see
+   * `maxBufferedObservations`) and do not use this.
    *
    * Defaults: maxAttempts=5, baseDelayMs=500, maxDelayMs=30 000.
    * Set `maxAttempts: 1` to disable retries entirely.
@@ -486,4 +517,11 @@ export interface ResolvedConfig {
   feature: string | null;
   /** Resolved code-side data grant ceiling. Empty = no ceiling. */
   maxGrants: DataGrant[];
+
+  // Observation delivery — see WrapOptions.
+  maxBufferedObservations: number | undefined;
+  maxBufferedBytes: number | undefined;
+  flushOnExit: boolean;
+  spoolDir: string | null;
+  spoolMaxBytes: number | undefined;
 }

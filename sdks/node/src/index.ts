@@ -1,5 +1,6 @@
 export { wrap } from "./wrap.js";
-export { prewarm, flushObservations } from "./prewarm.js";
+export { prewarm, flushObservations, observationStats } from "./prewarm.js";
+export type { TransportStats as ObservationStats } from "./transport.js";
 export { MissingConfigError, TensorCostConfigError } from "./config.js";
 export { UnsupportedClientError } from "./providers/detect.js";
 export {

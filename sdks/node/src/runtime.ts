@@ -48,6 +48,11 @@ export function getSharedRuntime(
     apiKey: config.apiKey,
     tenantId: config.tenantId,
     failOpen: config.failOpen,
+    maxBufferedObservations: config.maxBufferedObservations,
+    maxBufferedBytes: config.maxBufferedBytes,
+    flushOnExit: config.flushOnExit,
+    spoolDir: config.spoolDir,
+    spoolMaxBytes: config.spoolMaxBytes,
   });
   const sdkLayer = new SdkLayerClient({
     baseUrl: config.baseUrl,
@@ -76,6 +81,11 @@ export function warmupSharedRuntime(config: ResolvedConfig): void {
       /* warmup */
     }
   })();
+}
+
+/** Every shared transport, for process-wide stats. */
+export function sharedTransports(): ObservationTransport[] {
+  return [...runtimes.values()].map((r) => r.transport);
 }
 
 export const __test__ = {

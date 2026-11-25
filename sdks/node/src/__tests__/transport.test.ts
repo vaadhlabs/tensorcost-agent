@@ -148,8 +148,7 @@ describe("ObservationTransport", () => {
     warnSpy.mockRestore();
   });
 
-  it("drops observations when the queue is saturated", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("buffers rather than drops when only the in-flight limit is reached", async () => {
     // never-resolving fetch keeps everything pending
     const fetchImpl: typeof fetch = () => new Promise(() => {});
     const t = new ObservationTransport({
@@ -158,10 +157,10 @@ describe("ObservationTransport", () => {
       tenantId: "t-1",
       fetchImpl,
     });
-    // Queue depth is 1024; push 1100.
+    // 1024 may be in flight; the rest wait in the retry buffer.
     for (let i = 0; i < 1100; i += 1) t.post(makeObservation());
     await flushMicrotasks(5);
-    expect(warnSpy).toHaveBeenCalled();
-    warnSpy.mockRestore();
+    expect(t.pendingCount).toBe(1100);
+    expect(t.droppedCount).toBe(0);
   });
 });

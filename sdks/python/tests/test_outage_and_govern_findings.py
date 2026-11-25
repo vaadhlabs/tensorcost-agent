@@ -21,7 +21,6 @@ from typing import Any
 import httpx
 import pytest
 
-from tensorcost import _transport as transport_mod
 from tensorcost._config import resolve_config
 from tensorcost._errors import TensorCostModelGovernanceDeniedError, TensorCostTimeoutError
 from tensorcost._providers import _openai
@@ -202,41 +201,62 @@ def _flaky_server(fail_first: int, status_when_failing: int | None = None):
     return state, handler
 
 
-def _post_and_wait(t: ObservationTransport, ids: list[str]) -> None:
-    for i in ids:
-        t.post({"correlation_id": i})
-        t.flush(2.0)
+def _wait_for(pred, timeout_s: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return pred()
 
 
-def test_observations_that_fail_during_an_outage_are_replayed_after_it():
+def _fast(handler, **kw: Any) -> ObservationTransport:
+    """A transport whose backoff starts at 10 ms, so retries happen in test time."""
+    return ObservationTransport(
+        "https://tc.test", "k", tenant_id=TENANT, http_client=_http(handler),
+        max_workers=1, backoff_base_s=0.01, backoff_max_s=0.05, flush_on_exit=False, **kw,
+    )
+
+
+def test_observations_that_fail_during_an_outage_are_delivered_after_it_without_a_flush():
     state, handler = _flaky_server(fail_first=3)
-    t = ObservationTransport("https://tc.test", "k", tenant_id=TENANT, http_client=_http(handler), max_workers=1)
-    _post_and_wait(t, ["a", "b", "c"])
-    assert t.queued_observations == 3
-    _post_and_wait(t, ["d"])
-    assert sorted(state["delivered"]) == ["a", "b", "c", "d"]
+    t = _fast(handler)
+    for i in ["a", "b", "c"]:
+        t.post({"correlation_id": i})
+    assert _wait_for(lambda: len(state["delivered"]) == 3)
+    assert sorted(state["delivered"]) == ["a", "b", "c"]
     assert t.queued_observations == 0 and t.dropped_observations == 0
+    assert t.stats().delivered_after_retry >= 1
 
 
 def test_503_is_kept_but_a_400_is_not():
     state, handler = _flaky_server(fail_first=1, status_when_failing=503)
-    t = ObservationTransport("https://tc.test", "k", tenant_id=TENANT, http_client=_http(handler), max_workers=1)
-    _post_and_wait(t, ["a"])
-    assert t.queued_observations == 1
+    t = _fast(handler)
+    t.post({"correlation_id": "a"})
+    assert t.flush(2.0) == 0
+    assert state["delivered"] == ["a"]
     state2, handler2 = _flaky_server(fail_first=1, status_when_failing=400)
-    t2 = ObservationTransport("https://tc.test", "k", tenant_id=TENANT, http_client=_http(handler2), max_workers=1)
-    _post_and_wait(t2, ["a"])
-    assert t2.queued_observations == 0
+    t2 = _fast(handler2)
+    t2.post({"correlation_id": "a"})
+    assert t2.flush(2.0) == 0
+    time.sleep(0.2)
+    assert state2["n"] == 1 and state2["delivered"] == []
+    assert t2.stats().rejected == 1 and t2.queued_observations == 0
 
 
-def test_retry_queue_is_bounded_and_drops_the_oldest(monkeypatch):
-    monkeypatch.setattr(transport_mod, "_RETRY_QUEUE_MAX", 2)
-    state, handler = _flaky_server(fail_first=3)
-    t = ObservationTransport("https://tc.test", "k", tenant_id=TENANT, http_client=_http(handler), max_workers=1)
-    _post_and_wait(t, ["a", "b", "c"])
+def test_retry_queue_is_bounded_and_drops_the_oldest():
+    state, handler = _flaky_server(fail_first=1)
+    t = ObservationTransport(
+        "https://tc.test", "k", tenant_id=TENANT, http_client=_http(handler),
+        max_workers=1, max_buffered_observations=2, backoff_base_s=60, flush_on_exit=False,
+    )
+    t.post({"correlation_id": "a"})
+    assert _wait_for(lambda: state["n"] == 1 and t.stats().in_flight == 0)
+    for i in ["b", "c"]:
+        t.post({"correlation_id": i})
     assert t.queued_observations == 2 and t.dropped_observations == 1
-    _post_and_wait(t, ["d"])
-    assert sorted(state["delivered"]) == ["b", "c", "d"]
+    assert t.flush(2.0) == 0
+    assert sorted(state["delivered"]) == ["b", "c"]
 
 
 # --- 8: admit_unavailable keeps the agent and the tokens -------------------

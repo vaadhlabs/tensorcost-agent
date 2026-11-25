@@ -81,6 +81,14 @@ class ResolvedConfig:
     agent_id: Optional[str] = None
     workflow_id: Optional[str] = None
     team_id: Optional[str] = None
+    # Observation delivery. These belong to the transport shared by every
+    # wrap() with the same base_url, tenant_id and api_key; the first one
+    # to create it decides. None means the transport default.
+    max_buffered_observations: Optional[int] = None
+    max_buffered_bytes: Optional[int] = None
+    flush_on_exit: bool = True
+    spool_dir: Optional[str] = None
+    spool_max_bytes: Optional[int] = None
 
 
 def _resolve_attribution_field(raw: Optional[str], field_name: str) -> Optional[str]:
@@ -122,6 +130,11 @@ def resolve_config(
     workflow_id: Optional[str] = None,
     auto_workflow_id: Optional[bool] = None,
     team_id: Optional[str] = None,
+    max_buffered_observations: Optional[int] = None,
+    max_buffered_bytes: Optional[int] = None,
+    flush_on_exit: Optional[bool] = None,
+    spool_dir: Optional[str] = None,
+    spool_max_bytes: Optional[int] = None,
 ) -> ResolvedConfig:
     """Resolve final config values, env vars filling in any blanks."""
     final_api_key = api_key or os.environ.get("TENSORCOST_API_KEY")
@@ -230,6 +243,12 @@ def resolve_config(
         trimmed = raw_team.strip()
         final_team_id = trimmed if trimmed else None
 
+    if flush_on_exit is None:
+        env_flush = os.environ.get("TENSORCOST_FLUSH_ON_EXIT", "").strip().lower()
+        flush_on_exit = env_flush not in ("0", "false", "no", "off")
+    raw_spool = spool_dir if spool_dir is not None else os.environ.get("TENSORCOST_SPOOL_DIR")
+    final_spool_dir = raw_spool.strip() or None if raw_spool is not None else None
+
     return ResolvedConfig(
         api_key=final_api_key,
         base_url=final_base_url.rstrip("/"),
@@ -254,4 +273,9 @@ def resolve_config(
         agent_id=final_agent_id,
         workflow_id=final_workflow_id,
         team_id=final_team_id,
+        max_buffered_observations=max_buffered_observations,
+        max_buffered_bytes=max_buffered_bytes,
+        flush_on_exit=flush_on_exit,
+        spool_dir=final_spool_dir,
+        spool_max_bytes=spool_max_bytes,
     )

@@ -194,6 +194,12 @@ export function resolveConfig(options: WrapOptions = {}): ResolvedConfig {
 
   const maxGrants = normalizeMaxGrants(options.maxGrants);
 
+  const flushOnExitEnv = (process.env.TENSORCOST_FLUSH_ON_EXIT ?? "").trim().toLowerCase();
+  const flushOnExit =
+    options.flushOnExit ?? !["0", "false", "no", "off"].includes(flushOnExitEnv);
+  const spoolDirRaw = options.spoolDir ?? process.env.TENSORCOST_SPOOL_DIR ?? null;
+  const spoolDir = spoolDirRaw !== null ? String(spoolDirRaw).trim() || null : null;
+
   return {
     apiKey,
     baseUrl: baseUrlRaw.replace(/\/+$/, ""),
@@ -221,6 +227,11 @@ export function resolveConfig(options: WrapOptions = {}): ResolvedConfig {
     customer,
     feature,
     maxGrants,
+    maxBufferedObservations: options.maxBufferedObservations,
+    maxBufferedBytes: options.maxBufferedBytes,
+    flushOnExit,
+    spoolDir,
+    spoolMaxBytes: options.spoolMaxBytes,
   };
 }
 
