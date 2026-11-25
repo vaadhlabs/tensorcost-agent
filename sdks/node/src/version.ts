@@ -2,7 +2,7 @@
  * Central SDK identity — wire headers and observation sdk_version.
  */
 
-export const SDK_VERSION = "tensorcost-node/1.8.0";
+export const SDK_VERSION = "tensorcost-node/1.8.1";
 
 /** Advertise only capabilities this build implements. */
 export const SDK_CAPABILITIES = ["streaming", "refusal-v1"] as const;

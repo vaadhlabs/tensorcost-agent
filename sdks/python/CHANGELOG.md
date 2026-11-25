@@ -3,7 +3,59 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## 1.8.0 — unreleased
+## 1.8.1 — unreleased
+
+**Spend made while TensorCost is down is no longer lost.** In 1.8.0 an
+observation whose token exchange or POST failed (a connection error, a
+timeout, a 5xx from a gateway in front of a proxy that was scaled to zero, a
+429) went into a retry queue that only the next successful delivery
+replayed. Nothing retried it on a timer, `flush_observations()` didn't touch
+it, and it was lost at exit, so a call the provider answered and billed
+during the outage often left no spend row. Now a failed observation
+waits in a bounded in-memory buffer and is resent with backoff, 1 s doubling
+to 60 s with jitter (`Retry-After` sets the wait on a 429 or 503), until it
+lands or an hour has passed. The token exchange is retried on the same
+schedule. While TensorCost is unreachable one request at a time probes it,
+so a recovering proxy sees one request rather than the whole buffer, and
+once it answers the buffer drains on its own, with no call to `flush_observations()`
+needed. The body is serialised once and resent byte for byte, so every
+attempt carries the same `correlation_id`; ingestion dedupes the spend row,
+the trace and the budget counters on it, so a resend after a lost response
+is not counted twice. A 4xx other than 408 and 429 is not retried: it is
+logged once, then at most once a minute with a count.
+
+The buffer holds `max_buffered_observations` (10 000) or `max_buffered_bytes` (32 MiB). When it is full the
+oldest observation goes, with at most one warning a minute. `observation_stats()` reports
+what is in flight and buffered, `dropped`, `rejected`, and `delivered_after_retry` (held back
+by a failure, then delivered); the SDK also logs once when delivery
+recovers.
+
+`flush_observations()` now sends what is waiting to retry as well as what is queued,
+cuts a pending backoff short to probe once, and returns how many
+observations are still undelivered (0 when everything landed). It returns as
+soon as the next retry would land past its deadline, so a short-lived job
+calling it during an outage pays for one attempt, not the whole timeout.
+
+On a normal exit the SDK spends up to 2 s sending what is left (flush_on_exit=False or
+`TENSORCOST_FLUSH_ON_EXIT=0` turns this off). Python uses `atexit`, which runs on a normal exit and under servers that turn SIGTERM into a clean shutdown (gunicorn, uvicorn); a bare SIGTERM skips it. A transport forked after it started (gunicorn `--preload`) starts fresh in the child. An opt-in disk
+spool (`spool_dir` or `TENSORCOST_SPOOL_DIR`, off by default) keeps
+observations that would otherwise be dropped, or that are still undelivered
+at exit, as JSONL for the next start; both SDKs read and write the same
+format.
+
+**The half-open probe is one attempt.** With the circuit open, the first call
+after the 5 s window probes the proxy. In 1.8.0 that call went through the
+full retry schedule against a proxy that was still down (five attempts, 5 to
+7.6 s) before falling back. Now the probe is a single attempt: if it fails,
+the call goes to the provider at once and the circuit stays open for the
+next window. A call whose own failures open the circuit stops retrying there
+too and falls back, rather than spending its remaining attempts on the proxy.
+
+**Sub-second timeouts read correctly.** A `timeout_s` of 0.4 was reported
+as "timed out after 0s"; messages now say 0.4s (and 50ms below a tenth of a
+second).
+
+## 1.8.0 — 2026-11-24
 
 **A call that may already have reached the provider is never sent again.**
 Through 1.7.0 the SDK retried every 5xx, timeout and network error from the
