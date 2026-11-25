@@ -22,6 +22,11 @@ and anything with ``x-should-retry: false`` raise with
 network error was retried five times and then fell back, so one call the
 provider had already billed could run six times.
 
+Since 1.8.2 the proxy's 502 ``x-tc-upstream-error: provider_unreachable`` (it
+couldn't connect to the provider, nothing was sent) is not retried, counts as
+a circuit failure, and raises with ``may_have_reached_provider`` false so
+fail-open goes direct.
+
 How a non-2xx response is classified (unchanged split from 1.4.0, plus the
 refusal check in front of it):
 
@@ -51,7 +56,7 @@ from typing import Any, Optional
 import httpx
 
 from ._circuit import CircuitBreaker
-from ._delivery import classify_error_answer, send_error_sent_nothing
+from ._delivery import classify_error_answer, is_provider_unreachable, send_error_sent_nothing
 from ._errors import (
     format_seconds,
     TensorCostError,
@@ -577,6 +582,32 @@ def proxy_request(
             )
             raise tc_err
 
+        if unsent and is_provider_unreachable(resp.status_code, resp.headers):
+            # The proxy couldn't connect to the provider and nothing was sent
+            # (_delivery.is_provider_unreachable). Not retried through the
+            # proxy, which already retried the provider once. A circuit
+            # failure, so a proxy whose egress is broken gets bypassed instead
+            # of costing every call its connect timeouts. Raised as unsent so
+            # the wrapper can go direct.
+            tc_err = _provider_unreachable_error(resp, request_id, attempt + 1)
+            if circuit is not None:
+                circuit.record_failure()
+            emit_event(
+                on_lifecycle_event,
+                OnErrorEvent(
+                    kind="on_error",
+                    provider=provider,
+                    model=model,
+                    operation=operation,
+                    attempt_number=attempt + 1,
+                    elapsed_ms=(time.monotonic() - call_start) * 1000.0,
+                    error_class=tc_err.__class__.__name__,
+                    status=resp.status_code,
+                    reason="provider_unreachable",
+                ),
+            )
+            raise tc_err
+
         if resp.status_code == 402:
             # No refusal body: the plan's monthly proxy-request ceiling (Scale
             # COGS gate). TensorCost declining to carry the call is not a
@@ -731,6 +762,22 @@ def proxy_request(
         raise tc_err
 
     raise last_error or TensorCostProxyError("tensorcost: max attempts reached")
+
+
+def _provider_unreachable_error(
+    resp: httpx.Response, request_id: Optional[str], attempt: int
+) -> TensorCostError:
+    """The proxy's 502 for a provider it could not connect to: unsent, so fail-open may go direct."""
+    return _mark(
+        TensorCostProxyError(
+            f"tensorcost: proxy returned {resp.status_code} "
+            "(it could not reach the provider; nothing was sent)",
+            status=resp.status_code,
+            request_id=request_id,
+            attempt=attempt,
+        ),
+        False,
+    )
 
 
 def _non_refusal_4xx(
@@ -957,6 +1004,27 @@ def proxy_request_stream(
             )
             if answer == "provider":
                 raise _provider_answer_error(resp, error_body, request_id, 1)
+            if answer == "unsent" and is_provider_unreachable(resp.status_code, resp.headers):
+                # See proxy_request: unreachable provider, nothing sent, not
+                # retried, a circuit failure.
+                tc_err = _provider_unreachable_error(resp, request_id, 1)
+                if circuit is not None:
+                    circuit.record_failure()
+                emit_event(
+                    on_lifecycle_event,
+                    OnErrorEvent(
+                        kind="on_error",
+                        provider=provider,
+                        model=model,
+                        operation=operation,
+                        attempt_number=1,
+                        elapsed_ms=0.0,
+                        error_class=tc_err.__class__.__name__,
+                        status=resp.status_code,
+                        reason="provider_unreachable",
+                    ),
+                )
+                raise tc_err
             if resp.status_code in (402, 429):
                 ra_ms = parse_retry_after_ms(resp.headers.get("retry-after"))
                 raise _mark(

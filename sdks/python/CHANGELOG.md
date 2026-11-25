@@ -3,7 +3,41 @@
 All notable changes to the `tensorcost` Python SDK are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## 1.8.1 — unreleased
+## 1.8.2 — unreleased
+
+**A call TensorCost couldn't deliver to the provider now goes to the
+provider directly.** A newer inference proxy answers a provider it got no
+answer from in one of three ways, each with `x-tc-upstream-error`. One of
+them, `provider_unreachable` (a 502 with no `x-should-retry`), means the
+proxy couldn't connect to the provider at all: the connection, DNS lookup or
+TLS handshake failed before anything was sent, and failed again on the
+proxy's own retry. Nothing ran and nothing was billed. Through 1.8.1 the SDK
+treated that answer like the other two, as a call that may have reached the
+provider: it surfaced the error and never fell open, so a provider that
+TensorCost's network couldn't reach failed every call even though your own
+network could reach it.
+
+Now that answer surfaces as a `TensorCostProxyError` with
+`may_have_reached_provider` False, and with `fail_open_enabled` on (the
+default) the wrapper calls the provider directly. It is not retried through
+the proxy, which has already retried the provider once. It does count as a
+circuit failure: when the proxy's own network can't reach the provider,
+every call gets this answer after the proxy's two connect attempts, and the
+open circuit then sends calls straight to the provider instead of making
+each one wait out those attempts first. The rule needs all of the 502,
+`x-tc-error-origin: provider` and `x-tc-upstream-error:
+provider_unreachable`; the header with any other origin, or none, is
+handled as before. The `on_error`
+lifecycle event for it carries `reason="provider_unreachable"`. With
+`fail_open_enabled=False` the error is raised.
+
+`provider_connection_lost` (502) and `provider_timeout` (504) carry
+`x-should-retry: false` because the provider may have run the call, and are
+handled exactly as before: never retried, never sent around TensorCost. A
+`provider_unreachable` that also carries `x-should-retry: false` (a routed
+call, where an earlier route may have run) is treated the same way.
+
+## 1.8.1 — 2026-11-24
 
 **Spend made while TensorCost is down is no longer lost.** In 1.8.0 an
 observation whose token exchange or POST failed (a connection error, a

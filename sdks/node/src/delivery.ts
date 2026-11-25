@@ -36,6 +36,12 @@
 export const ERROR_ORIGIN_HEADER = "x-tc-error-origin";
 /** OpenAI/Anthropic SDK convention; "false" means do not send this again. */
 export const SHOULD_RETRY_HEADER = "x-should-retry";
+/**
+ * Set by inference-proxy-service on its answer for a provider send that got
+ * no answer (unanswered-send.ts): `provider_unreachable`,
+ * `provider_connection_lost` or `provider_timeout`.
+ */
+export const UPSTREAM_ERROR_HEADER = "x-tc-upstream-error";
 
 /** What a non-2xx answer says about where the call got to. */
 export type ErrorAnswer =
@@ -124,6 +130,16 @@ export function fetchErrorSentNothing(err: unknown): boolean {
  * front of it). `body` is the parsed error body when the caller read it.
  *
  * In order:
+ *   0. The proxy's 502 `x-tc-upstream-error: provider_unreachable`, marked
+ *      origin `provider`, without `x-should-retry: false`
+ *      (isProviderUnreachable): the proxy could not
+ *      connect to the provider (connect, DNS or TLS, after its own one
+ *      retry), so nothing of the call left it and nothing was billed. The
+ *      origin is `provider`, so it has to come before rule 1. The same
+ *      header with another origin or none is not the proxy's answer as
+ *      unanswered-send.ts writes it, and stays "maybe_sent".
+ *      A routed call's answer carries `x-should-retry: false` (an earlier
+ *      route may have run) and stays "maybe_sent".
  *   1. origin `provider`: the provider's answer. Never resent: it would
  *      answer the same, or (a 5xx, the proxy's 504) it may already have run.
  *   2. `x-should-retry: false`: whoever sent it says don't. Always honoured.
@@ -149,6 +165,7 @@ export function classifyErrorAnswer(status: number, headers: Headers, body: unkn
   const origin = headers.get(ERROR_ORIGIN_HEADER)?.trim().toLowerCase() ?? null;
   const shouldRetry = headers.get(SHOULD_RETRY_HEADER)?.trim().toLowerCase() ?? null;
 
+  if (isProviderUnreachable(status, headers)) return "unsent";
   if (origin === "provider") return "provider";
   if (shouldRetry === "false") return "maybe_sent";
   if (status === 429 || status === 402) return "unsent";
@@ -157,6 +174,27 @@ export function classifyErrorAnswer(status: number, headers: Headers, body: unkn
   }
   if (status === 502 && origin === "gateway" && gatewayCouldNotConnect(body)) return "unsent";
   return "maybe_sent";
+}
+
+/**
+ * The proxy's 502 for a provider it could not connect to: origin
+ * `provider`, `x-tc-upstream-error: provider_unreachable`, no
+ * `x-should-retry: false`. Nothing was sent, so it is "unsent" to
+ * classifyErrorAnswer. The proxy already retried the provider once, so the
+ * proxy client doesn't retry it, but it does count it against the circuit:
+ * when the proxy's own egress is broken every call gets this answer after
+ * the proxy's two connect attempts (about 20 s at a 10 s connect timeout),
+ * and an open circuit is what stops each call paying that before going
+ * direct. The wrapper calls the provider directly when fail-open is on.
+ * `provider_connection_lost` and `provider_timeout` may have run, carry
+ * `x-should-retry: false`, and never match.
+ */
+export function isProviderUnreachable(status: number, headers: Headers): boolean {
+  if (status !== 502) return false;
+  const origin = headers.get(ERROR_ORIGIN_HEADER)?.trim().toLowerCase();
+  const kind = headers.get(UPSTREAM_ERROR_HEADER)?.trim().toLowerCase();
+  const shouldRetry = headers.get(SHOULD_RETRY_HEADER)?.trim().toLowerCase();
+  return origin === "provider" && kind === "provider_unreachable" && shouldRetry !== "false";
 }
 
 /** The gateway's 502 body for a connect failure to the proxy. */
