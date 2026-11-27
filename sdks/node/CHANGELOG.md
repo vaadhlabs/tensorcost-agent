@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.9.0 — unreleased
 
 **A 429 from TensorCost is pacing, not an outage, and a call it lets
 through unchecked is never silent.** A self-hosted load test found the
@@ -36,7 +36,7 @@ is fixed separately; this release fixes what the SDK does with the 429.
   is logged per reason at most once a minute with the number of calls, and
   `uncheckedCalls()` returns the count per reason since the process started.
 
-## 1.8.2 — unreleased
+## 1.8.2 — 2026-11-25
 
 **A call TensorCost couldn't deliver to the provider now goes to the
 provider directly.** A newer inference proxy answers a provider it got no

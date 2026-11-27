@@ -5,7 +5,7 @@ from tensorcost._providers._detect import UnsupportedClientError
 
 
 def test_version_string():
-    assert __version__ == "1.8.2"
+    assert __version__ == "1.9.0"
 
 
 def test_wrap_returns_same_object(openai_client):
