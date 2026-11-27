@@ -1,7 +1,15 @@
 """Govern-layer admit — metadata-only POST /api/inference-proxy/v1/admit.
 
-Fail-open only on an outage: network error, timeout, 5xx, or a 429 / 402
-with no refusal body. The customer's call then proceeds. ``admit_call``
+Fail-open only when TensorCost gave no decision: a network error, a timeout,
+a 5xx, or a 429 / 402 with no refusal body. The customer's call then proceeds.
+
+A bare 429 is TensorCost pacing this process, not an outage (1.9.0). It is
+retried inside the admit budget: after Retry-After when that fits (and every
+call to the same /admit holds off until then), else after a short jittered
+backoff. Still throttled when the budget runs out, it takes the same fail mode
+as an outage, with the outcome reason ``admit_throttled``. Through 1.8.2 a 429
+was not retried and was recorded as ``admit_unavailable``. A bare 402 (the
+plan's ceiling) is not retried: ``admit_plan_limit``. ``admit_call``
 says so in its outcome (``unavailable``), and the provider wrappers mark the
 call's own observation ``admit_unavailable``, so the row keeps its agent,
 team and token usage. ``admit_request`` (the older tuple API) still posts a
@@ -22,6 +30,9 @@ could not be checked for this call; that is not an outage either.
 
 from __future__ import annotations
 
+import random
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -60,8 +71,12 @@ class AdmitOutcome:
 
     allowed: bool
     decision_header: Optional[str]
-    # True when /admit couldn't be reached (fail-open let the call through).
+    # True when /admit gave no answer (fail-open let the call through).
     unavailable: bool = False
+    # With ``unavailable``: why. ``admit_throttled`` is a bare 429 still there
+    # when the admit budget ran out, ``admit_plan_limit`` a bare 402,
+    # ``admit_unavailable`` an outage.
+    reason: Optional[str] = None
     # Budgets that would have refused the call had the SDK enforced them.
     would_refuse: tuple[str, ...] = ()
 
@@ -132,48 +147,107 @@ def admit_call(
 
     own_client = http_client is None
     client = http_client or httpx.Client(timeout=timeout_s)
+    deadline = time.monotonic() + timeout_s
     # Raised after the try below: inside it, fail-open would swallow it.
     refusal: Optional[TensorCostError] = None
     try:
-        try:
-            resp = client.post(url, headers=headers, json=metadata)
-        except httpx.TimeoutException as exc:
-            raise TensorCostTimeoutError(
-                f"tensorcost: admit timed out after {format_seconds(timeout_s)}", "total", root_cause=exc
-            ) from exc
-        except (httpx.TransportError, OSError) as exc:
-            raise TensorCostNetworkError(
-                f"tensorcost: network error reaching admit: {exc}", root_cause=exc
-            ) from exc
-        decision_header = resp.headers.get("x-tc-decision")
-        request_id = resp.headers.get("x-tc-request-id")
-        if 400 <= resp.status_code < 500:
-            refusal = _refusal_from_4xx(resp, decision_header)
-            if refusal is None:  # a bare 429 (throttler) or 402 (plan ceiling)
+        attempt = 0
+        while True:
+            # A Retry-After another call got from this /admit holds every
+            # call: wait it out when it ends inside this call's budget.
+            with _throttle_lock:
+                held_until = _throttled_until.get(url, 0.0)
+            now = time.monotonic()
+            if held_until > now:
+                if held_until + _MIN_ATTEMPT_S > deadline:
+                    raise _throttled(429, (held_until - now) * 1000.0, None)
+                time.sleep(held_until - now)
+            remaining = max(0.001, deadline - time.monotonic())
+            try:
+                resp = client.post(url, headers=headers, json=metadata, timeout=remaining)
+            except httpx.TimeoutException as exc:
+                raise TensorCostTimeoutError(
+                    f"tensorcost: admit timed out after {format_seconds(timeout_s)}", "total", root_cause=exc
+                ) from exc
+            except (httpx.TransportError, OSError) as exc:
+                raise TensorCostNetworkError(
+                    f"tensorcost: network error reaching admit: {exc}", root_cause=exc
+                ) from exc
+            decision_header = resp.headers.get("x-tc-decision")
+            request_id = resp.headers.get("x-tc-request-id")
+            if 400 <= resp.status_code < 500:
+                refusal = _refusal_from_4xx(resp, decision_header)
+                if refusal is not None:
+                    break
+                # A bare 429 (TensorCost pacing this process) or 402 (the
+                # plan's ceiling). Neither is an outage, and neither decided.
                 ra_ms = parse_retry_after_ms(resp.headers.get("retry-after"))
-                raise TensorCostQuotaError(
+                if resp.status_code == 402:
+                    raise _throttled(402, ra_ms, request_id)
+                if ra_ms is not None:
+                    with _throttle_lock:
+                        _throttled_until[url] = time.monotonic() + ra_ms / 1000.0
+                # Retry-After is the least we wait; the backoff is the floor,
+                # so "Retry-After: 0" can't turn into a busy loop.
+                wait = max(ra_ms / 1000.0 if ra_ms is not None else 0.0, _backoff_s(attempt))
+                if time.monotonic() + wait + _MIN_ATTEMPT_S > deadline:
+                    raise _throttled(429, ra_ms, request_id)
+                time.sleep(wait)
+                attempt += 1
+                continue
+            if resp.status_code >= 400:
+                raise TensorCostProxyError(
                     f"admit POST failed status={resp.status_code}",
-                    retry_after_ms=int(ra_ms) if ra_ms is not None else None,
                     status=resp.status_code,
                     request_id=request_id,
                 )
-        elif resp.status_code >= 400:
-            raise TensorCostProxyError(
-                f"admit POST failed status={resp.status_code}",
-                status=resp.status_code,
-                request_id=request_id,
-            )
-        else:
             return AdmitOutcome(True, decision_header, would_refuse=_would_refuse_ids(resp))
-    except Exception:
+    except Exception as exc:
         if fail_open:
-            return AdmitOutcome(True, None, unavailable=True)
+            return AdmitOutcome(True, None, unavailable=True, reason=_reason_of(exc))
         raise
     finally:
         if own_client:
             client.close()
     assert refusal is not None
     raise refusal
+
+
+# The shortest attempt worth sending: below this the budget is spent.
+_MIN_ATTEMPT_S = 0.05
+# Backoff for a 429 with no Retry-After: 25 ms, doubling, with jitter.
+_BACKOFF_BASE_S = 0.025
+
+# Per /admit URL: no call is sent before this monotonic time (a Retry-After).
+_throttled_until: dict[str, float] = {}
+_throttle_lock = threading.Lock()
+
+
+def _backoff_s(attempt: int) -> float:
+    return _BACKOFF_BASE_S * (2 ** attempt) * (0.5 + random.random() * 0.5)
+
+
+def _throttled(status: int, ra_ms: Optional[float], request_id: Optional[str]) -> TensorCostQuotaError:
+    return TensorCostQuotaError(
+        "tensorcost: admit is rate limiting this process (429) and the admit budget ran out"
+        if status == 429
+        else "tensorcost: admit says the plan's request ceiling is reached (402)",
+        retry_after_ms=int(ra_ms) if ra_ms is not None else None,
+        status=status,
+        request_id=request_id,
+    )
+
+
+def _reason_of(exc: BaseException) -> str:
+    if isinstance(exc, TensorCostQuotaError):
+        return "admit_plan_limit" if exc.status == 402 else "admit_throttled"
+    return "admit_unavailable"
+
+
+def _reset() -> None:
+    """Test hook: forget any Retry-After hold."""
+    with _throttle_lock:
+        _throttled_until.clear()
 
 
 ADMIT_UNAVAILABLE_METADATA = {

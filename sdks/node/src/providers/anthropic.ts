@@ -66,7 +66,7 @@ import {
   postObservation,
   withAwaitExcluded,
 } from "../wrap-overhead.js";
-import { ADMIT_UNAVAILABLE, callPathToken } from "./call-path.js";
+import { admitErrorReason, callPathToken, goingUnchecked, proxyFallbackReason } from "./call-path.js";
 const MARKER = "__tensorcost_wrapped__";
 const WITH_META_MARKER = "__tensorcost_with_meta__";
 
@@ -361,13 +361,27 @@ function wrapMethod(
               })
             );
           }
-          decisionMeta = admit.unavailable ? ADMIT_UNAVAILABLE : decisionMetadata(admit.decisionHeader);
+          decisionMeta = admit.unavailable
+            ? goingUnchecked(admit.reason ?? "admit_unavailable", {
+            onLifecycleEvent: opts.hardening.onLifecycleEvent,
+            provider: "anthropic",
+            model: String(model),
+            operation: "messages",
+            consecutiveFailures: opts.hardening.circuit.failures,
+          })
+            : decisionMetadata(admit.decisionHeader);
         } catch (err) {
           // Same rule as the proxy path: go around TensorCost only when it
           // is unavailable (token exchange or admit unreachable), and only
           // with failOpenEnabled. A refusal, known code or not, stops the call.
           if (!shouldFallBackToProvider(err) || !opts.hardening.failOpenEnabled) throw err;
-          decisionMeta = ADMIT_UNAVAILABLE;
+          decisionMeta = goingUnchecked(admitErrorReason(err), {
+            onLifecycleEvent: opts.hardening.onLifecycleEvent,
+            provider: "anthropic",
+            model: String(model),
+            operation: "messages",
+            consecutiveFailures: opts.hardening.circuit.failures,
+          });
         }
       }
 
@@ -466,16 +480,14 @@ function wrapMethod(
             throw tcErr;
           }
 
-          emitEvent(opts.hardening.onLifecycleEvent, {
-            kind: "on_fallback",
+          const fallbackMeta = goingUnchecked(proxyFallbackReason(proxyFailureError), {
+            onLifecycleEvent: opts.hardening.onLifecycleEvent,
             provider: "anthropic",
             model: String(model),
             operation: "messages",
-            attemptNumber: 1,
-            elapsedMs: 0,
             consecutiveFailures: opts.hardening.circuit.failures,
           });
-          return { kind: "call", call: callProvider(decisionMeta) };
+          return { kind: "call", call: callProvider(fallbackMeta) };
         }
 
         const proxyMeta = decisionMeta;

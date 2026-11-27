@@ -32,9 +32,17 @@ The event kinds::
                                           timeout, 5xx, 429/402)
                        circuit_open       the circuit breaker is open, the
                                           proxy was not tried
+                       proxy_throttled    the proxy still answered a bare 429
+                                          after its retries (1.9.0)
+                       proxy_plan_limit   the proxy answered a bare 402
                        layer_decayed      the published layer couldn't be
                                           fetched, so the client decayed to
                                           govern and skipped the proxy
+                     and, since 1.9.0, when a govern call goes ahead without
+                     an /admit answer: admit_unavailable (outage),
+                     admit_throttled (still a bare 429 when the admit budget
+                     ran out), admit_plan_limit (a bare 402). The same value
+                     is the call's observation ``decision_reason``.
                      Never for a refusal: those raise and never fall back.
     on_budget_would_refuse
                      fires when /admit let a call through but named budgets
@@ -109,7 +117,16 @@ class OnFallbackEvent:
     attempt_number: int
     elapsed_ms: float
     consecutive_failures: int
-    reason: Literal["proxy_unavailable", "circuit_open", "layer_decayed"] = "proxy_unavailable"
+    reason: Literal[
+        "proxy_unavailable",
+        "proxy_throttled",
+        "proxy_plan_limit",
+        "circuit_open",
+        "layer_decayed",
+        "admit_unavailable",
+        "admit_throttled",
+        "admit_plan_limit",
+    ] = "proxy_unavailable"
 
 
 @dataclass(frozen=True)

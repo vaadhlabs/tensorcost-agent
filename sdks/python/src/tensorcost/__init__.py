@@ -19,6 +19,7 @@ underlying provider call still completes normally.
 
 from ._wrap import wrap
 from ._prewarm import prewarm, flush_observations, observation_stats
+from ._unchecked import unchecked_calls
 from ._transport import TransportStats as ObservationStats
 from ._config import MissingConfigError
 from ._providers._detect import UnsupportedClientError
@@ -58,6 +59,7 @@ __all__ = [
     "wrap",
     "prewarm",
     "flush_observations",
+    "unchecked_calls",
     "observation_stats",
     "ObservationStats",
     "MissingConfigError",

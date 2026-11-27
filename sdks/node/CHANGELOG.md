@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+**A 429 from TensorCost is pacing, not an outage, and a call it lets
+through unchecked is never silent.** A self-hosted load test found the
+proxy's admission check capped at 600 calls a minute for the install's one
+tenant. The SDK treated the bare 429 it answered over that limit as an
+outage: with `failOpenEnabled` on (the default) every call over the limit
+went to the provider with no budget or governance check, recorded as
+`admit_unavailable` like an outage, and nothing was logged. The server limit
+is fixed separately; this release fixes what the SDK does with the 429.
+
+- **The admission check retries a bare 429** (one with no refusal code)
+  inside its existing 500 ms budget. A `Retry-After` that fits is waited
+  out; a longer one gives up at once, and every later call to the same
+  TensorCost waits it out (or gives up) without asking again, instead of
+  sending a request it has been told will be refused. Without
+  `Retry-After` it backs off from 25 ms with jitter. `Retry-After: 0`
+  waits the backoff, so it can't turn into a busy loop. A bare 402 (the
+  plan's request ceiling) is not retried.
+- **Still throttled when the budget runs out, the fail mode applies
+  exactly as for an outage.** With `failOpenEnabled` on, the call goes to the
+  provider; with it off, the call is rejected with the 429 as a
+  `TensorCostQuotaError` and the provider is never called. A 429
+  with a refusal code in it was, and still is, a refusal.
+- **The proxy route** already retried a 429 (`retry`, honouring
+  `Retry-After`) before going around TensorCost. What changes is that the
+  fall-back is now recorded.
+- **Every call that goes to the provider unchecked says why.** Its
+  observation carries `decision_action: allow` and a `decision_reason`:
+  `admit_throttled`, `admit_plan_limit` or `admit_unavailable` at govern;
+  `proxy_throttled`, `proxy_plan_limit`, `proxy_unavailable` or
+  `circuit_open` through the proxy (those had no reason at all before).
+  `on_fallback` fires with the same `reason`, now also at govern. A warning
+  is logged per reason at most once a minute with the number of calls, and
+  `uncheckedCalls()` returns the count per reason since the process started.
+
 ## 1.8.2 — unreleased
 
 **A call TensorCost couldn't deliver to the provider now goes to the

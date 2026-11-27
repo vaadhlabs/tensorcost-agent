@@ -1,5 +1,7 @@
 export { wrap } from "./wrap.js";
 export { prewarm, flushObservations, observationStats } from "./prewarm.js";
+export { uncheckedCalls } from "./unchecked.js";
+export type { UncheckedCalls, UncheckedReason } from "./unchecked.js";
 export type { TransportStats as ObservationStats } from "./transport.js";
 export { MissingConfigError, TensorCostConfigError } from "./config.js";
 export { UnsupportedClientError } from "./providers/detect.js";

@@ -24,8 +24,10 @@
  *                    attempt
  *   on_error         fires when the SDK gives up (all retries exhausted or
  *                    a non-retriable error occurred)
- *   on_fallback      fires when the circuit breaker opens and the SDK routes
- *                    to the provider directly instead of the proxy
+ *   on_fallback      fires when a call goes to the provider without
+ *                    TensorCost's check (fail-open): the proxy failed or was
+ *                    throttled, the circuit is open, or /admit gave no
+ *                    answer (since 1.9.0). `reason` says which.
  *
  * And one that isn't about a single request:
  *
@@ -38,6 +40,8 @@
  *                    this event, and a console.warn when the circuit opens
  *                    or closes again.
  */
+
+import type { UncheckedReason } from "./unchecked.js";
 
 export type Provider = "openai" | "anthropic";
 
@@ -86,6 +90,11 @@ export interface OnFallbackEvent extends TelemetryBase {
   kind: "on_fallback";
   /** Number of consecutive proxy failures that tripped the circuit. */
   consecutiveFailures: number;
+  /**
+   * Why the call went to the provider without TensorCost's check (1.9.0).
+   * The same value is the call's observation `decision_reason`.
+   */
+  reason?: UncheckedReason;
 }
 
 export type CircuitStateName = "CLOSED" | "OPEN" | "HALF_OPEN";

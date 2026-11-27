@@ -162,7 +162,7 @@ If TensorCost is down, your call still reaches the provider. The SDK goes around
 
 A failure after the call may have reached the provider is never sent again, through TensorCost or around it: a timeout once the request was sent, a dropped connection, a 5xx the provider sent (marked `x-tc-error-origin: provider`, raised as the provider SDK's own error), any other 5xx TensorCost can't prove it sent before forwarding, and anything with `x-should-retry: false`. Those reach your code as the error, with `mayHaveReachedProvider` set to true, because resending could bill the call twice. Through 1.7.0 the SDK retried those and then called the provider directly, so one call could run up to six times.
 
-- **Retries.** Only calls that provably never reached the provider are retried, with jittered backoff, honouring `Retry-After` on a 429.
+- **Retries.** Only calls that provably never reached the provider are retried, with jittered backoff, honouring `Retry-After` on a 429. The admission check retries a bare 429 too, inside its 500 ms budget (see below).
 - **Timeouts.** The check before a call is capped at 500 ms. Through the proxy, a buffered call waits up to `timeoutMs` (60 s); a streamed one waits `headersTimeoutMs` (2 s) for the stream to start and ends after `idleTimeoutMs` (30 s) without data. With TensorCost unreachable, only the first calls of a process wait for the published layer (250 ms at most); the token exchange counts against the budget of whatever waits on it, and after it fails calls stop waiting on it for 5 s.
 - **Circuit breaker.** After three proxy failures in a row, calls go straight to the provider. Every 5 s one call probes the proxy with a single attempt, never retried: if it fails, that call goes to the provider at once and the circuit stays open for another 5 s. Once probes succeed calls go through the proxy again. A call never retries through a circuit that opened while it was running. Transitions reach `onLifecycleEvent` as `on_circuit_state`; they are not sent to TensorCost.
 
@@ -177,6 +177,26 @@ const client = wrap(new OpenAI(), {
 ```
 
 Where calls must never go around TensorCost (a proxy inside your VPC, say), set `failOpenEnabled: false` and proxy failures surface as `TensorCostProxyError`.
+
+### Unchecked calls, and when TensorCost is pacing you
+
+A bare 429 from TensorCost (no refusal code in it) means TensorCost is pacing this process, not that it is down. Before 1.9.0 the govern layer treated it as an outage and let the call through, unrecorded. Now the admission check retries it inside its own 500 ms budget: after `Retry-After` when that fits, otherwise after a short jittered backoff, and every call to the same TensorCost waits out a `Retry-After` it has already been given rather than asking again. The proxy route already retried a 429 (`retry`, honouring `Retry-After`) before going around TensorCost. A bare 402 (the plan's request ceiling) is not retried.
+
+If TensorCost is still pacing you when the budget or the retries run out, the fail mode applies exactly as for an outage. With `failOpenEnabled` on (the default) the call goes to the provider without a budget or governance check; with it off the call is rejected with a `TensorCostQuotaError` (govern) or a `TensorCostProxyError` (route) and the provider is never called.
+
+Every call that goes to the provider unchecked is recorded, whatever the reason:
+
+- Its observation carries `decision_action: allow` and a `decision_reason`: `admit_throttled`, `admit_plan_limit` or `admit_unavailable` at govern; `proxy_throttled`, `proxy_plan_limit`, `proxy_unavailable` or `circuit_open` through the proxy.
+- `on_fallback` fires with the same `reason`.
+- A warning is logged per reason, at most once a minute, with how many calls went through.
+- `uncheckedCalls()` returns the count per reason since the process started.
+
+```ts
+import { uncheckedCalls } from "@tensorcost/sdk";
+
+// from a health check
+const { admit_throttled, proxy_throttled } = uncheckedCalls();
+```
 
 ### Observation delivery
 
