@@ -22,7 +22,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .._admit_client import ADMIT_UNAVAILABLE_METADATA, AdmitOutcome, admit_call
+from .._admit_client import AdmitOutcome, admit_call
+from .._unchecked import (
+    admit_error_reason,
+    going_unchecked,
+    proxy_fallback_reason,
+    record_unchecked,
+    unchecked_metadata,
+)
 from .._compliance_guard import (
     assert_team_scope,
     compliance_stamp_from,
@@ -240,6 +247,7 @@ def _wrap_method(
 
             # Token exchange and /admit together get ADMIT_TIMEOUT_S.
             admit_started = time.monotonic()
+            token_error: Optional[BaseException] = None
             try:
                 bearer_token: Optional[str] = get_token_within(transport, ADMIT_TIMEOUT_S)
             except Exception as exc:  # noqa: BLE001
@@ -248,6 +256,7 @@ def _wrap_method(
                 if not (fail_open_enabled and should_fall_back_to_provider(exc)):
                     raise
                 bearer_token = None
+                token_error = exc
             remaining = ADMIT_TIMEOUT_S - (time.monotonic() - admit_started)
             if bearer_token is None or remaining < _MIN_ADMIT_S:
                 if bearer_token is not None and not fail_open_enabled:
@@ -255,7 +264,7 @@ def _wrap_method(
                         f"tensorcost: admit budget ({ADMIT_TIMEOUT_S}s) spent on the token exchange",
                         "total",
                     )
-                outcome = AdmitOutcome(True, None, unavailable=True)
+                outcome = AdmitOutcome(True, None, unavailable=True, reason=admit_error_reason(token_error))
             else:
                 outcome = admit_call(
                     base_url=base_url,
@@ -288,7 +297,14 @@ def _wrap_method(
                     attempt=1,
                 )
             if outcome.unavailable:
-                obs_metadata = dict(ADMIT_UNAVAILABLE_METADATA)
+                obs_metadata = going_unchecked(
+                    outcome.reason or "admit_unavailable",
+                    on_lifecycle_event=on_lifecycle_event,
+                    provider="openai",
+                    model=str(model),
+                    operation=operation,
+                    consecutive_failures=circuit.failures if circuit else 0,
+                )
             report_would_refuse(
                 on_lifecycle_event, outcome.would_refuse,
                 provider=provider_name, model=str(model), operation=operation,
@@ -318,6 +334,11 @@ def _wrap_method(
             )
 
         def fallback(reason: str) -> None:
+            nonlocal obs_metadata
+            if reason != "layer_decayed":
+                # proxy_* / circuit_open: the call goes to the provider unchecked.
+                record_unchecked(reason)
+                obs_metadata = unchecked_metadata(reason)
             emit_event(
                 on_lifecycle_event,
                 OnFallbackEvent(
@@ -437,7 +458,7 @@ def _wrap_method(
                     if native is exc:
                         raise
                     raise native from exc
-                fallback_reason = "proxy_unavailable"
+                fallback_reason = proxy_fallback_reason(exc)
                 proxy_error = exc
             finally:
                 if circuit is not None:

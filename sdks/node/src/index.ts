@@ -1,5 +1,7 @@
 export { wrap } from "./wrap.js";
 export { prewarm, flushObservations, observationStats } from "./prewarm.js";
+export { uncheckedCalls } from "./unchecked.js";
+export type { UncheckedCalls, UncheckedReason } from "./unchecked.js";
 export type { TransportStats as ObservationStats } from "./transport.js";
 export { MissingConfigError, TensorCostConfigError } from "./config.js";
 export { UnsupportedClientError } from "./providers/detect.js";
@@ -49,4 +51,4 @@ export { wrapCrewAI } from "./adapters/crewai.js";
 export { wrapVercelAi } from "./adapters/vercel-ai.js";
 export { intersectGrants } from "./layer.js";
 
-export const version = "1.8.2";
+export const version = "1.9.0";
